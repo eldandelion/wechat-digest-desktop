@@ -1,0 +1,45 @@
+{
+  "id": "REG-04_multi_topic_anti_merge_and_room_memory",
+  "description": "Produces two unmerged cards for distinct announcements while suppressing an already-covered dorm maintenance duplicate via room memory.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "recentRoomCards": [
+    {
+      "id": "existing-dorm-1",
+      "title": "Dormitory Hot Water Maintenance",
+      "summary": "Hot water supply in Dorm Building 5 will be shut off on May 18 from 09:00 to 16:00.",
+      "translatedSummary": "Hot water supply in Dorm Building 5 will be shut off on May 18 from 09:00 to 16:00.",
+      "sections": [
+        { "heading": "Schedule", "content": "- May 18, 09:00-16:00, Dorm Building 5" }
+      ],
+      "category": "NOTICE",
+      "priority": "NORMAL",
+      "eventDate": "2026-05-18",
+      "originalSender": "Dorm_Admin",
+      "sourceRoomId": "room_eval@chatroom",
+      "sourceRoomName": "Eval Study Group",
+      "sourceMessages": "[Dorm_Admin] Dorm Building 5 hot water maintenance May 18 09:00-16:00.",
+      "translatedSourceMessages": "",
+      "timestampSeconds": 1779000000
+    }
+  ],
+  "messages": [
+    { "localId": 401, "timestampSeconds": 1779004000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Teacher_Si", "content": "All thesis candidates must sign and upload the AI Use Declaration PDF to Canvas before 2026-06-05 23:59." },
+    { "localId": 402, "timestampSeconds": 1779004060, "senderId": "wxid_teacher_eval", "senderDisplayName": "Teacher_Si", "content": "Annual Graduate Academic Conference registration closes 2026-06-12 at Lecture Hall B; submit your abstract if presenting." },
+    { "localId": 403, "timestampSeconds": 1779004120, "senderId": "wxid_dorm_eval", "senderDisplayName": "Dorm_Admin", "content": "Friendly reminder that Dorm Building 5 hot water maintenance happens May 18 09:00-16:00 as announced earlier." }
+  ],
+  "expectations": {
+    "minCards": 2,
+    "maxCards": 2,
+    "expectedTitles": ["AI Use Declaration", "Academic Conference"],
+    "mustContainFacts": ["Canvas", "23:59", "Lecture Hall B"],
+    "forbiddenTitleSubstrings": ["Hot Water"],
+    "forbiddenContentSubstrings": ["Dorm Building 5"],
+    "allowSlashMergedTitles": false,
+    "maxLlmCalls": 4,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

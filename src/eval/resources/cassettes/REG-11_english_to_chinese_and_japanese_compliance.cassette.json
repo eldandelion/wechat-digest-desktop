@@ -1,0 +1,24 @@
+{
+    "version": 1,
+    "scenarioId": "REG-11_english_to_chinese_and_japanese_compliance",
+    "descriptions": {
+        "001809191e82b584253e7b69bc12e8ed5aa8468aeb36b5a368181f292dd32f08": "pass1_triage",
+        "2f1f6aa92ea1e9679646e24fe70a99e2f2a21c869864f5c8126de176c6ed8c0a": "pass2_gatekeeper",
+        "50f62f661bb0d030fa2e716399c8eed71cca0d768743bcab9536440a473ae6f3": "pass3_synthesis",
+        "c9ab14e4c65604ccbaa3aafbbf4d1ddafcc81cd2adeda590d9f5d173df695173": "card_translator"
+    },
+    "entries": {
+        "001809191e82b584253e7b69bc12e8ed5aa8468aeb36b5a368181f292dd32f08": [
+            "{\"chunks\":[{\"topic\":\"Distributed Systems Guest Lecture\",\"message_ids\":[1101],\"category\":\"ACTIVITY\",\"reason\":\"Academic guest talk\"}]}"
+        ],
+        "2f1f6aa92ea1e9679646e24fe70a99e2f2a21c869864f5c8126de176c6ed8c0a": [
+            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Concrete time and auditorium\"}]}"
+        ],
+        "50f62f661bb0d030fa2e716399c8eed71cca0d768743bcab9536440a473ae6f3": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"分布式系统客座讲座\",\"summary\":\"本周二上午十点在礼堂举行分布式系统客座讲座。\",\"translated_summary\":\"本周二上午十点在礼堂举行分布式系统客座讲座。\",\"sections\":[{\"heading\":\"时间地点\",\"content\":\"- 本周二 10:00，Auditorium A\"}],\"category\":\"ACTIVITY\",\"priority\":\"NORMAL\",\"source_message_ids\":[1101]}]}"
+        ],
+        "c9ab14e4c65604ccbaa3aafbbf4d1ddafcc81cd2adeda590d9f5d173df695173": [
+            "{\"title\":\"分散システム特別講義のご案内\",\"summary\":\"今週火曜日の10:00よりAuditorium Aにて分散システムの特別講義を開催します。\",\"sections\":[{\"heading\":\"日時と会場\",\"content\":\"- 今週火曜日の10:00よりAuditorium Aで特別講義が行われます。\"}]}"
+        ]
+    }
+}

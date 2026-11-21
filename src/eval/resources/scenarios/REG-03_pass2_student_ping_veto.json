@@ -1,0 +1,25 @@
+{
+  "id": "REG-03_pass2_student_ping_veto",
+  "description": "Pass 2 gatekeeper approves the concrete professor deadline while rejecting a casual student confirmation ping.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 301, "timestampSeconds": 1779003000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Prof_Lin", "content": "All thesis applicants must submit printed copies on Nov 26 at 10:00 in Room 422-1." },
+    { "localId": 302, "timestampSeconds": 1779003060, "senderId": "wxid_student_eval", "senderDisplayName": "Student_A", "content": "@Prof_Lin Did you receive my draft thesis email from yesterday?" }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "expectedCategories": ["DEADLINE"],
+    "expectedTitles": ["Thesis Hard Copy"],
+    "mustContainFacts": ["Nov 26", "10:00", "Room 422-1"],
+    "forbiddenTitleSubstrings": ["draft thesis email"],
+    "forbiddenContentSubstrings": ["Did you receive"],
+    "forbiddenSourceSubstrings": ["Student_A"],
+    "maxLlmCalls": 3,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

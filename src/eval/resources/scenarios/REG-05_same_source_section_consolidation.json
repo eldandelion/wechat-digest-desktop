@@ -1,0 +1,22 @@
+{
+  "id": "REG-05_same_source_section_consolidation",
+  "description": "Multiple sub-events emitted for the same source message ID are consolidated into a single multi-section card preserving highest priority and earliest date.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 501, "timestampSeconds": 1779005000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Dean_Office", "content": "2026 Defense Packet Notice: 1) Eligibility requires all coursework credits cleared by June 1; 2) Documents: bring three bound copies and signed advisor form; 3) Venue: Room 422-1 Academic Affairs Office before 17:00." }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "minSectionsOnFirstCard": 3,
+    "expectedPriorities": ["CRITICAL"],
+    "expectedTitles": ["Defense Packet"],
+    "mustContainFacts": ["June 1", "bound copies", "422-1"],
+    "maxLlmCalls": 3,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

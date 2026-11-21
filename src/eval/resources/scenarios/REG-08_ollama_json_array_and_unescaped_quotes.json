@@ -1,0 +1,21 @@
+{
+  "id": "REG-08_ollama_json_array_and_unescaped_quotes",
+  "description": "Recovers cleanly when Ollama emits section content as a JSON array of bullets inside malformed JSON with a truncated closing container.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 801, "timestampSeconds": 1779008000, "senderId": "wxid_teacher_eval", "senderDisplayName": "TA_Chen", "content": "Midterm Finalized Seating: Building A Room 422-1 for surnames A-M; email accommodation form to ta@eval.edu before Friday 12:00." }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "expectedCategories": ["EXAM"],
+    "expectedTitles": ["Midterm"],
+    "mustContainFacts": ["422-1", "ta@eval.edu", "12:00"],
+    "minJsonRepairs": 1,
+    "maxLlmCalls": 3,
+    "requireLanguageCompliance": true
+  }
+}

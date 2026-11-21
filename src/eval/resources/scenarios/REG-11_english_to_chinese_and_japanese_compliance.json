@@ -1,0 +1,22 @@
+{
+  "id": "REG-11_english_to_chinese_and_japanese_compliance",
+  "description": "Under targetLanguage=ja, LanguageGate detects pure-Chinese output lacking Japanese Kana and translates all fields into natural Japanese.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "ja",
+  "messages": [
+    { "localId": 1101, "timestampSeconds": 1779011000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Prof_Sato", "content": "Guest lecture on Distributed Systems starts Tuesday 10:00 in Auditorium A." }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "expectedCategories": ["ACTIVITY"],
+    "mustContainFacts": ["10:00", "Auditorium A"],
+    "minTranslationRepairs": 1,
+    "maxTranslationRepairs": 1,
+    "maxLlmCalls": 4,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

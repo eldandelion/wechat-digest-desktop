@@ -1,0 +1,49 @@
+name: Build & Release macOS DMG
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Run unit tests & offline AI evaluation suite
+        run: ./gradlew test evalTest check --console=plain
+
+      - name: Package macOS DMG installer
+        run: ./gradlew packageDmg --console=plain
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatDigest-macOS-DMG
+          path: build/compose/binaries/main/dmg/*.dmg
+
+      - name: Publish GitHub Release on version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
+            gh release create "$TAG_NAME" build/compose/binaries/main/dmg/*.dmg \
+              --title "WeChat Digest Desktop $TAG_NAME (macOS)" \
+              --generate-notes

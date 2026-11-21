@@ -1,0 +1,21 @@
+{
+    "version": 1,
+    "scenarioId": "REG-09_ollama_truncated_mid_string_and_empty_retry",
+    "descriptions": {
+        "8f2323336a38e8646227593e027056a50b54c4590e8e9ee7f0dc67f64c95c473": "pass2_gatekeeper",
+        "9ec13a77d630d91664b1a6b30590a7e7525cea9992c37979af43c3a7df85c2f4": "pass3_synthesis",
+        "db0719d41237618f787cb03cfdef236d9d5af2398b1255c8c43af664f0c96d8a": "pass1_triage"
+    },
+    "entries": {
+        "8f2323336a38e8646227593e027056a50b54c4590e8e9ee7f0dc67f64c95c473": [
+            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Exam room, time, and required documents\"}]}"
+        ],
+        "9ec13a77d630d91664b1a6b30590a7e7525cea9992c37979af43c3a7df85c2f4": [
+            "__ERROR__:Empty or missing message in Ollama response",
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Physics Lab Midterm\",\"summary\":\"Bring student ID and signed AI declaration to Room 105 on June 8 at 09:00.\",\"translated_summary\":\"Bring student ID and signed AI declaration to Room 105 on June 8 at 09:00.\",\"category\":\"EXAM\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[901],\"sections\":[{\"heading\":\"Requirements\",\"content\":\"- Student ID card\\n- Signed AI declaration (Room 105, June 8 09:00"
+        ],
+        "db0719d41237618f787cb03cfdef236d9d5af2398b1255c8c43af664f0c96d8a": [
+            "{\"chunks\":[{\"topic\":\"Physics Lab Midterm\",\"message_ids\":[901],\"category\":\"EXAM\",\"reason\":\"Exam schedule and checklist\"}]}"
+        ]
+    }
+}

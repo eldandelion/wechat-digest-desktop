@@ -1,0 +1,23 @@
+{
+  "id": "REG-06_chinese_to_english_translation_repair",
+  "description": "When Pass 3 returns untranslated Chinese under targetLanguage=en, LanguageGate invokes CardTranslator and repairs every card field on attempt 1.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 601, "timestampSeconds": 1779006000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Teacher_Si", "content": "请所有研究生于周五下午16:00前将开题报告纸质版交至行政楼308室张老师处，逾期不再受理。" }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "expectedCategories": ["DEADLINE"],
+    "expectedTitles": ["Proposal Report"],
+    "mustContainFacts": ["308", "16:00"],
+    "minTranslationRepairs": 1,
+    "maxTranslationRepairs": 1,
+    "maxLlmCalls": 4,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

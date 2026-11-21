@@ -1,0 +1,32 @@
+{
+  "id": "REG-01_emoji_acks_and_bare_mentions",
+  "description": "Static prefilter strips emoji confirmations, sticker tags, and XML cards while Pass 1 strips bare @所有人 mentions and retains the real deadline.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 101, "timestampSeconds": 1779001000, "senderId": "wxid_s1", "senderDisplayName": "Student_1", "content": "收到" },
+    { "localId": 102, "timestampSeconds": 1779001010, "senderId": "wxid_s2", "senderDisplayName": "Student_2", "content": "谢谢老师🙏🙏" },
+    { "localId": 103, "timestampSeconds": 1779001020, "senderId": "wxid_s3", "senderDisplayName": "Student_3", "content": "+1" },
+    { "localId": 104, "timestampSeconds": 1779001030, "senderId": "wxid_s4", "senderDisplayName": "Student_4", "content": "[Sticker]" },
+    { "localId": 105, "timestampSeconds": 1779001040, "senderId": "wxid_s5", "senderDisplayName": "Student_5", "content": "已提交" },
+    { "localId": 106, "timestampSeconds": 1779001050, "senderId": "wxid_s6", "senderDisplayName": "Student_6", "content": "<msg><appmsg><title>Share</title></appmsg></msg>" },
+    { "localId": 107, "timestampSeconds": 1779001060, "senderId": "wxid_teacher", "senderDisplayName": "Teacher_Si", "content": "@所有人" },
+    { "localId": 108, "timestampSeconds": 1779001070, "senderId": "wxid_teacher", "senderDisplayName": "Teacher_Si", "content": "Final project report submission closes Friday 17:00 on Canvas (Room 305 lab)." }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "minSurvivingPrefilter": 1,
+    "maxSurvivingPrefilter": 2,
+    "expectedCategories": ["DEADLINE"],
+    "expectedTitles": ["Final Project Report"],
+    "mustContainFacts": ["Canvas", "17:00", "305"],
+    "forbiddenContentSubstrings": ["谢谢老师", "Sticker"],
+    "forbiddenSourceSubstrings": ["Student_1", "Student_2"],
+    "maxLlmCalls": 3,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

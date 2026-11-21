@@ -1,0 +1,23 @@
+{
+  "id": "REG-07_card_translator_json_echo_corrective_retry",
+  "description": "When CardTranslator attempt 1 echoes source Chinese (Ollama failure mode), LanguageGate sends a corrective hint on attempt 2 and repairs the card into English.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 701, "timestampSeconds": 1779007000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Academic_Office", "content": "请全体硕士生于本周四15:00前往教务处201室领取毕业证封皮及离校手续单。" }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "expectedCategories": ["NOTICE"],
+    "expectedTitles": ["Diploma"],
+    "mustContainFacts": ["201", "15:00"],
+    "minTranslationRepairs": 2,
+    "maxTranslationRepairs": 2,
+    "maxLlmCalls": 6,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

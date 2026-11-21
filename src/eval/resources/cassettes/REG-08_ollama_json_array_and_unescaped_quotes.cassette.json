@@ -1,0 +1,20 @@
+{
+    "version": 1,
+    "scenarioId": "REG-08_ollama_json_array_and_unescaped_quotes",
+    "descriptions": {
+        "416c376f2df430e1b125752a54c59a74007a6f4c16cdf5eecb78fa435d5124fa": "pass3_synthesis",
+        "82271a57b447addb8818e7cdf48301ec44d832d2ed5db3c89c336dff96c8c34b": "pass2_gatekeeper",
+        "ff10b082b03b663dc6de15e3da51c2d0731a1d4c66d090882af3dba48acb25af": "pass1_triage"
+    },
+    "entries": {
+        "416c376f2df430e1b125752a54c59a74007a6f4c16cdf5eecb78fa435d5124fa": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Midterm \"Finalized\" Seating\",\"summary\":\"Building A Room 422-1 for surnames A-M; email accommodation form to ta@eval.edu before Friday 12:00.\",\"translated_summary\":\"Building A Room 422-1 for surnames A-M; email accommodation form to ta@eval.edu before Friday 12:00.\",\"sections\":[{\"heading\":\"Seating & Accommodations\",\"content\":[\"- Building A Room 422-1 for surnames A-M\",\"- Email ta@eval.edu before Friday 12:00\"]}],\"category\":\"EXAM\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[801]}]}"
+        ],
+        "82271a57b447addb8818e7cdf48301ec44d832d2ed5db3c89c336dff96c8c34b": [
+            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Concrete room, email, and deadline\"}]}"
+        ],
+        "ff10b082b03b663dc6de15e3da51c2d0731a1d4c66d090882af3dba48acb25af": [
+            "{\"chunks\":[{\"topic\":\"Midterm Finalized Seating\",\"message_ids\":[801],\"category\":\"EXAM\",\"reason\":\"Exam seating and accommodation deadline\"}]}"
+        ]
+    }
+}

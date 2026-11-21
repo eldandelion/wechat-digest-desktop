@@ -1,0 +1,21 @@
+{
+  "id": "REG-09_ollama_truncated_mid_string_and_empty_retry",
+  "description": "Retries automatically when Ollama returns an empty response on attempt 1 and repairs mid-string truncated JSON on attempt 2.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 901, "timestampSeconds": 1779009000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Lab_Instructor", "content": "Physics Lab Midterm: Bring student ID and signed AI declaration to Room 105 on June 8 at 09:00." }
+  ],
+  "expectations": {
+    "minCards": 1,
+    "maxCards": 1,
+    "expectedCategories": ["EXAM"],
+    "expectedTitles": ["Physics Lab Midterm"],
+    "mustContainFacts": ["Room 105", "09:00", "AI declaration"],
+    "minJsonRepairs": 1,
+    "maxLlmCalls": 4,
+    "requireLanguageCompliance": true
+  }
+}

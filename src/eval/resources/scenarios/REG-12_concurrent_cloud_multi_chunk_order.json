@@ -1,0 +1,24 @@
+{
+  "id": "REG-12_concurrent_cloud_multi_chunk_order",
+  "description": "4 distinct notices are batched into 1 Pass 2 gatekeeper call and 4 concurrent Pass 3 calls while preserving chronological chunk order and strict LLM budget.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 1201, "timestampSeconds": 1779012000, "senderId": "wxid_teacher_eval", "senderDisplayName": "Teacher_Si", "content": "Final Exam Schedule: Algorithms written exam on June 15 at 09:00 in Hall 101." },
+    { "localId": 1202, "timestampSeconds": 1779012060, "senderId": "wxid_library_eval", "senderDisplayName": "Library_Desk", "content": "Library Extended Hours: Main Reading Room stays open until 23:30 from June 1 to June 20." },
+    { "localId": 1203, "timestampSeconds": 1779012120, "senderId": "wxid_career_eval", "senderDisplayName": "Career_Center", "content": "Summer Career Fair Registration closes May 28 at Student Union Room 202." },
+    { "localId": 1204, "timestampSeconds": 1779012180, "senderId": "wxid_lab_eval", "senderDisplayName": "Lab_Safety", "content": "Mandatory Lab Safety Quiz must be completed before May 29 at 18:00 on Safety Portal." }
+  ],
+  "expectations": {
+    "minCards": 4,
+    "maxCards": 4,
+    "expectedTitles": ["Algorithms", "Library", "Career Fair", "Lab Safety Quiz"],
+    "mustContainFacts": ["Hall 101", "23:30", "Room 202", "Safety Portal"],
+    "allowSlashMergedTitles": false,
+    "maxLlmCalls": 6,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}
