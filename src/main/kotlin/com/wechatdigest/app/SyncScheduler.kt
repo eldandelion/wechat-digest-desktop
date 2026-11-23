@@ -1,6 +1,8 @@
 package com.wechatdigest.app
 
+import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.notification.NotificationDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -39,7 +41,10 @@ class SyncScheduler(
                         )
                     }
                 } catch (e: Exception) {
-                    System.err.println("[SyncScheduler] Background sync error: ${e.message}")
+                    if (e is CancellationException) throw e
+                    System.err.println(
+                        "[SyncScheduler] Background sync error: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
+                    )
                 }
             }
         }

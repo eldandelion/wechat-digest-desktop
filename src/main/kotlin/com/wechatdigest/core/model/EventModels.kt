@@ -12,6 +12,8 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
+import java.io.File
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -49,7 +51,7 @@ enum class EventPriority {
     @SerialName("LOW") LOW;
 
     companion object {
-        fun fromString(value: String): EventPriority = when (value.uppercase().trim()) {
+        fun fromString(value: String): EventPriority = when (value.uppercase(Locale.ROOT).trim()) {
             "CRITICAL" -> CRITICAL
             "IMPORTANT", "HIGH" -> IMPORTANT
             "NORMAL", "MEDIUM" -> NORMAL
@@ -68,7 +70,7 @@ enum class EventCategory {
     @SerialName("OTHER") OTHER;
 
     companion object {
-        fun fromString(value: String): EventCategory = when (value.uppercase().trim()) {
+        fun fromString(value: String): EventCategory = when (value.uppercase(Locale.ROOT).trim()) {
             "EXAM" -> EXAM
             "DEADLINE" -> DEADLINE
             "NOTICE", "ACADEMIC" -> NOTICE
@@ -88,6 +90,27 @@ data class EventSection(
 )
 
 @Serializable
+data class EventAttachment(
+    val fileName: String,
+    val fileExtension: String = "",
+    val fileSizeBytes: Long = 0L,
+    val md5: String = "",
+    val localPath: String? = null,
+    val messageTimestampSeconds: Long = 0L,
+    val mediaExpireAtSeconds: Long? = null
+) {
+    /** Returns `true` when [localPath] is populated and points to an existing regular file on disk. */
+    fun isLocalFilePresent(): Boolean = !localPath.isNullOrBlank() && File(localPath).isFile
+
+    /** Returns `true` when WeChat's `media_expire_at` timestamp has passed relative to [nowEpochSeconds]. */
+    fun isExpired(nowEpochSeconds: Long = System.currentTimeMillis() / 1000): Boolean =
+        mediaExpireAtSeconds != null && mediaExpireAtSeconds > 0L && nowEpochSeconds > mediaExpireAtSeconds
+
+    /** Stable deduplication key built from normalized MD5 (or fallback filename and timestamp). */
+    fun previewKey(): String = md5.trim().lowercase(Locale.ROOT).ifBlank { "$fileName:$messageTimestampSeconds" }
+}
+
+@Serializable
 data class EventCard(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
@@ -102,6 +125,7 @@ data class EventCard(
     val sourceRoomName: String = "",
     val sourceMessages: String = "",
     val translatedSourceMessages: String = "",
+    val attachments: List<EventAttachment> = emptyList(),
     val timestampSeconds: Long,
     val isRead: Boolean = false,
     val isStarred: Boolean = false,

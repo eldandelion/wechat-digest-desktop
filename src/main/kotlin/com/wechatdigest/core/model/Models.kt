@@ -40,5 +40,8 @@ data class WeChatMessage(
     val senderDisplayName: String,
     val rawContent: String,
     val textContent: String,
-    val isZstdCompressed: Boolean
+    val isZstdCompressed: Boolean,
+    val localType: Long = 1L,
+    val attachments: List<EventAttachment> = emptyList(),
+    val attachmentPreviews: Map<String, String> = emptyMap()
 )

@@ -4,6 +4,7 @@ import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LanguageHelper
 import com.wechatdigest.core.llm.LlmConfig
+import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.MessageTranslator
 import com.wechatdigest.core.model.EventCard
@@ -720,5 +721,17 @@ class SanitizationAndLlmTest {
         )
         assertTrue(EventExtractor(badJsonClient).extractEventsResult(listOf(msg), "room@chatroom").isFailure)
         badJsonClient.close()
+
+        // Remote cleartext HTTP must fail transport security check while local loopback HTTP stays allowed
+        val insecureRemoteClient = KtorLlmClient(
+            LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, endpointUrl = "http://api.example.com/v1", apiKey = "k"),
+            MockEngine { respond("", HttpStatusCode.OK) }
+        )
+        assertTrue(kotlin.runCatching { insecureRemoteClient.chatCompletion("sys", "usr") }.isFailure)
+        insecureRemoteClient.close()
+
+        val redacted = LlmJsonUtils.sanitizeLogMessage("Failed opening /Users/alice/WeChat/db/contact.db?token=1")
+        assertFalse(redacted.contains("/Users/alice"))
+        assertTrue(redacted.contains("[redacted-path]"))
     }
 }

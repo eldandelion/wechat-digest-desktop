@@ -1,5 +1,7 @@
 package com.wechatdigest.app
 
+import com.wechatdigest.core.attachment.AttachmentLauncher
+import com.wechatdigest.core.attachment.WeChatAttachmentResolver
 import com.wechatdigest.core.calendar.CalendarLauncher
 import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.detector.DiscoveredPath
@@ -7,10 +9,12 @@ import com.wechatdigest.core.detector.WeChatPathDetector
 import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmConfig
+import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.llm.LocalOllamaModel
 import com.wechatdigest.core.llm.MessageTranslator
 import com.wechatdigest.core.llm.OllamaDiscoveryResult
 import com.wechatdigest.core.llm.OllamaService
+import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.GroupChat
@@ -22,6 +26,7 @@ import com.wechatdigest.storage.EventCardStore
 import com.wechatdigest.storage.GroupConfigStore
 import com.wechatdigest.storage.SettingsStore
 import com.wechatdigest.storage.SyncCheckpointStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -34,11 +39,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.file.Files
 
 enum class Screen {
     EVENTS,
@@ -55,6 +62,7 @@ private data class FeedFilterCriteria(
     val priority: EventPriority?,
     val roomId: String?,
     val starredOnly: Boolean,
+    val unreadOnly: Boolean,
     val sortOrder: EventSortOrder,
     val query: String
 )
@@ -72,7 +80,8 @@ class AppState(
     private val decryptedCacheDir: File = File(System.getProperty("user.home"), "Library/Application Support/WeChatDigest/decrypted"),
     syncScheduler: SyncScheduler? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main),
-    private val llmClientFactory: (LlmConfig) -> LlmClient = { KtorLlmClient(it) }
+    private val llmClientFactory: (LlmConfig) -> LlmClient = { KtorLlmClient(it) },
+    private val attachmentLauncher: AttachmentLauncher = AttachmentLauncher()
 ) {
     private val _currentScreen = MutableStateFlow(Screen.EVENTS)
     val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
@@ -86,6 +95,7 @@ class AppState(
     val priorityFilter = MutableStateFlow<EventPriority?>(null)
     val groupFilter = MutableStateFlow<String?>(null)
     val starredOnlyFilter = MutableStateFlow(false)
+    val unreadOnlyFilter = MutableStateFlow(false)
     val sortOrder = MutableStateFlow(EventSortOrder.NEWEST_FIRST)
     val searchQuery = MutableStateFlow("")
     val groupSearchQuery = MutableStateFlow("")
@@ -105,14 +115,18 @@ class AppState(
     private val _syncCheckpoints = MutableStateFlow<Map<String, SyncCheckpoint>>(emptyMap())
     val syncCheckpoints: StateFlow<Map<String, SyncCheckpoint>> = _syncCheckpoints.asStateFlow()
 
+    private val toggleFiltersFlow = combine(starredOnlyFilter, unreadOnlyFilter) { starredOnly, unreadOnly ->
+        starredOnly to unreadOnly
+    }
+
     private val filterCriteriaFlow = combine(
         priorityFilter,
         groupFilter,
-        starredOnlyFilter,
+        toggleFiltersFlow,
         sortOrder,
         searchQuery
-    ) { priority, roomId, starredOnly, order, query ->
-        FeedFilterCriteria(priority, roomId, starredOnly, order, query)
+    ) { priority, roomId, (starredOnly, unreadOnly), order, query ->
+        FeedFilterCriteria(priority, roomId, starredOnly, unreadOnly, order, query)
     }
 
     val visibleEvents: StateFlow<List<EventCard>> = combine(
@@ -123,6 +137,7 @@ class AppState(
             val matchesPriority = criteria.priority == null || card.priority == criteria.priority
             val matchesGroup = criteria.roomId == null || card.sourceRoomId == criteria.roomId
             val matchesStarred = !criteria.starredOnly || card.isStarred
+            val matchesUnread = !criteria.unreadOnly || !card.isRead
             val query = criteria.query
             val matchesQuery = if (query.isBlank()) true else {
                 card.title.contains(query, ignoreCase = true) ||
@@ -134,7 +149,7 @@ class AppState(
                     section.content.contains(query, ignoreCase = true)
                 }
             }
-            matchesPriority && matchesGroup && matchesStarred && matchesQuery
+            matchesPriority && matchesGroup && matchesStarred && matchesUnread && matchesQuery
         }
         when (criteria.sortOrder) {
             EventSortOrder.NEWEST_FIRST -> filtered.sortedWith(
@@ -163,7 +178,13 @@ class AppState(
     private val _translatingCardIds = MutableStateFlow<Set<String>>(emptySet())
     val translatingCardIds: StateFlow<Set<String>> = _translatingCardIds.asStateFlow()
 
+    private val _recheckingAttachmentCardIds = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Card IDs currently re-scanning local WeChat storage for downloaded attachments. */
+    val recheckingAttachmentCardIds: StateFlow<Set<String>> = _recheckingAttachmentCardIds.asStateFlow()
+
     private val settingsMutex = Mutex()
+    private var refreshRoomsJob: Job? = null
 
     private val _showWizard = MutableStateFlow(false)
     val showWizard: StateFlow<Boolean> = _showWizard.asStateFlow()
@@ -230,6 +251,7 @@ class AppState(
         _syncCheckpoints.value = emptyMap()
         groupFilter.value = null
         starredOnlyFilter.value = false
+        unreadOnlyFilter.value = false
         _selectedEventId.value = null
         _snackbarMessage.emit("Cleared all extracted events and sync checkpoints.")
     }
@@ -241,7 +263,11 @@ class AppState(
             syncCheckpointStore?.resetAll()
             groupConfigStore?.clearAll()
             settingsStore.clear()
-            if (decryptedCacheDir.exists() && decryptedCacheDir.isDirectory && decryptedCacheDir.name == "decrypted") {
+            if (!Files.isSymbolicLink(decryptedCacheDir.toPath()) &&
+                decryptedCacheDir.exists() &&
+                decryptedCacheDir.isDirectory &&
+                decryptedCacheDir.name == "decrypted"
+            ) {
                 decryptedCacheDir.deleteRecursively()
             }
         }
@@ -254,6 +280,7 @@ class AppState(
         priorityFilter.value = null
         groupFilter.value = null
         starredOnlyFilter.value = false
+        unreadOnlyFilter.value = false
         sortOrder.value = EventSortOrder.NEWEST_FIRST
         searchQuery.value = ""
         groupSearchQuery.value = ""
@@ -268,6 +295,11 @@ class AppState(
 
     fun autoDetectWeChatCandidates(): List<DiscoveredPath> {
         return wechatPathDetector.detectCandidates()
+    }
+
+    /** Runs WeChat installation auto-detection on [Dispatchers.IO]. */
+    suspend fun autoDetectWeChatCandidatesAsync(): List<DiscoveredPath> = withContext(Dispatchers.IO) {
+        wechatPathDetector.detectCandidates()
     }
 
     fun detectLocalOllama(
@@ -294,8 +326,9 @@ class AppState(
                 }
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             _detectedOllamaModels.value = emptyList()
-            _ollamaStatusMessage.value = "Detection failed: ${e.message}"
+            _ollamaStatusMessage.value = "Detection failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
         } finally {
             _isDetectingOllama.value = false
         }
@@ -348,7 +381,7 @@ class AppState(
         if (result.isSuccess) {
             _snackbarMessage.emit("Exported '${card.title}' to Calendar.")
         } else {
-            val err = result.exceptionOrNull()?.message ?: "Unknown error"
+            val err = LlmJsonUtils.sanitizeLogMessage(result.exceptionOrNull()?.message)
             _snackbarMessage.emit("Failed to export to Calendar: $err")
         }
     }
@@ -415,63 +448,99 @@ class AppState(
         }
     }
 
-    fun updateSettings(newSettings: AppSettings): Job = scope.launch {
-        _settings.value = newSettings
-        settingsMutex.withLock {
-            val latest = _settings.value
-            withContext(Dispatchers.IO) {
-                settingsStore.save(latest)
-            }
-        }
-        refreshRoomsInternal()
+    fun updateSettings(newSettings: AppSettings): Job = transformSettings { newSettings }
 
-        if (newSettings.autoSyncEnabled) {
-            scheduler.start(
-                intervalMinutes = newSettings.syncIntervalMinutes,
-                notifyOnNewEvents = newSettings.notifyOnNewEvents
-            )
-        } else {
-            scheduler.stop()
+    /**
+     * Atomically updates [settings] via [transform], persists the latest snapshot to SQLite on IO,
+     * refreshes chatrooms when data/key paths change, and updates background sync scheduling.
+     */
+    fun transformSettings(transform: (AppSettings) -> AppSettings): Job {
+        lateinit var previous: AppSettings
+        val updated = _settings.updateAndGet { current ->
+            previous = current
+            transform(current)
+        }
+        return scope.launch {
+            settingsMutex.withLock {
+                val latest = _settings.value
+                withContext(Dispatchers.IO) {
+                    settingsStore.save(latest)
+                }
+            }
+            if (updated.wechatDataDir != previous.wechatDataDir ||
+                updated.keysPath != previous.keysPath
+            ) {
+                refreshRooms().join()
+            }
+
+            val schedulerConfigChanged = updated.autoSyncEnabled != previous.autoSyncEnabled ||
+                updated.syncIntervalMinutes != previous.syncIntervalMinutes ||
+                updated.notifyOnNewEvents != previous.notifyOnNewEvents
+            if (schedulerConfigChanged) {
+                if (updated.autoSyncEnabled) {
+                    scheduler.start(
+                        intervalMinutes = updated.syncIntervalMinutes,
+                        notifyOnNewEvents = updated.notifyOnNewEvents
+                    )
+                } else {
+                    scheduler.stop()
+                }
+            }
         }
     }
 
     fun toggleRoomMonitored(roomId: String): Job {
-        val currentMonitored = _settings.value.monitoredRoomIds
-        val updated = if (currentMonitored.contains(roomId)) {
-            currentMonitored - roomId
-        } else {
-            currentMonitored + roomId
+        return transformSettings { current ->
+            val updated = if (current.monitoredRoomIds.contains(roomId)) {
+                current.monitoredRoomIds - roomId
+            } else {
+                current.monitoredRoomIds + roomId
+            }
+            current.copy(monitoredRoomIds = updated)
         }
-        return updateSettings(_settings.value.copy(monitoredRoomIds = updated))
     }
 
-    fun refreshRooms(): Job = scope.launch {
-        refreshRoomsInternal()
+    fun refreshRooms(): Job {
+        refreshRoomsJob?.cancel()
+        val job = scope.launch {
+            refreshRoomsInternal()
+        }
+        refreshRoomsJob = job
+        return job
+    }
+
+    private fun resolveDriverFromSettings(): WeChatDatabaseDriver? {
+        val snapshot = _settings.value
+        val dataDirStr = snapshot.wechatDataDir
+        if (dataDirStr.isBlank()) return null
+        val canonicalDir = runCatching { File(dataDirStr).canonicalFile }.getOrNull() ?: return null
+        if (!canonicalDir.exists() || !canonicalDir.isDirectory) return null
+        val keysFile = snapshot.keysPath
+            .takeIf { it.isNotBlank() }
+            ?.let { runCatching { File(it).canonicalFile }.getOrNull() }
+            ?.takeIf { it.exists() && it.isFile }
+        return WeChatDatabaseDriver(
+            baseDir = canonicalDir,
+            customKeysFile = keysFile,
+            cacheDir = decryptedCacheDir
+        )
     }
 
     private suspend fun refreshRoomsInternal() {
-        val dataDirStr = _settings.value.wechatDataDir
-        if (dataDirStr.isBlank()) {
-            _availableRooms.value = emptyList()
-            return
-        }
-        val dir = File(dataDirStr)
-        if (!dir.exists() || !dir.isDirectory) {
-            _availableRooms.value = emptyList()
-            return
-        }
-
         _isLoadingRooms.value = true
         try {
-            val keysFile = if (_settings.value.keysPath.isNotBlank()) File(_settings.value.keysPath) else null
+            val driver = withContext(Dispatchers.IO) { resolveDriverFromSettings() }
+            if (driver == null) {
+                _availableRooms.value = emptyList()
+                return
+            }
             val rooms = withContext(Dispatchers.IO) {
-                val driver = WeChatDatabaseDriver(baseDir = dir, customKeysFile = keysFile)
-                val contactRepo = WeChatContactRepository(driver)
-                contactRepo.listAllChatrooms()
+                WeChatContactRepository(driver).listAllChatrooms()
             }
             _availableRooms.value = rooms
         } catch (e: Exception) {
-            System.err.println("[AppState] Failed to load chatrooms: ${e.message}")
+            if (e is CancellationException) throw e
+            System.err.println("[AppState] Failed to load chatrooms: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
             _availableRooms.value = emptyList()
         } finally {
             _isLoadingRooms.value = false
@@ -482,28 +551,14 @@ class AppState(
      * Loads resolved group members for a given [roomId] from WeChat's contact.db on IO.
      */
     suspend fun loadRoomMembers(roomId: String): List<com.wechatdigest.core.model.GroupMember> {
-        val dataDirStr = _settings.value.wechatDataDir
-        if (dataDirStr.isBlank()) return emptyList()
-        val canonicalDir = File(dataDirStr).canonicalFile
-        if (!canonicalDir.exists() || !canonicalDir.isDirectory) return emptyList()
-
         return try {
-            val keysFile = _settings.value.keysPath
-                .takeIf { it.isNotBlank() }
-                ?.let(::File)
-                ?.canonicalFile
-                ?.takeIf { it.exists() && it.isFile }
             withContext(Dispatchers.IO) {
-                val driver = WeChatDatabaseDriver(
-                    baseDir = canonicalDir,
-                    customKeysFile = keysFile,
-                    cacheDir = decryptedCacheDir
-                )
+                val driver = resolveDriverFromSettings() ?: return@withContext emptyList()
                 WeChatContactRepository(driver).listRoomMembers(roomId)
             }
         } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            System.err.println("[AppState] Failed to load members: ${e.message}")
+            if (e is CancellationException) throw e
+            System.err.println("[AppState] Failed to load members: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
             emptyList()
         }
     }
@@ -529,7 +584,8 @@ class AppState(
                 }
             }
         } catch (e: Exception) {
-            _snackbarMessage.emit("Sync error: ${e.message}")
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Sync error: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         } finally {
             _isSyncing.value = false
         }
@@ -563,13 +619,94 @@ class AppState(
                     }
                 }
             }.onFailure { err ->
-                _snackbarMessage.emit("Message translation failed: ${err.message ?: "Unknown error"}")
+                _snackbarMessage.emit("Message translation failed: ${LlmJsonUtils.sanitizeLogMessage(err.message)}")
             }
         } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
-            _snackbarMessage.emit("Message translation failed: ${e.message ?: "Unknown error"}")
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Message translation failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         } finally {
             _translatingCardIds.value = _translatingCardIds.value - cardId
+        }
+    }
+
+    /**
+     * Opens a downloaded safe document [attachment] in its default viewer, strictly confined
+     * under WeChat's verified `msg/file` folder.
+     */
+    fun openAttachment(attachment: EventAttachment): Job =
+        performAttachmentAction(attachment, verb = "open") { file, allowedRoot ->
+            attachmentLauncher.openFile(file, allowedRoot = allowedRoot)
+        }
+
+    /**
+     * Reveals a downloaded [attachment] in Finder, strictly confined under WeChat's `msg/file` folder.
+     */
+    fun revealAttachmentInFinder(attachment: EventAttachment): Job =
+        performAttachmentAction(attachment, verb = "reveal") { file, allowedRoot ->
+            attachmentLauncher.revealInFinder(file, allowedRoot = allowedRoot)
+        }
+
+    private fun performAttachmentAction(
+        attachment: EventAttachment,
+        verb: String,
+        action: (File, File) -> Result<Unit>
+    ): Job = scope.launch {
+        val localPath = attachment.localPath?.takeIf { it.isNotBlank() }
+        if (localPath == null) {
+            _snackbarMessage.emit("File is not downloaded on disk yet. Open it in WeChat first, then click Re-check.")
+            return@launch
+        }
+        val result = withContext(Dispatchers.IO) {
+            val allowedRoot = resolveDriverFromSettings()?.let { WeChatAttachmentResolver(it).resolveMsgFileRoot() }
+                ?: return@withContext Result.failure<Unit>(
+                    IllegalStateException("WeChat attachments folder could not be verified.")
+                )
+            action(File(localPath), allowedRoot)
+        }
+        if (result.isFailure) {
+            val err = LlmJsonUtils.sanitizeLogMessage(result.exceptionOrNull()?.message)
+            if (err == "WeChat attachments folder could not be verified.") {
+                _snackbarMessage.emit(err)
+            } else {
+                _snackbarMessage.emit("Failed to $verb '${attachment.fileName}': $err")
+            }
+        }
+    }
+
+    /**
+     * Re-scans WeChat's `hardlink.db` and `msg/file/` folders on [Dispatchers.IO] to locate newly
+     * downloaded attachments for [cardId] and persists updated paths to [EventCardStore].
+     */
+    fun recheckCardAttachments(cardId: String): Job = scope.launch {
+        if (cardId in _recheckingAttachmentCardIds.value) return@launch
+        val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
+        if (card.attachments.isEmpty()) return@launch
+
+        _recheckingAttachmentCardIds.value = _recheckingAttachmentCardIds.value + cardId
+        try {
+            val (refreshed, foundCount) = withContext(Dispatchers.IO) {
+                val driver = resolveDriverFromSettings() ?: return@withContext null to 0
+                val updatedList = WeChatAttachmentResolver(driver).refreshAttachments(card.attachments)
+                eventCardStore.updateAttachmentsOrThrow(cardId, updatedList)
+                updatedList to updatedList.count { it.isLocalFilePresent() }
+            }
+            if (refreshed == null) {
+                _snackbarMessage.emit("WeChat data directory is not configured or does not exist.")
+                return@launch
+            }
+            _events.value = _events.value.map { existing ->
+                if (existing.id == cardId) existing.copy(attachments = refreshed) else existing
+            }
+            if (foundCount > 0) {
+                _snackbarMessage.emit("Located $foundCount downloaded attachment${if (foundCount == 1) "" else "s"}.")
+            } else {
+                _snackbarMessage.emit("Attachment still not found in WeChat's local files.")
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Attachment re-check failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        } finally {
+            _recheckingAttachmentCardIds.value = _recheckingAttachmentCardIds.value - cardId
         }
     }
 }

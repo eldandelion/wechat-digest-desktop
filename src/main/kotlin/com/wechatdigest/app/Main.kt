@@ -110,7 +110,7 @@ fun main() = application {
             LaunchedEffect(window) {
                 window.minimumSize = java.awt.Dimension(440, 500)
             }
-            WeChatDigestTheme {
+            WeChatDigestTheme(themeMode = currentSettings.themeMode) {
                 MainAppShell(appState)
             }
         }

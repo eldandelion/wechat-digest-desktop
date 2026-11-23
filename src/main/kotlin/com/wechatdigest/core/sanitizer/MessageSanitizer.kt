@@ -118,7 +118,7 @@ object MessageSanitizer {
         config: PrefilterConfig = PrefilterConfig()
     ): List<WeChatMessage> {
         return messages.filter { msg ->
-            isSubstantive(msg.textContent, config)
+            msg.attachments.isNotEmpty() || isSubstantive(msg.textContent, config)
         }
     }
 

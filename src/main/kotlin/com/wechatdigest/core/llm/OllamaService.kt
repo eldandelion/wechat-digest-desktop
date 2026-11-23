@@ -9,6 +9,7 @@ import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -132,8 +133,10 @@ class OllamaService(
                     OllamaDiscoveryResult.Success(endpointUrl = candidate, models = models)
                 }
             } catch (e: Exception) {
-                lastError = e.message ?: e.javaClass.simpleName
-                System.err.println("[OllamaService] Probe failed for $candidate: $lastError")
+                if (e is CancellationException) throw e
+                val sanitized = LlmJsonUtils.sanitizeLogMessage(e.message ?: e.javaClass.simpleName)
+                lastError = sanitized
+                System.err.println("[OllamaService] Probe failed: $sanitized")
             }
         }
 

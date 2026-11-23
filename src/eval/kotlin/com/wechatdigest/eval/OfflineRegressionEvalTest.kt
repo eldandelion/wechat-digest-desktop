@@ -141,4 +141,66 @@ class OfflineRegressionEvalTest {
         assertEquals(openAiResult.cards.single().category, ollamaResult.cards.single().category)
         assertEquals(openAiResult.cards.single().priority, ollamaResult.cards.single().priority)
     }
+
+    @Test
+    fun `EventExtractor propagates attachments and bounded previews into Pass 3 card synthesis`() = runBlocking {
+        val attachment = com.wechatdigest.core.model.EventAttachment(
+            fileName = "exam_seats.xlsx",
+            fileExtension = "xlsx",
+            fileSizeBytes = 4096L,
+            md5 = "0123456789abcdef0123456789abcdef",
+            localPath = "/tmp/mock/exam_seats.xlsx",
+            messageTimestampSeconds = 1795000005L
+        )
+        val messages = listOf(
+            WeChatMessage(
+                localId = 901L,
+                timestampSeconds = 1795000000L,
+                senderId = "wxid_prof",
+                senderDisplayName = "Prof_Lin",
+                rawContent = "Midterm exam is Nov 28 at 14:00. Seating sheet below.",
+                textContent = "Midterm exam is Nov 28 at 14:00. Seating sheet below.",
+                isZstdCompressed = false
+            ),
+            WeChatMessage(
+                localId = 902L,
+                timestampSeconds = 1795000005L,
+                senderId = "wxid_prof",
+                senderDisplayName = "Prof_Lin",
+                rawContent = "<msg><appmsg><title>exam_seats.xlsx</title><type>6</type></appmsg></msg>",
+                textContent = "[Shared File: exam_seats.xlsx (4 KB)]",
+                isZstdCompressed = false,
+                localType = (6L shl 32) or 49L,
+                attachments = listOf(attachment),
+                attachmentPreviews = mapOf(attachment.previewKey() to "[Sheet: Seats (2 rows)]\nStudent | Room\nAll | Hall B-102")
+            )
+        )
+
+        var sawPreviewInPass3 = false
+        val mockEngine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val contentJson = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"Midterm Exam Seating","message_ids":[901,902],"category":"EXAM"}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Exam schedule and seating"}]}"""
+                else -> {
+                    sawPreviewInPass3 = body.contains("Hall B-102") && body.contains("<attachment_content")
+                    """{"is_relevant":true,"events":[{"title":"Midterm Exam Seating","summary":"Midterm exam is Nov 28 at 14:00 in Hall B-102 per exam_seats.xlsx.","category":"EXAM","priority":"CRITICAL","source_message_ids":[901,902]}]}"""
+                }
+            }
+            val payload = """{"choices":[{"message":{"role":"assistant","content":${Json.encodeToString(contentJson)}}}]}"""
+            respond(payload, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val extractor = EventExtractor(
+            llmClient = KtorLlmClient(LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, apiKey = "k"), mockEngine),
+            maxConcurrency = 1
+        )
+        val cards = extractor.extractEventsResult(messages = messages, roomId = "exam@chatroom").getOrThrow()
+
+        assertTrue(sawPreviewInPass3, "Pass 3 must receive sanitized <attachment_content> preview")
+        assertEquals(1, cards.size)
+        assertEquals(listOf(attachment), cards.single().attachments)
+    }
 }

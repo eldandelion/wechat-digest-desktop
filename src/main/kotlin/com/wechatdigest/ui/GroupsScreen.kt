@@ -16,9 +16,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
@@ -44,6 +45,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppState
@@ -55,7 +57,6 @@ import com.wechatdigest.core.model.SyncCheckpoint
 /**
  * Screen listing discovered WeChat chatrooms with monitoring toggles, rule configuration, and sync checkpoint reset.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun GroupsScreen(appState: AppState) {
     val settings by appState.settings.collectAsState()
@@ -63,212 +64,179 @@ fun GroupsScreen(appState: AppState) {
     val isLoading by appState.isLoadingRooms.collectAsState()
     val groupConfigs by appState.groupConfigs.collectAsState()
     val syncCheckpoints by appState.syncCheckpoints.collectAsState()
-
     val query by appState.groupSearchQuery.collectAsState()
     var showSelectedOnly by remember { mutableStateOf(false) }
     var editingRoom by remember { mutableStateOf<GroupChat?>(null) }
 
     val filteredRooms = remember(rooms, query, showSelectedOnly, settings.monitoredRoomIds) {
-        val baseRooms = if (showSelectedOnly) {
-            rooms.filter { settings.monitoredRoomIds.contains(it.roomId) }
-        } else {
-            rooms
-        }
-        if (query.isBlank()) baseRooms else {
-            baseRooms.filter {
-                it.displayName.contains(query, ignoreCase = true) ||
-                it.roomId.contains(query, ignoreCase = true)
-            }
-        }
+        filterChatrooms(rooms, query, showSelectedOnly, settings.monitoredRoomIds)
     }
-
     val canScan = !isLoading && settings.wechatDataDir.isNotBlank()
 
     Box(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(start = 24.dp, top = 16.dp, end = 24.dp)
-        ) {
-                PillSearchBar(
-                    query = query,
-                    onQueryChange = { appState.groupSearchQuery.value = it },
-                    placeholder = "Search groups",
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Spacer(Modifier.height(14.dp))
-
-                // Data dir warning banner if not set
-                if (settings.wechatDataDir.isBlank()) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.errorContainer
-                        ),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.Warning,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onErrorContainer
-                            )
-                            Spacer(Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "WeChat directory not set",
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onErrorContainer
-                                )
-                                Text(
-                                    text = "Configure your WeChat data storage directory in Settings to discover chatrooms.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onErrorContainer
-                                )
-                            }
-                            TextButton(onClick = { appState.selectScreen(Screen.SETTINGS) }) {
-                                Text("Settings", color = MaterialTheme.colorScheme.onErrorContainer)
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(16.dp))
-                }
-
-                // Selection Filter Chips
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    FilterChip(
-                        selected = !showSelectedOnly,
-                        onClick = { showSelectedOnly = false },
-                        label = { Text("All (${rooms.size})") }
-                    )
-                    FilterChip(
-                        selected = showSelectedOnly,
-                        onClick = { showSelectedOnly = true },
-                        label = { Text("Selected (${settings.monitoredRoomIds.size})") }
-                    )
-                }
-
-                Spacer(Modifier.height(16.dp))
-
-                // List or Loading / Empty
-                if (isLoading && rooms.isEmpty()) {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                } else if (filteredRooms.isEmpty()) {
-                    GroupsEmptyState(
-                        roomsEmpty = rooms.isEmpty(),
-                        showSelectedOnly = showSelectedOnly,
-                        queryBlank = query.isBlank()
-                    )
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(bottom = 88.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(filteredRooms, key = { it.roomId }) { room ->
-                            GroupRoomCard(
-                                room = room,
-                                isChecked = settings.monitoredRoomIds.contains(room.roomId),
-                                config = groupConfigs[room.roomId],
-                                checkpoint = syncCheckpoints[room.roomId],
-                                onToggleMonitored = { appState.toggleRoomMonitored(room.roomId) },
-                                onResetCheckpoint = { appState.resetGroupCheckpoint(room.roomId) },
-                                onConfigureRules = { editingRoom = room }
-                            )
-                        }
-                    }
-                }
-        }
-
-        if (isLoading) {
-            LinearProgressIndicator(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.TopCenter)
+        Column(modifier = Modifier.fillMaxSize().padding(start = 24.dp, top = 8.dp, end = 24.dp)) {
+            PillSearchBar(query = query, onQueryChange = { appState.groupSearchQuery.value = it }, placeholder = "Search groups", modifier = Modifier.fillMaxWidth())
+            if (settings.wechatDataDir.isBlank()) {
+                Spacer(Modifier.height(8.dp))
+                MissingDirectoryBanner(onOpenSettings = { appState.selectScreen(Screen.SETTINGS) })
+            }
+            // FilterChip has 8.dp built-in vertical touch padding above and below its pill, so 8.dp spacers give 16.dp visual gaps on both sides.
+            Spacer(Modifier.height(8.dp))
+            GroupsFilterChipsRow(rooms.size, settings.monitoredRoomIds.size, showSelectedOnly) { showSelectedOnly = it }
+            Spacer(Modifier.height(8.dp))
+            GroupsListContent(
+                isLoading = isLoading,
+                roomsEmpty = rooms.isEmpty(),
+                showSelectedOnly = showSelectedOnly,
+                queryBlank = query.isBlank(),
+                filteredRooms = filteredRooms,
+                monitoredIds = settings.monitoredRoomIds,
+                groupConfigs = groupConfigs,
+                syncCheckpoints = syncCheckpoints,
+                onToggleMonitored = { appState.toggleRoomMonitored(it) },
+                onResetCheckpoint = { appState.resetGroupCheckpoint(it) },
+                onConfigureRules = { editingRoom = it }
             )
         }
-
-        ExtendedFloatingActionButton(
-            onClick = { if (canScan) appState.refreshRooms() },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(24.dp),
-            containerColor = if (canScan) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surfaceVariant
-            },
-            contentColor = if (canScan) {
-                MaterialTheme.colorScheme.onPrimaryContainer
-            } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            },
-            icon = {
-                if (isLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp
-                    )
-                } else {
-                    Icon(Icons.Default.Refresh, contentDescription = "Scan Groups")
-                }
-            },
-            text = { Text(if (isLoading) "Scanning..." else "Scan Groups") }
-        )
-
+        if (isLoading) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter))
+        }
+        GroupsScanFab(isLoading = isLoading, canScan = canScan, onScan = { appState.refreshRooms() }, modifier = Modifier.align(Alignment.BottomEnd).padding(24.dp))
         editingRoom?.let { targetRoom ->
-            val rememberedLoadMembers = remember(targetRoom.roomId) {
-                suspend { appState.loadRoomMembers(targetRoom.roomId) }
-            }
+            val rememberedLoadMembers = remember(targetRoom.roomId) { suspend { appState.loadRoomMembers(targetRoom.roomId) } }
             GroupRuleDialog(
                 room = targetRoom,
                 initialConfig = groupConfigs[targetRoom.roomId],
                 loadMembers = rememberedLoadMembers,
-                onSave = {
-                    appState.saveGroupConfig(it)
-                    editingRoom = null
-                },
-                onDelete = {
-                    appState.deleteGroupConfig(targetRoom.roomId)
-                    editingRoom = null
-                },
+                onSave = { appState.saveGroupConfig(it); editingRoom = null },
+                onDelete = { appState.deleteGroupConfig(targetRoom.roomId); editingRoom = null },
                 onDismiss = { editingRoom = null }
             )
         }
     }
 }
 
+private fun filterChatrooms(
+    rooms: List<GroupChat>,
+    query: String,
+    showSelectedOnly: Boolean,
+    monitoredIds: Set<String>
+): List<GroupChat> {
+    val baseRooms = if (showSelectedOnly) rooms.filter { it.roomId in monitoredIds } else rooms
+    if (query.isBlank()) return baseRooms
+    return baseRooms.filter { it.displayName.contains(query, ignoreCase = true) || it.roomId.contains(query, ignoreCase = true) }
+}
+
 @Composable
-private fun GroupsEmptyState(
+private fun MissingDirectoryBanner(onOpenSettings: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text("WeChat directory not set", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onErrorContainer)
+                Text(
+                    "Configure your WeChat data storage directory in Settings to discover chatrooms.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
+            TextButton(onClick = onOpenSettings) { Text("Settings", color = MaterialTheme.colorScheme.onErrorContainer) }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GroupsFilterChipsRow(totalRooms: Int, selectedCount: Int, showSelectedOnly: Boolean, onSelectMode: (Boolean) -> Unit) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterChip(
+            selected = !showSelectedOnly,
+            onClick = { onSelectMode(false) },
+            leadingIcon = { Icon(Icons.Default.Group, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            label = { Text("All ($totalRooms)") }
+        )
+        FilterChip(
+            selected = showSelectedOnly,
+            onClick = { onSelectMode(true) },
+            leadingIcon = { Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            label = { Text("Selected ($selectedCount)") }
+        )
+    }
+}
+
+@Composable
+private fun GroupsListContent(
+    isLoading: Boolean,
     roomsEmpty: Boolean,
     showSelectedOnly: Boolean,
-    queryBlank: Boolean
+    queryBlank: Boolean,
+    filteredRooms: List<GroupChat>,
+    monitoredIds: Set<String>,
+    groupConfigs: Map<String, GroupConfig>,
+    syncCheckpoints: Map<String, SyncCheckpoint>,
+    onToggleMonitored: (String) -> Unit,
+    onResetCheckpoint: (String) -> Unit,
+    onConfigureRules: (GroupChat) -> Unit
 ) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
-        contentAlignment = Alignment.Center
+    if (isLoading && roomsEmpty) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        return
+    }
+    if (filteredRooms.isEmpty()) {
+        GroupsEmptyState(roomsEmpty = roomsEmpty, showSelectedOnly = showSelectedOnly, queryBlank = queryBlank)
+        return
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 88.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(
-                Icons.Default.Group,
-                contentDescription = null,
-                modifier = Modifier.size(48.dp),
-                tint = MaterialTheme.colorScheme.outline
+        itemsIndexed(filteredRooms, key = { _, room -> room.roomId }) { index, room ->
+            val onToggle = remember(room.roomId, onToggleMonitored) { { onToggleMonitored(room.roomId) } }
+            val onReset = remember(room.roomId, onResetCheckpoint) { { onResetCheckpoint(room.roomId) } }
+            val onConfigure = remember(room, onConfigureRules) { { onConfigureRules(room) } }
+            GroupRoomCard(
+                room = room,
+                shape = segmentedItemShape(index = index, totalCount = filteredRooms.size),
+                isChecked = monitoredIds.contains(room.roomId),
+                config = groupConfigs[room.roomId],
+                checkpoint = syncCheckpoints[room.roomId],
+                onToggleMonitored = onToggle,
+                onResetCheckpoint = onReset,
+                onConfigureRules = onConfigure
             )
+        }
+    }
+}
+
+@Composable
+private fun GroupsScanFab(isLoading: Boolean, canScan: Boolean, onScan: () -> Unit, modifier: Modifier = Modifier) {
+    ExtendedFloatingActionButton(
+        onClick = { if (canScan) onScan() },
+        modifier = modifier,
+        containerColor = if (canScan) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = if (canScan) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+        icon = {
+            if (isLoading) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(Icons.Default.Refresh, contentDescription = null)
+            }
+        },
+        text = { Text(if (isLoading) "Scanning..." else "Scan Groups") }
+    )
+}
+
+@Composable
+private fun GroupsEmptyState(roomsEmpty: Boolean, showSelectedOnly: Boolean, queryBlank: Boolean) {
+    Box(modifier = Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(Icons.Default.Group, contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.outline)
             Spacer(Modifier.height(8.dp))
             Text(
                 text = when {
@@ -293,10 +261,10 @@ private fun GroupsEmptyState(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GroupRoomCard(
     room: GroupChat,
+    shape: RoundedCornerShape,
     isChecked: Boolean,
     config: GroupConfig?,
     checkpoint: SyncCheckpoint?,
@@ -304,109 +272,67 @@ private fun GroupRoomCard(
     onResetCheckpoint: () -> Unit,
     onConfigureRules: () -> Unit
 ) {
-    val hasCustomPrompt = config?.customPrompt?.isNotBlank() == true
-    val hasCustomPersona = config?.customPersona?.isNotBlank() == true
-    val senderCount = config?.allowedSenderIds?.size ?: 0
-    val hasAnyRule = hasCustomPrompt || hasCustomPersona || senderCount > 0
+    val badgeLabel = remember(config) { buildGroupRuleBadgeLabel(config) }
 
     Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onToggleMonitored),
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isChecked) {
-                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
-            } else {
-                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-            }
-        )
+        modifier = Modifier.fillMaxWidth().clickable(role = Role.Checkbox, onClick = onToggleMonitored),
+        shape = shape,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Checkbox(
-                checked = isChecked,
-                onCheckedChange = { onToggleMonitored() }
-            )
-
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = isChecked, onCheckedChange = null)
             Spacer(Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Text(
-                        text = room.displayName,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-
-                    if (hasAnyRule) {
-                        val badgeLabel = buildList {
-                            if (hasCustomPrompt) add("Custom Rule")
-                            if (hasCustomPersona) add("Persona")
-                            if (senderCount > 0) add("$senderCount sender(s)")
-                        }.joinToString(" • ")
-                        Surface(
-                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
-                            shape = RoundedCornerShape(4.dp)
-                        ) {
-                            Text(
-                                text = badgeLabel,
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
-                    }
-
-                    if (checkpoint != null && checkpoint.lastLocalId > 0) {
-                        Surface(
-                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
-                            shape = RoundedCornerShape(4.dp)
-                        ) {
-                            Text(
-                                text = "Synced: #${checkpoint.lastLocalId}",
-                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-                    }
-                }
-
-                Text(
-                    text = room.roomId,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline
-                )
-            }
-
+            GroupRoomMetadataColumn(room = room, badgeLabel = badgeLabel, checkpoint = checkpoint, modifier = Modifier.weight(1f))
             if (checkpoint != null && checkpoint.lastLocalId > 0) {
                 IconButton(onClick = onResetCheckpoint) {
-                    Icon(
-                        Icons.Default.Refresh,
-                        contentDescription = "Re-scan group history",
-                        tint = MaterialTheme.colorScheme.outline
-                    )
+                    Icon(Icons.Default.Refresh, contentDescription = "Re-scan group history", tint = MaterialTheme.colorScheme.outline)
                 }
             }
-
             IconButton(onClick = onConfigureRules) {
                 Icon(
-                    Icons.Default.Tune,
+                    imageVector = Icons.Default.Tune,
                     contentDescription = "Configure Rules",
-                    tint = if (hasAnyRule) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                    tint = if (badgeLabel != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                 )
             }
         }
+    }
+}
+
+private fun buildGroupRuleBadgeLabel(config: GroupConfig?): String? {
+    val hasCustomPrompt = config?.customPrompt?.isNotBlank() == true
+    val hasCustomPersona = config?.customPersona?.isNotBlank() == true
+    val senderCount = config?.allowedSenderIds?.size ?: 0
+    if (!hasCustomPrompt && !hasCustomPersona && senderCount == 0) return null
+    return buildList {
+        if (hasCustomPrompt) add("Custom Rule")
+        if (hasCustomPersona) add("Persona")
+        if (senderCount > 0) add("$senderCount sender(s)")
+    }.joinToString(" • ")
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GroupRoomMetadataColumn(
+    room: GroupChat,
+    badgeLabel: String?,
+    checkpoint: SyncCheckpoint?,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(text = room.displayName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            badgeLabel?.let { label ->
+                Surface(color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), shape = RoundedCornerShape(4.dp)) {
+                    Text(text = label, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                }
+            }
+            if (checkpoint != null && checkpoint.lastLocalId > 0) {
+                Surface(color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f), shape = RoundedCornerShape(4.dp)) {
+                    Text(text = "Synced: #${checkpoint.lastLocalId}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer, fontWeight = FontWeight.Medium)
+                }
+            }
+        }
+        Text(text = room.roomId, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
     }
 }

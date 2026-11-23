@@ -28,7 +28,8 @@ internal object Pass2Gatekeeper {
 
         for (chunk in chunks) {
             val messageChars = chunk.messages.sumOf {
-                it.textContent.length.toLong() + it.senderDisplayName.length.toLong() + 40L
+                val previewChars = it.attachmentPreviews.values.sumOf { preview -> preview.length.toLong() }
+                it.textContent.length.toLong() + it.senderDisplayName.length.toLong() + previewChars + 40L
             }
             val chunkChars = minOf(chunk.topic.length, 120).toLong() + messageChars + 100L
             if (current.isNotEmpty() && (current.size >= maxItems || currentChars + chunkChars > maxChars)) {
@@ -65,53 +66,53 @@ internal object Pass2Gatekeeper {
         val rootObj = parseRootJsonObject(rawVerdictJson) { jsonRepaired = true }
             .getOrElse { return Result.failure(it) }
 
-        if (batch.size == 1 && "verdicts" !in rootObj) {
-            val verdict = parseSingleVerdictObject(rootObj)
-                .getOrElse { return Result.failure(it) }
-            val keep = verdict.keep && verdict.isGroupNotice && verdict.passesRules && verdict.hasSubstance
+        val traces = if (batch.size == 1 && "verdicts" !in rootObj) {
+            val verdict = parseSingleVerdictObject(rootObj).getOrElse { return Result.failure(it) }
             val chunk = batch.single()
-            val trace = GatekeeperVerdictTrace(
-                chunkTopic = chunk.topic,
-                messageIds = chunk.messages.map { it.localId },
-                keep = keep,
-                isGroupNotice = verdict.isGroupNotice,
-                passesRules = verdict.passesRules,
-                hasSubstance = verdict.hasSubstance,
-                reason = verdict.reason
-            )
-            return Result.success(
-                BatchVerdictEvaluation(
-                    approvedChunks = if (keep) batch else emptyList(),
-                    traces = listOf(trace),
-                    jsonRepaired = jsonRepaired
+            listOf(
+                buildTrace(
+                    chunk = chunk,
+                    isGroupNotice = verdict.isGroupNotice,
+                    passesRules = verdict.passesRules,
+                    hasSubstance = verdict.hasSubstance,
+                    keep = verdict.keep && verdict.isGroupNotice && verdict.passesRules && verdict.hasSubstance,
+                    reason = verdict.reason
                 )
             )
-        }
-
-        val verdictItems = parseBatchedVerdictItems(rootObj, expectedCount = batch.size)
-            .getOrElse { return Result.failure(it) }
-        val traces = verdictItems.mapIndexed { index, item ->
-            val chunk = batch[index]
-            val keep = item.keep && item.isGroupNotice && item.passesRules && item.hasSubstance
-            GatekeeperVerdictTrace(
-                chunkTopic = chunk.topic,
-                messageIds = chunk.messages.map { it.localId },
-                keep = keep,
-                isGroupNotice = item.isGroupNotice,
-                passesRules = item.passesRules,
-                hasSubstance = item.hasSubstance,
-                reason = item.reason
-            )
+        } else {
+            val verdictItems = parseBatchedVerdictItems(rootObj, expectedCount = batch.size)
+                .getOrElse { return Result.failure(it) }
+            verdictItems.mapIndexed { index, item ->
+                buildTrace(
+                    chunk = batch[index],
+                    isGroupNotice = item.isGroupNotice,
+                    passesRules = item.passesRules,
+                    hasSubstance = item.hasSubstance,
+                    keep = item.keep && item.isGroupNotice && item.passesRules && item.hasSubstance,
+                    reason = item.reason
+                )
+            }
         }
         val approved = batch.filterIndexed { index, _ -> traces[index].keep }
-        return Result.success(
-            BatchVerdictEvaluation(
-                approvedChunks = approved,
-                traces = traces,
-                jsonRepaired = jsonRepaired
-            )
-        )
+        return Result.success(BatchVerdictEvaluation(approvedChunks = approved, traces = traces, jsonRepaired = jsonRepaired))
     }
+
+    private fun buildTrace(
+        chunk: EventExtractor.NoticeChunk,
+        isGroupNotice: Boolean,
+        passesRules: Boolean,
+        hasSubstance: Boolean,
+        keep: Boolean,
+        reason: String
+    ) = GatekeeperVerdictTrace(
+        chunkTopic = chunk.topic,
+        messageIds = chunk.messages.map { it.localId },
+        keep = keep,
+        isGroupNotice = isGroupNotice,
+        passesRules = passesRules,
+        hasSubstance = hasSubstance,
+        reason = reason
+    )
 
     fun parseBatchedVerdictsResult(rawJson: String, expectedCount: Int): Result<List<Boolean>> {
         val rootObj = parseRootJsonObject(rawJson)

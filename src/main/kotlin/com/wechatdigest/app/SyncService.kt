@@ -1,5 +1,7 @@
 package com.wechatdigest.app
 
+import com.wechatdigest.core.attachment.AttachmentContentExtractor
+import com.wechatdigest.core.attachment.WeChatAttachmentResolver
 import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.KtorLlmClient
@@ -8,6 +10,7 @@ import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.model.GroupConfig
 import com.wechatdigest.core.model.SyncCheckpoint
+import com.wechatdigest.core.model.WeChatMessage
 import com.wechatdigest.core.repository.WeChatContactRepository
 import com.wechatdigest.core.repository.WeChatMessageRepository
 import com.wechatdigest.core.sanitizer.MessageSanitizer
@@ -59,10 +62,17 @@ class SyncService(
         val keysFile = if (settings.keysPath.isNotBlank()) File(settings.keysPath) else null
         val driver = WeChatDatabaseDriver(baseDir = dataDir, customKeysFile = keysFile)
         val contactRepo = WeChatContactRepository(driver)
-        val messageRepo = WeChatMessageRepository(driver, contactRepo)
-        val roomNamesMap = runCatching {
+        val attachmentResolver = WeChatAttachmentResolver(driver)
+        val messageRepo = WeChatMessageRepository(driver, contactRepo, attachmentResolver)
+        val roomNamesMap = try {
             contactRepo.listAllChatrooms().associate { it.roomId to it.displayName }
-        }.getOrElse { emptyMap() }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            System.err.println(
+                "[SyncService] Failed loading chatroom display names: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
+            )
+            emptyMap()
+        }
 
         var totalScanned = 0
         var totalInserted = 0
@@ -182,9 +192,17 @@ class SyncService(
         val effectiveRules = groupConfig?.customPrompt.orEmpty()
         val effectivePersona = groupConfig?.customPersona?.takeIf { it.isNotBlank() } ?: settings.userPersona
         val recentRoomCards = eventCardStore.listRecentByRoom(roomId, limit = 10)
+        val preparedMessages = if (settings.parseAttachmentContents) {
+            enrichMessagesWithAttachmentPreviews(
+                messages = substantive,
+                focusHints = extractFocusHints(effectivePersona, effectiveRules)
+            )
+        } else {
+            substantive
+        }
 
         val events = extractor.extractEventsResult(
-            messages = substantive,
+            messages = preparedMessages,
             roomId = roomId,
             userPersona = effectivePersona,
             targetLanguage = settings.targetLanguage,
@@ -195,6 +213,37 @@ class SyncService(
         ).getOrThrow()
 
         return if (events.isNotEmpty()) eventCardStore.upsertOrThrow(events) else 0
+    }
+
+    private fun enrichMessagesWithAttachmentPreviews(
+        messages: List<WeChatMessage>,
+        focusHints: Set<String>
+    ): List<WeChatMessage> {
+        return messages.map { msg ->
+            if (msg.attachments.isEmpty()) return@map msg
+            val previews = buildMap<String, String> {
+                for (att in msg.attachments) {
+                    val path = att.localPath?.takeIf { it.isNotBlank() } ?: continue
+                    val file = File(path)
+                    if (!file.isFile) continue
+                    val extracted = AttachmentContentExtractor.extractBoundedPreview(file, focusHints)
+                    if (!extracted.isNullOrBlank()) {
+                        put(att.previewKey(), extracted)
+                    }
+                }
+            }
+            if (previews.isEmpty()) msg else msg.copy(attachmentPreviews = previews)
+        }
+    }
+
+    private fun extractFocusHints(persona: String, customRules: String): Set<String> {
+        return "$persona $customRules"
+            .split(Regex("[\\s,.;:!?/\\\\|()\\[\\]{}\"']+"))
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.length >= 2 }
+            .take(12)
+            .toSet()
     }
 
     private fun advanceCheckpoint(roomId: String, maxLocalId: Long) {

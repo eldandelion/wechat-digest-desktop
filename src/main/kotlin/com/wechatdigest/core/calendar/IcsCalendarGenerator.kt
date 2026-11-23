@@ -110,6 +110,7 @@ class IcsCalendarGenerator {
             .replace(";", "\\;")
             .replace(",", "\\,")
             .replace("\r\n", "\n")
+            .replace("\r", "")
             .replace("\n", "\\n")
     }
 }

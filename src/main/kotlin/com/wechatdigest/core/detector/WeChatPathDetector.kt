@@ -1,6 +1,7 @@
 package com.wechatdigest.core.detector
 
 import java.io.File
+import java.nio.file.Files
 
 data class DiscoveredPath(
     val path: File,
@@ -13,62 +14,57 @@ data class DiscoveredPath(
 class WeChatPathDetector {
 
     fun detectCandidates(customRoots: List<File>? = null): List<DiscoveredPath> {
-        val results = mutableListOf<DiscoveredPath>()
-
         if (customRoots != null) {
-            for (dir in customRoots) {
-                if (dir.exists() && dir.isDirectory) {
-                    val candidate = inspectDirectory(dir, label = dir.name)
-                    if (candidate != null) {
-                        results.add(candidate)
-                    }
+            return customRoots.mapNotNull { dir ->
+                if (dir.exists() && dir.isDirectory && !Files.isSymbolicLink(dir.toPath())) {
+                    inspectDirectory(dir, label = dir.name)
+                } else {
+                    null
                 }
             }
-            return results
         }
 
         val userHome = System.getProperty("user.home") ?: "."
-
-        // 1. Check standard decrypted WCDB key tool directories under user home
-        val decryptedCandidates = listOf(
-            File(userHome, "wcdb-key-tool/decrypted"),
-            File(userHome, ".wcdb-key-tool/decrypted")
-        )
-        for (localDecrypted in decryptedCandidates) {
-            if (localDecrypted.exists() && localDecrypted.isDirectory) {
-                val candidate = inspectDirectory(localDecrypted, label = "Decrypted WCDB Key Tool Directory")
-                if (candidate != null) {
-                    results.add(candidate.copy(isDecryptedCopy = true))
-                }
-            }
+        val userDir = File(System.getProperty("user.dir") ?: ".").absoluteFile
+        return buildList {
+            addAll(collectDecryptedCandidates(userHome, userDir))
+            addAll(collectXWeChatCandidates(userHome))
+            collectAppSupportCandidate(userHome)?.let { add(it) }
         }
+    }
 
-        // 2. Scan standard macOS WeChat Container (xwechat_files)
+    private fun collectDecryptedCandidates(userHome: String, userDir: File): List<DiscoveredPath> {
+        val candidateDirs = buildList {
+            add(File(userDir, "wcdb-key-tool/decrypted"))
+            userDir.parentFile?.let { add(File(it, "wcdb-key-tool/decrypted")) }
+            add(File(userHome, "wcdb-key-tool/decrypted"))
+            add(File(userHome, ".wcdb-key-tool/decrypted"))
+        }.distinctBy { it.absolutePath }
+
+        return candidateDirs.mapNotNull { dir ->
+            if (!dir.exists() || !dir.isDirectory || Files.isSymbolicLink(dir.toPath())) return@mapNotNull null
+            inspectDirectory(dir, label = "Decrypted WCDB Key Tool Directory")?.copy(isDecryptedCopy = true)
+        }
+    }
+
+    private fun collectXWeChatCandidates(userHome: String): List<DiscoveredPath> {
         val xwechatFiles = File(userHome, "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
-        if (xwechatFiles.exists() && xwechatFiles.isDirectory) {
-            val wxidDirs = xwechatFiles.listFiles { f -> f.isDirectory && (f.name.startsWith("wxid_") || f.name.contains("_")) }
-            if (wxidDirs != null) {
-                for (accountDir in wxidDirs) {
-                    val dbStorage = File(accountDir, "db_storage")
-                    val targetDir = if (dbStorage.exists() && dbStorage.isDirectory) dbStorage else accountDir
-                    val candidate = inspectDirectory(targetDir, label = "WeChat Account: ${accountDir.name}")
-                    if (candidate != null) {
-                        results.add(candidate)
-                    }
-                }
-            }
-        }
+        if (!xwechatFiles.exists() || !xwechatFiles.isDirectory) return emptyList()
+        val wxidDirs = xwechatFiles.listFiles { f ->
+            f.isDirectory && (f.name.startsWith("wxid_") || f.name.contains("_"))
+        } ?: return emptyList()
 
-        // 3. Scan Application Support legacy container
+        return wxidDirs.mapNotNull { accountDir ->
+            val dbStorage = File(accountDir, "db_storage")
+            val targetDir = if (dbStorage.exists() && dbStorage.isDirectory) dbStorage else accountDir
+            inspectDirectory(targetDir, label = "WeChat Account: ${accountDir.name}")
+        }
+    }
+
+    private fun collectAppSupportCandidate(userHome: String): DiscoveredPath? {
         val appSupportDir = File(userHome, "Library/Application Support/com.tencent.xinWeChat")
-        if (appSupportDir.exists() && appSupportDir.isDirectory) {
-            val candidate = inspectDirectory(appSupportDir, label = "WeChat App Support Directory")
-            if (candidate != null) {
-                results.add(candidate)
-            }
-        }
-
-        return results
+        if (!appSupportDir.exists() || !appSupportDir.isDirectory) return null
+        return inspectDirectory(appSupportDir, label = "WeChat App Support Directory")
     }
 
     fun isValidWeChatDir(dir: File): Boolean {

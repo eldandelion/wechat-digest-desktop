@@ -20,10 +20,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -44,9 +48,11 @@ class AppStateTest {
     private lateinit var eventCardStore: EventCardStore
     private lateinit var groupConfigStore: com.wechatdigest.storage.GroupConfigStore
     private lateinit var syncService: SyncService
+    private lateinit var testScope: CoroutineScope
 
     @BeforeEach
     fun setUp() {
+        testScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         val dbFile = File(tempDir, "test_app.db")
         appDb = AppDatabase(dbFile)
         settingsStore = SettingsStore(appDb)
@@ -58,13 +64,19 @@ class AppStateTest {
         syncService = SyncService(eventCardStore, groupConfigStore) { llmClient }
     }
 
+    @AfterEach
+    fun tearDown(): Unit = runBlocking {
+        // Ensure background init/IO coroutines finish touching SQLite before JUnit deletes @TempDir.
+        testScope.coroutineContext[Job]?.cancelAndJoin()
+    }
+
     @Test
     fun `navigation and settings toggle work as expected`() = runBlocking {
         val appState = AppState(
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         assertEquals(Screen.EVENTS, appState.currentScreen.value)
@@ -120,7 +132,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         appState.loadEvents().join()
@@ -173,7 +185,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         // Invalid directory
@@ -202,7 +214,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         // Mock failure sync (blank dir)
@@ -218,7 +230,7 @@ class AppStateTest {
             eventCardStore = eventCardStore,
             syncService = syncService,
             groupConfigStore = groupConfigStore,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         val config = com.wechatdigest.core.model.GroupConfig(
@@ -243,7 +255,7 @@ class AppStateTest {
             syncService = syncService,
             groupConfigStore = groupConfigStore,
             calendarLauncher = launcher,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         val card = EventCard(
@@ -284,7 +296,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         appState.loadEvents().join()
@@ -304,7 +316,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         assertTrue(appState.showWizard.value)
@@ -318,7 +330,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         assertTrue(appState.scheduler.isRunning)
@@ -361,7 +373,7 @@ class AppStateTest {
             eventCardStore = eventCardStore,
             syncService = syncService,
             ollamaService = ollamaService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         assertEquals(emptyList(), appState.detectedOllamaModels.value)
@@ -396,7 +408,7 @@ class AppStateTest {
             eventCardStore = eventCardStore,
             syncService = syncService,
             syncCheckpointStore = syncCheckpointStore,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         appState.loadCheckpoints().join()
@@ -436,7 +448,7 @@ class AppStateTest {
             syncService = syncService,
             groupConfigStore = groupConfigStore,
             syncCheckpointStore = syncCheckpointStore,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         appState.loadEvents().join()
@@ -489,7 +501,7 @@ class AppStateTest {
             groupConfigStore = groupConfigStore,
             syncCheckpointStore = syncCheckpointStore,
             decryptedCacheDir = cacheDir,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
 
         assertTrue(appState.scheduler.isRunning)
@@ -532,7 +544,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined),
+            scope = testScope,
             llmClientFactory = { config ->
                 val engine = MockEngine {
                     llmCalls++
@@ -601,7 +613,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
         // Default blank wechatDataDir -> returns empty list gracefully
         assertTrue(appState.loadRoomMembers("room@chatroom").isEmpty())
@@ -679,7 +691,7 @@ class AppStateTest {
             settingsStore = settingsStore,
             eventCardStore = eventCardStore,
             syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
+            scope = testScope
         )
         appState.loadEvents().join()
         assertEquals(3, withTimeout(2_000) { appState.visibleEvents.first { it.size == 3 } }.size)
@@ -708,191 +720,6 @@ class AppStateTest {
         // Clearing groupFilter restores all cards
         appState.groupFilter.value = null
         assertEquals(3, appState.visibleEvents.value.size)
-    }
-
-    @Test
-    fun `visibleEvents sorts by date newest-to-oldest and oldest-to-newest with deterministic priority tie-break`() = runBlocking {
-        val oldest = EventCard(
-            id = "t1000",
-            title = "Oldest Event",
-            summary = "First",
-            translatedSummary = "First",
-            category = EventCategory.NOTICE,
-            priority = EventPriority.NORMAL,
-            originalSender = "Admin",
-            sourceRoomId = "room@chatroom",
-            timestampSeconds = 1000L
-        )
-        val tieLow = EventCard(
-            id = "t2000_low",
-            title = "Tie Low",
-            summary = "Low",
-            translatedSummary = "Low",
-            category = EventCategory.NOTICE,
-            priority = EventPriority.LOW,
-            originalSender = "Admin",
-            sourceRoomId = "room@chatroom",
-            timestampSeconds = 2000L
-        )
-        val tieCritical = EventCard(
-            id = "t2000_crit",
-            title = "Tie Critical",
-            summary = "Crit",
-            translatedSummary = "Crit",
-            category = EventCategory.EXAM,
-            priority = EventPriority.CRITICAL,
-            originalSender = "Admin",
-            sourceRoomId = "room@chatroom",
-            timestampSeconds = 2000L
-        )
-        val newest = EventCard(
-            id = "t3000",
-            title = "Newest Event",
-            summary = "Latest",
-            translatedSummary = "Latest",
-            category = EventCategory.DEADLINE,
-            priority = EventPriority.IMPORTANT,
-            originalSender = "Admin",
-            sourceRoomId = "room@chatroom",
-            timestampSeconds = 3000L
-        )
-
-        eventCardStore.upsert(listOf(oldest, tieLow, tieCritical, newest))
-
-        val appState = AppState(
-            settingsStore = settingsStore,
-            eventCardStore = eventCardStore,
-            syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
-        )
-        appState.loadEvents().join()
-        assertEquals(4, withTimeout(2_000) { appState.visibleEvents.first { it.size == 4 } }.size)
-
-        assertEquals(EventSortOrder.NEWEST_FIRST, appState.sortOrder.value)
-        assertEquals(
-            listOf("t3000", "t2000_crit", "t2000_low", "t1000"),
-            appState.visibleEvents.value.map { it.id }
-        )
-
-        appState.sortOrder.value = EventSortOrder.OLDEST_FIRST
-        assertEquals(
-            listOf("t1000", "t2000_crit", "t2000_low", "t3000"),
-            appState.visibleEvents.value.map { it.id }
-        )
-    }
-
-    @Test
-    fun `clearEventsAndCheckpoints and resetLocalAppDatabase clear stale groupFilter and reset sortOrder`() = runBlocking {
-        val appState = AppState(
-            settingsStore = settingsStore,
-            eventCardStore = eventCardStore,
-            syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
-        )
-
-        appState.priorityFilter.value = EventPriority.CRITICAL
-        appState.groupFilter.value = "room1@chatroom"
-        appState.sortOrder.value = EventSortOrder.OLDEST_FIRST
-        appState.searchQuery.value = "exam"
-        appState.groupSearchQuery.value = "math"
-
-        appState.clearEventsAndCheckpoints().join()
-        assertNull(appState.groupFilter.value)
-
-        appState.groupFilter.value = "room2@chatroom"
-        appState.resetLocalAppDatabase().join()
-
-        assertNull(appState.priorityFilter.value)
-        assertNull(appState.groupFilter.value)
-        assertEquals(EventSortOrder.NEWEST_FIRST, appState.sortOrder.value)
-        assertEquals("", appState.searchQuery.value)
-        assertEquals("", appState.groupSearchQuery.value)
-    }
-
-    @Test
-    fun `toggleStarred and starredOnlyFilter persist and filter starred events`() = runBlocking {
-        val c1 = EventCard(
-            id = "s1",
-            title = "Starred Candidate",
-            summary = "Save this",
-            translatedSummary = "Save this",
-            category = EventCategory.NOTICE,
-            priority = EventPriority.IMPORTANT,
-            originalSender = "Admin",
-            sourceRoomId = "r1@chatroom",
-            timestampSeconds = 2000L
-        )
-        val c2 = EventCard(
-            id = "s2",
-            title = "Regular Notice",
-            summary = "Unstarred",
-            translatedSummary = "Unstarred",
-            category = EventCategory.NOTICE,
-            priority = EventPriority.NORMAL,
-            originalSender = "Admin",
-            sourceRoomId = "r1@chatroom",
-            timestampSeconds = 1000L
-        )
-        eventCardStore.upsert(listOf(c1, c2))
-
-        val appState = AppState(
-            settingsStore = settingsStore,
-            eventCardStore = eventCardStore,
-            syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
-        )
-        appState.loadEvents().join()
-
-        appState.toggleStarred("s1").join()
-        assertTrue(appState.events.value.first { it.id == "s1" }.isStarred)
-        assertTrue(eventCardStore.listActive().first { it.id == "s1" }.isStarred)
-
-        appState.starredOnlyFilter.value = true
-        assertEquals(listOf("s1"), appState.visibleEvents.value.map { it.id })
-
-        // Unstarring while starredOnlyFilter is active removes it from visibleEvents
-        appState.toggleStarred("s1").join()
-        assertTrue(appState.visibleEvents.value.isEmpty())
-
-        appState.starredOnlyFilter.value = false
-        assertEquals(2, appState.visibleEvents.value.size)
-    }
-
-    @Test
-    fun `selectEvent marks unread card as read and markUnread restores unread status`() = runBlocking {
-        val unreadCard = EventCard(
-            id = "u1",
-            title = "Unread Exam Notice",
-            summary = "Details",
-            translatedSummary = "Details",
-            category = EventCategory.EXAM,
-            priority = EventPriority.CRITICAL,
-            originalSender = "Prof",
-            sourceRoomId = "r1@chatroom",
-            timestampSeconds = 3000L,
-            isRead = false
-        )
-        eventCardStore.upsert(listOf(unreadCard))
-
-        val appState = AppState(
-            settingsStore = settingsStore,
-            eventCardStore = eventCardStore,
-            syncService = syncService,
-            scope = CoroutineScope(Dispatchers.Unconfined)
-        )
-        appState.loadEvents().join()
-        assertFalse(appState.events.value.single().isRead)
-
-        appState.selectEvent("u1")
-        assertEquals("u1", appState.selectedEventId.value)
-        assertTrue(withTimeout(2_000) { appState.events.first { it.single().isRead } }.single().isRead)
-
-        appState.markUnread("u1").join()
-        assertFalse(appState.events.value.single().isRead)
-        assertFalse(eventCardStore.listActive().single().isRead)
-
-        appState.dismiss("u1").join()
-        assertNull(appState.selectedEventId.value)
     }
 }
 

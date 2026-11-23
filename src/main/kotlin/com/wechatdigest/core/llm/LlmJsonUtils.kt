@@ -12,6 +12,7 @@ internal object LlmJsonUtils {
     private const val MAX_LOG_MESSAGE_CHARS = 240
 
     private val urlWithQueryOrCredentialsRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
+    private val localFilesystemPathRegex = Regex("/(?:Users|Volumes|tmp|var|private|home)/[^\\s\"':,)<>]+")
     private val controlOrAnsiRegex = Regex("[\\u0000-\\u001F\\u007F]")
     private val trailingCommaRegex = Regex(",(\\s*[}\\]])")
     private val incompleteTrailingObjectKeyRegex = Regex(",\\s*\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"\\s*$")
@@ -200,15 +201,17 @@ internal object LlmJsonUtils {
     }
 
     /**
-     * Strips control characters and redacts embedded URLs/queries from exception messages before logging or UI display.
+     * Strips control characters and redacts embedded URLs/queries and local filesystem paths
+     * from exception messages before logging or UI display.
      */
     fun sanitizeLogMessage(raw: String?): String {
         if (raw.isNullOrBlank()) return "Unknown error"
-        val redacted = raw.replace(urlWithQueryOrCredentialsRegex) { match ->
+        val urlRedacted = raw.replace(urlWithQueryOrCredentialsRegex) { match ->
             val host = runCatching { java.net.URI(match.value).host }.getOrNull()
             if (host.isNullOrBlank()) "[redacted-url]" else "https://$host/..."
         }
-        return redacted.replace(controlOrAnsiRegex, " ")
+        val pathRedacted = urlRedacted.replace(localFilesystemPathRegex, "[redacted-path]")
+        return pathRedacted.replace(controlOrAnsiRegex, " ")
             .replace(Regex(" {2,}"), " ")
             .trim()
             .take(MAX_LOG_MESSAGE_CHARS)

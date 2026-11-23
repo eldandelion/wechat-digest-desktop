@@ -1,11 +1,13 @@
 package com.wechatdigest.core.llm
 
+import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.core.model.LlmExtractedEvent
 import com.wechatdigest.core.model.WeChatMessage
+import java.util.Locale
 
 /**
  * Consolidates related LLM event extractions and builds sanitized [EventCard] instances.
@@ -65,42 +67,31 @@ internal object ExtractionCardConsolidator {
         roomId: String,
         roomDisplayName: String,
         fallbackTitle: String,
-        joinDistinctTitles: Boolean
+        joinDistinctTitles: Boolean,
+        sourceAttachments: List<EventAttachment> = emptyList()
     ): EventCard {
+        val deduplicatedAttachments = sourceAttachments.distinctBy { it.previewKey() }
         if (extractedEvents.size == 1) {
             return buildSingleEventCard(
-                single = extractedEvents.first(),
-                fallbackTitle = fallbackTitle,
-                eventSender = eventSender,
-                roomId = roomId,
-                roomDisplayName = roomDisplayName,
-                sourceMessagesText = sourceMessagesText,
-                eventTimestamp = eventTimestamp
+                extractedEvents.first(), fallbackTitle, eventSender, roomId, roomDisplayName,
+                sourceMessagesText, eventTimestamp, deduplicatedAttachments
             )
         }
 
-        val mergedPriority = extractedEvents.minOf { EventPriority.fromString(it.priority) }
-        val mergedCategory = extractedEvents.map { EventCategory.fromString(it.category) }
-            .firstOrNull { it != EventCategory.OTHER } ?: EventCategory.OTHER
-        val earliestEventDate = extractedEvents
-            .mapNotNull { sanitizeEventDate(it.eventDate) }
-            .minOrNull()
         val (collectedSections, promotedFlatItem) = collectConsolidatedSections(extractedEvents)
-        val mergedTitle = resolveConsolidatedTitle(extractedEvents, fallbackTitle, joinDistinctTitles, collectedSections.size)
-        val mergedSummary = resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem)
-
         return EventCard(
-            title = mergedTitle,
-            summary = mergedSummary,
-            translatedSummary = mergedSummary,
+            title = resolveConsolidatedTitle(extractedEvents, fallbackTitle, joinDistinctTitles, collectedSections.size),
+            summary = resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
+            translatedSummary = resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
             sections = collectedSections,
-            category = mergedCategory,
-            priority = mergedPriority,
-            eventDate = earliestEventDate,
+            category = extractedEvents.map { EventCategory.fromString(it.category) }.firstOrNull { it != EventCategory.OTHER } ?: EventCategory.OTHER,
+            priority = extractedEvents.minOf { EventPriority.fromString(it.priority) },
+            eventDate = extractedEvents.mapNotNull { sanitizeEventDate(it.eventDate) }.minOrNull(),
             originalSender = eventSender,
             sourceRoomId = roomId,
             sourceRoomName = roomDisplayName,
             sourceMessages = sourceMessagesText,
+            attachments = deduplicatedAttachments,
             timestampSeconds = eventTimestamp
         )
     }
@@ -112,7 +103,8 @@ internal object ExtractionCardConsolidator {
         roomId: String,
         roomDisplayName: String,
         sourceMessagesText: String,
-        eventTimestamp: Long
+        eventTimestamp: Long,
+        attachments: List<EventAttachment>
     ): EventCard {
         val preferredSummary = single.translatedSummary.ifBlank { single.summary }
         val fallbackSummary = single.summary.ifBlank { single.translatedSummary }
@@ -128,6 +120,7 @@ internal object ExtractionCardConsolidator {
             sourceRoomId = roomId,
             sourceRoomName = roomDisplayName,
             sourceMessages = sourceMessagesText,
+            attachments = attachments,
             timestampSeconds = eventTimestamp
         )
     }
@@ -156,7 +149,7 @@ internal object ExtractionCardConsolidator {
                 }
             }
             for (section in candidates) {
-                val key = section.heading.lowercase() to section.content.lowercase()
+                val key = section.heading.lowercase(Locale.ROOT) to section.content.lowercase(Locale.ROOT)
                 if (seenSections.add(key)) {
                     collectedSections.add(section)
                 }
@@ -171,7 +164,7 @@ internal object ExtractionCardConsolidator {
         joinDistinctTitles: Boolean,
         sectionCount: Int
     ): String {
-        val distinctTitles = extractedEvents.map { it.title.trim() }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+        val distinctTitles = extractedEvents.map { it.title.trim() }.filter { it.isNotBlank() }.distinctBy { it.lowercase(Locale.ROOT) }
         return when {
             distinctTitles.isEmpty() -> fallbackTitle
             distinctTitles.size == 1 -> distinctTitles.first()
@@ -188,7 +181,7 @@ internal object ExtractionCardConsolidator {
     ): String {
         val distinctSummaries = extractedEvents.map { it.translatedSummary.ifBlank { it.summary }.trim() }
             .filter { it.isNotBlank() }
-            .distinctBy { it.lowercase() }
+            .distinctBy { it.lowercase(Locale.ROOT) }
         val allWereFlat = extractedEvents.all { sanitizeSections(it.sections).isEmpty() }
         return if (promotedFlatItem && allWereFlat && sectionCount > 0) {
             distinctSummaries.firstOrNull().orEmpty()

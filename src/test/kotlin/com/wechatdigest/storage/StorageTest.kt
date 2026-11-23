@@ -1,8 +1,10 @@
 package com.wechatdigest.storage
 
 import com.wechatdigest.app.AppSettings
+import com.wechatdigest.app.AppThemeMode
 import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmProviderType
+import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
@@ -61,6 +63,8 @@ class StorageTest {
             userPersona = "Faculty researcher",
             targetLanguage = "zh",
             messagesPerSync = 100,
+            themeMode = AppThemeMode.DARK,
+            parseAttachmentContents = false,
             prefilter = PrefilterConfig(
                 minMessageLength = 3,
                 rules = listOf(
@@ -93,6 +97,8 @@ class StorageTest {
         assertEquals(custom.userPersona, loaded.userPersona)
         assertEquals(custom.targetLanguage, loaded.targetLanguage)
         assertEquals(custom.messagesPerSync, loaded.messagesPerSync)
+        assertEquals(AppThemeMode.DARK, loaded.themeMode)
+        assertFalse(loaded.parseAttachmentContents)
         assertEquals(custom.prefilter, loaded.prefilter)
     }
 
@@ -483,5 +489,44 @@ class StorageTest {
 
         eventCardStore.setStarred("star-card-1", false)
         assertFalse(eventCardStore.listActive().single().isStarred)
+    }
+
+    @Test
+    fun `event card store persists and updates attachments list`() {
+        val pendingAttachment = EventAttachment(
+            fileName = "exam_seats.xlsx",
+            fileExtension = "xlsx",
+            fileSizeBytes = 20480L,
+            md5 = "0123456789abcdef0123456789abcdef",
+            localPath = null,
+            messageTimestampSeconds = 1795000100L,
+            mediaExpireAtSeconds = 1893456000L
+        )
+        val card = EventCard(
+            id = "attach-card-1",
+            title = "Final Exam Seating Chart",
+            summary = "See attached Excel file for room numbers.",
+            translatedSummary = "See attached Excel file for room numbers.",
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Advisor",
+            sourceRoomId = "exam@chatroom",
+            attachments = listOf(pendingAttachment),
+            timestampSeconds = 1795000100L
+        )
+
+        eventCardStore.upsert(listOf(card))
+        val loaded = eventCardStore.listActive().single()
+        assertEquals(1, loaded.attachments.size)
+        assertEquals("exam_seats.xlsx", loaded.attachments.single().fileName)
+        assertEquals(null, loaded.attachments.single().localPath)
+
+        val downloadedFile = File(tempDir, "exam_seats.xlsx").apply { writeBytes(ByteArray(32)) }
+        val resolved = pendingAttachment.copy(localPath = downloadedFile.absolutePath)
+        eventCardStore.updateAttachments("attach-card-1", listOf(resolved))
+
+        val reloaded = eventCardStore.listRecentByRoom("exam@chatroom").single()
+        assertEquals(downloadedFile.absolutePath, reloaded.attachments.single().localPath)
+        assertTrue(reloaded.attachments.single().isLocalFilePresent())
     }
 }

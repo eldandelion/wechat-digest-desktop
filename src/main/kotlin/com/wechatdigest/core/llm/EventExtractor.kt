@@ -505,7 +505,8 @@ class EventExtractor(
         var currentChars = 0L
 
         for (msg in messages) {
-            val msgChars = minOf(msg.textContent.length, MAX_SINGLE_MESSAGE_CHARS).toLong() + 64L
+            val previewChars = msg.attachmentPreviews.values.sumOf { it.length }
+            val msgChars = minOf(msg.textContent.length, MAX_SINGLE_MESSAGE_CHARS).toLong() + previewChars.toLong() + 64L
             if (current.isNotEmpty() && shouldSplitWindow(current, currentChars, msg, msgChars)) {
                 windows.add(current.toList())
                 current = mutableListOf()
@@ -533,41 +534,30 @@ class EventExtractor(
     }
 
     private fun formatTranscriptForPrompt(messages: List<WeChatMessage>): String {
-        return formatMessages(messages, includeIds = true, sanitizeForPrompt = true)
+        return formatMessages(messages, includeIds = true, sanitizeForPrompt = true, includeAttachmentPreviews = true)
     }
 
     private fun formatSourceMessagesForPrompt(messages: List<WeChatMessage>): String {
-        return formatMessages(messages, includeIds = false, sanitizeForPrompt = true)
+        return formatMessages(messages, includeIds = false, sanitizeForPrompt = true, includeAttachmentPreviews = true)
     }
 
     private fun formatSourceMessages(messages: List<WeChatMessage>): String {
-        return formatMessages(messages, includeIds = false, sanitizeForPrompt = false)
+        return formatMessages(messages, includeIds = false, sanitizeForPrompt = false, includeAttachmentPreviews = false)
     }
 
     private fun formatMessages(
         messages: List<WeChatMessage>,
         includeIds: Boolean,
-        sanitizeForPrompt: Boolean
-    ): String {
-        return buildString {
-            messages.forEach { m ->
-                val timeStr = timeFormatter.format(Instant.ofEpochSecond(m.timestampSeconds))
-                val safeSender = sanitizeSenderLabel(m.senderDisplayName)
-                val body = if (sanitizeForPrompt) {
-                    val bounded = m.textContent.take(MAX_SINGLE_MESSAGE_CHARS)
-                    ExtractionPrompts.sanitizeTranscriptForPrompt(bounded)
-                } else {
-                    m.textContent
-                }
-                if (includeIds) append("[id:${m.localId}] ")
-                append("[$timeStr] $safeSender: $body\n\n")
-            }
-        }.trim()
-    }
-
-    private fun sanitizeSenderLabel(sender: String): String {
-        return ExtractionPrompts.sanitizeInline(sender, 64).ifBlank { "Unknown" }
-    }
+        sanitizeForPrompt: Boolean,
+        includeAttachmentPreviews: Boolean = false
+    ): String = PromptMessageFormatter.formatMessages(
+        messages = messages,
+        timeFormatter = timeFormatter,
+        maxSingleMessageChars = MAX_SINGLE_MESSAGE_CHARS,
+        includeIds = includeIds,
+        sanitizeForPrompt = sanitizeForPrompt,
+        includeAttachmentPreviews = includeAttachmentPreviews
+    )
 
     private fun resolveMatchedMessages(
         rawIds: List<JsonPrimitive>,
@@ -722,7 +712,8 @@ class EventExtractor(
             roomId = roomId,
             roomDisplayName = roomDisplayName,
             fallbackTitle = fallbackTitle,
-            joinDistinctTitles = false
+            joinDistinctTitles = false,
+            sourceAttachments = chunk.messages.flatMap { it.attachments }
         )
         return Result.success(card)
     }
@@ -775,7 +766,8 @@ class EventExtractor(
                 roomId = roomId,
                 roomDisplayName = roomDisplayName,
                 fallbackTitle = "Group Notice",
-                joinDistinctTitles = true
+                joinDistinctTitles = true,
+                sourceAttachments = allMatched.flatMap { it.attachments }
             )
         }
         return Result.success(cards)

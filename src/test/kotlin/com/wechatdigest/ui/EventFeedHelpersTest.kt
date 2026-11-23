@@ -160,4 +160,12 @@ class EventFeedHelpersTest {
         // Scrolling up within same item past deadband -> expands
         assertTrue(shouldExpandFab(1, 10, 1, 40, currentlyExpanded = false))
     }
+
+    @Test
+    fun `formatFileSizeLabel formats bytes kilobytes and megabytes cleanly`() {
+        assertEquals("Unknown size", formatFileSizeLabel(0L))
+        assertEquals("512 B", formatFileSizeLabel(512L))
+        assertEquals("18 KB", formatFileSizeLabel(18_432L))
+        assertEquals("1.8 MB", formatFileSizeLabel(1_887_436L))
+    }
 }

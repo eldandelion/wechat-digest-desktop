@@ -1,5 +1,7 @@
 package com.wechatdigest.core.repository
 
+import com.wechatdigest.core.attachment.WeChatAttachmentResolver
+import com.wechatdigest.core.attachment.WeChatFileMessageParser
 import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.decompress.ZstdDecompressor
 import com.wechatdigest.core.model.WeChatMessage
@@ -8,7 +10,8 @@ import java.io.FileNotFoundException
 
 class WeChatMessageRepository(
     private val driver: WeChatDatabaseDriver,
-    private val contactRepository: WeChatContactRepository
+    private val contactRepository: WeChatContactRepository,
+    private val attachmentResolver: WeChatAttachmentResolver? = null
 ) {
 
     private val messageDir: File by lazy {
@@ -35,37 +38,39 @@ class WeChatMessageRepository(
         var bestLocalId = Long.MIN_VALUE
 
         for (dbFile in candidateFiles.sortedByDescending { it.name }) {
-            try {
-                driver.openReadOnlyConnection(dbFile).use { conn ->
-                    val existsSql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
-                    val hasTable = conn.prepareStatement(existsSql).use { stmt ->
-                        stmt.setString(1, tableName)
-                        stmt.executeQuery().use { rs -> rs.next() }
-                    }
-                    if (hasTable) {
-                        val maxSql = "SELECT COALESCE(MAX(create_time), 0), COALESCE(MAX(local_id), 0) FROM $tableName"
-                        val (maxTs, maxId) = conn.createStatement().use { stmt ->
-                            stmt.executeQuery(maxSql).use { rs ->
-                                if (rs.next()) rs.getLong(1) to rs.getLong(2) else 0L to 0L
-                            }
-                        }
-
-                        if (bestShard == null ||
-                            maxTs > bestTimestamp ||
-                            (maxTs == bestTimestamp && maxId > bestLocalId)
-                        ) {
-                            bestShard = dbFile
-                            bestTimestamp = maxTs
-                            bestLocalId = maxId
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                // Continue scanning other shards if one fails
-                continue
+            val stats = readRoomShardBounds(dbFile, tableName) ?: continue
+            val (maxTs, maxId) = stats
+            val isNewer = bestShard == null ||
+                maxTs > bestTimestamp ||
+                (maxTs == bestTimestamp && maxId > bestLocalId)
+            if (isNewer) {
+                bestShard = dbFile
+                bestTimestamp = maxTs
+                bestLocalId = maxId
             }
         }
         return bestShard
+    }
+
+    private fun readRoomShardBounds(dbFile: File, tableName: String): Pair<Long, Long>? {
+        return try {
+            driver.openReadOnlyConnection(dbFile).use { conn ->
+                val existsSql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+                val hasTable = conn.prepareStatement(existsSql).use { stmt ->
+                    stmt.setString(1, tableName)
+                    stmt.executeQuery().use { rs -> rs.next() }
+                }
+                if (!hasTable) return null
+                val maxSql = "SELECT COALESCE(MAX(create_time), 0), COALESCE(MAX(local_id), 0) FROM $tableName"
+                conn.createStatement().use { stmt ->
+                    stmt.executeQuery(maxSql).use { rs ->
+                        if (rs.next()) rs.getLong(1) to rs.getLong(2) else 0L to 0L
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
@@ -81,12 +86,14 @@ class WeChatMessageRepository(
 
         driver.openReadOnlyConnection(shardFile).use { conn ->
             val name2IdMap = loadShardNameToIdMap(conn)
-            val sql = "SELECT local_id, create_time, real_sender_id, message_content FROM $tableName ORDER BY create_time DESC LIMIT ?"
+            val hasLocalType = hasColumn(conn, tableName, "local_type")
+            val localTypeSelect = if (hasLocalType) "local_type" else "1 AS local_type"
+            val sql = "SELECT local_id, create_time, real_sender_id, $localTypeSelect, message_content FROM $tableName ORDER BY create_time DESC LIMIT ?"
             conn.prepareStatement(sql).use { stmt ->
                 stmt.setInt(1, limit)
                 stmt.executeQuery().use { rs ->
                     while (rs.next()) {
-                        messages.add(parseMessageRow(rs, contactsMap, name2IdMap))
+                        messages.add(parseMessageRow(rs, contactsMap, name2IdMap, hasLocalType))
                     }
                 }
             }
@@ -109,13 +116,15 @@ class WeChatMessageRepository(
 
         driver.openReadOnlyConnection(shardFile).use { conn ->
             val name2IdMap = loadShardNameToIdMap(conn)
-            val sql = "SELECT local_id, create_time, real_sender_id, message_content FROM $tableName WHERE local_id > ? ORDER BY local_id ASC LIMIT ?"
+            val hasLocalType = hasColumn(conn, tableName, "local_type")
+            val localTypeSelect = if (hasLocalType) "local_type" else "1 AS local_type"
+            val sql = "SELECT local_id, create_time, real_sender_id, $localTypeSelect, message_content FROM $tableName WHERE local_id > ? ORDER BY local_id ASC LIMIT ?"
             conn.prepareStatement(sql).use { stmt ->
                 stmt.setLong(1, sinceLocalId)
                 stmt.setInt(2, limit)
                 stmt.executeQuery().use { rs ->
                     while (rs.next()) {
-                        messages.add(parseMessageRow(rs, contactsMap, name2IdMap))
+                        messages.add(parseMessageRow(rs, contactsMap, name2IdMap, hasLocalType))
                     }
                 }
             }
@@ -141,41 +150,44 @@ class WeChatMessageRepository(
         return map
     }
 
+    private fun hasColumn(conn: java.sql.Connection, tableName: String, columnName: String): Boolean {
+        return conn.createStatement().use { stmt ->
+            stmt.executeQuery("PRAGMA table_info($tableName)").use { rs ->
+                var found = false
+                while (rs.next()) {
+                    if (rs.getString("name").equals(columnName, ignoreCase = true)) {
+                        found = true
+                        break
+                    }
+                }
+                found
+            }
+        }
+    }
+
     private fun parseMessageRow(
         rs: java.sql.ResultSet,
         contactsMap: Map<String, String>,
-        name2IdMap: Map<Long, String>
+        name2IdMap: Map<Long, String>,
+        hasLocalType: Boolean
     ): WeChatMessage {
         val localId = rs.getLong("local_id")
         val createTime = rs.getLong("create_time")
         val realSenderId = rs.getString("real_sender_id") ?: ""
+        val localType = rs.getLong("local_type")
         val contentBytes = rs.getBytes("message_content") ?: ByteArray(0)
 
         val isCompressed = ZstdDecompressor.isZstdCompressed(contentBytes)
         val decompressed = ZstdDecompressor.decompressToString(contentBytes)
-
-        // Keep Name2Id sender authoritative when present; only parse inline "wxid:\n" headers when unmapped or matching.
-        val mappedSenderId = realSenderId.toLongOrNull()?.let { name2IdMap[it] }
-        var senderId = mappedSenderId ?: realSenderId
-        var textContent = decompressed
-        if (decompressed.isNotEmpty() && decompressed.take(40).contains(":\n")) {
-            val parts = decompressed.split(":\n", limit = 2)
-            val candidatePrefix = parts[0].trim()
-            if (mappedSenderId != null) {
-                if (candidatePrefix == mappedSenderId) {
-                    textContent = parts.getOrNull(1) ?: ""
-                }
-            } else if (
-                candidatePrefix in contactsMap ||
-                candidatePrefix.startsWith("wxid_") ||
-                (realSenderId.isBlank() && WECHAT_ID_REGEX.matches(candidatePrefix))
-            ) {
-                senderId = candidatePrefix
-                textContent = parts.getOrNull(1) ?: ""
-            }
-        }
-
+        val (senderId, initialText) = resolveSenderAndBody(realSenderId, decompressed, contactsMap, name2IdMap)
         val senderDisplayName = contactsMap[senderId] ?: senderId.ifBlank { "Unknown" }
+
+        val attachments = extractRowAttachments(localType, initialText, createTime, hasLocalType)
+        val textContent = if (attachments.isNotEmpty()) {
+            WeChatFileMessageParser.formatAttachmentMarker(attachments.first())
+        } else {
+            initialText
+        }
 
         return WeChatMessage(
             localId = localId,
@@ -184,8 +196,58 @@ class WeChatMessageRepository(
             senderDisplayName = senderDisplayName,
             rawContent = decompressed,
             textContent = textContent,
-            isZstdCompressed = isCompressed
+            isZstdCompressed = isCompressed,
+            localType = localType,
+            attachments = attachments
         )
+    }
+
+    private fun resolveSenderAndBody(
+        realSenderId: String,
+        decompressed: String,
+        contactsMap: Map<String, String>,
+        name2IdMap: Map<Long, String>
+    ): Pair<String, String> {
+        val mappedSenderId = realSenderId.toLongOrNull()?.let { name2IdMap[it] }
+        val baseSenderId = mappedSenderId ?: realSenderId
+        if (decompressed.isEmpty() || !decompressed.take(40).contains(":\n")) {
+            return baseSenderId to decompressed
+        }
+        val parts = decompressed.split(":\n", limit = 2)
+        val candidatePrefix = parts[0].trim()
+        val bodyWithoutPrefix = parts.getOrNull(1) ?: ""
+
+        if (mappedSenderId != null) {
+            return if (candidatePrefix == mappedSenderId) baseSenderId to bodyWithoutPrefix else baseSenderId to decompressed
+        }
+        if (candidatePrefix == realSenderId && realSenderId.isNotBlank()) {
+            return baseSenderId to bodyWithoutPrefix
+        }
+        val canInferMissingSender = realSenderId.isBlank() || (realSenderId.toLongOrNull() != null && name2IdMap.isEmpty())
+        val isKnownSenderPrefix = candidatePrefix in contactsMap ||
+            candidatePrefix.startsWith("wxid_") ||
+            WECHAT_ID_REGEX.matches(candidatePrefix)
+        return if (canInferMissingSender && isKnownSenderPrefix) {
+            candidatePrefix to bodyWithoutPrefix
+        } else {
+            baseSenderId to decompressed
+        }
+    }
+
+    private fun extractRowAttachments(
+        localType: Long,
+        textContent: String,
+        createTime: Long,
+        hasLocalType: Boolean
+    ): List<com.wechatdigest.core.model.EventAttachment> {
+        val isCandidate = WeChatFileMessageParser.isCandidateFileMessage(
+            localType = localType,
+            content = textContent,
+            allowLegacyXmlFallback = !hasLocalType
+        )
+        if (!isCandidate) return emptyList()
+        val parsed = WeChatFileMessageParser.parseFileMessage(textContent, createTime) ?: return emptyList()
+        return listOf(attachmentResolver?.resolve(parsed) ?: parsed)
     }
 
     companion object {

@@ -2,6 +2,8 @@ package com.wechatdigest.storage
 
 import org.sqlite.SQLiteConfig
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.Statement
@@ -9,8 +11,12 @@ import java.sql.Statement
 class AppDatabase(val dbFile: File = defaultDbFile()) {
 
     init {
-        dbFile.parentFile?.mkdirs()
+        dbFile.parentFile?.let { parent ->
+            parent.mkdirs()
+            setOwnerOnlyPermissions(parent, isDirectory = true)
+        }
         initSchema()
+        setOwnerOnlyPermissions(dbFile, isDirectory = false)
     }
 
     fun getConnection(): Connection {
@@ -64,6 +70,7 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                         source_room_name TEXT DEFAULT '',
                         source_messages TEXT DEFAULT '',
                         translated_source_messages TEXT DEFAULT '',
+                        attachments TEXT DEFAULT '[]',
                         timestamp_seconds INTEGER NOT NULL,
                         is_read INTEGER DEFAULT 0,
                         is_starred INTEGER DEFAULT 0,
@@ -74,11 +81,12 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                 )
 
                 // Safe schema migrations for existing databases
-                runCatching { stmt.execute("ALTER TABLE event_cards ADD COLUMN source_room_name TEXT DEFAULT ''") }
-                runCatching { stmt.execute("ALTER TABLE event_cards ADD COLUMN source_messages TEXT DEFAULT ''") }
-                runCatching { stmt.execute("ALTER TABLE event_cards ADD COLUMN translated_source_messages TEXT DEFAULT ''") }
-                runCatching { stmt.execute("ALTER TABLE event_cards ADD COLUMN sections TEXT DEFAULT '[]'") }
-                runCatching { stmt.execute("ALTER TABLE event_cards ADD COLUMN is_starred INTEGER DEFAULT 0") }
+                ensureColumnExists(stmt, "event_cards", "source_room_name", "TEXT DEFAULT ''")
+                ensureColumnExists(stmt, "event_cards", "source_messages", "TEXT DEFAULT ''")
+                ensureColumnExists(stmt, "event_cards", "translated_source_messages", "TEXT DEFAULT ''")
+                ensureColumnExists(stmt, "event_cards", "sections", "TEXT DEFAULT '[]'")
+                ensureColumnExists(stmt, "event_cards", "is_starred", "INTEGER DEFAULT 0")
+                ensureColumnExists(stmt, "event_cards", "attachments", "TEXT DEFAULT '[]'")
 
                 stmt.execute(
                     """
@@ -108,6 +116,23 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
         if (!exists) {
             stmt.execute("ALTER TABLE $table ADD COLUMN $column $definition")
         }
+    }
+
+    private fun setOwnerOnlyPermissions(path: File, isDirectory: Boolean) {
+        if (!path.exists()) return
+        val perms = if (isDirectory) {
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+                PosixFilePermission.OWNER_EXECUTE
+            )
+        } else {
+            setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE
+            )
+        }
+        runCatching { Files.setPosixFilePermissions(path.toPath(), perms) }
     }
 
     companion object {

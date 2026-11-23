@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class SyncServiceTest {
@@ -593,5 +594,115 @@ class SyncServiceTest {
         assertEquals(1, maxInFlight.get(), "Ollama sync must throttle concurrency to 1")
         assertEquals(1, (res as SyncResult.Success).roomErrors.size, "CardTranslator failure must bubble as room error")
         kotlin.test.assertNull(checkpointStore.get(room), "Translator failure must prevent checkpoint advancement")
+    }
+
+    @Test
+    fun `syncNow extracts file attachment resolves path via hardlink and injects bounded spreadsheet preview`() = runBlocking<Unit> {
+        val accountRoot = File(tempDir, "wxid_sync_attach").apply { mkdirs() }
+        val dbDir = File(accountRoot, "db_storage").apply { mkdirs() }
+        val contactDir = File(dbDir, "contact").apply { mkdirs() }
+        val messageDir = File(dbDir, "message").apply { mkdirs() }
+        val hardlinkDir = File(dbDir, "hardlink").apply { mkdirs() }
+        val fileMonthDir = File(accountRoot, "msg/file/2026-11").apply { mkdirs() }
+
+        val excelFile = File(fileMonthDir, "exam_seats.xlsx")
+        org.apache.poi.xssf.usermodel.XSSFWorkbook().use { wb ->
+            val sheet = wb.createSheet("Schedule")
+            sheet.createRow(0).apply {
+                createCell(0).setCellValue("Course")
+                createCell(1).setCellValue("Room")
+                createCell(2).setCellValue("Time")
+            }
+            sheet.createRow(1).apply {
+                createCell(0).setCellValue("Algorithms Final")
+                createCell(1).setCellValue("Auditorium C-201")
+                createCell(2).setCellValue("Nov 29 09:00")
+            }
+            excelFile.outputStream().use { wb.write(it) }
+        }
+
+        val excelBytes = excelFile.readBytes()
+        val excelMd5 = java.security.MessageDigest.getInstance("MD5")
+            .digest(excelBytes)
+            .joinToString("") { "%02x".format(it) }
+
+        val room = "exam_sync@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(contactDir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'CS Exam Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('wxid_prof', 'Prof_Zhang', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(hardlinkDir, "hardlink.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE dir2id(username TEXT PRIMARY KEY)")
+                stmt.execute("INSERT INTO dir2id(rowid, username) VALUES (1, '2026-11')")
+                stmt.execute("CREATE TABLE file_hardlink_info_v4(md5 TEXT, file_name TEXT, file_size INTEGER, dir1 INTEGER, dir2 INTEGER)")
+                stmt.executeUpdate("INSERT INTO file_hardlink_info_v4 VALUES ('$excelMd5', 'exam_seats.xlsx', ${excelFile.length()}, 1, 0)")
+            }
+        }
+        val packedFileType = (6L shl 32) or 49L
+        val fileXml = """
+            wxid_prof:
+            <?xml version="1.0"?>
+            <msg><appmsg><title>exam_seats.xlsx</title><type>6</type><appattach><totallen>${excelFile.length()}</totallen><fileext>xlsx</fileext></appattach><md5>$excelMd5</md5></appmsg></msg>
+        """.trimIndent()
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(messageDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, local_type INTEGER, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1795000000, 'wxid_prof', 1, CAST('Final exam room and seating spreadsheet attached below.' AS BLOB))")
+                val ps = conn.prepareStatement("INSERT INTO $table VALUES (2, 1795000005, 'wxid_prof', ?, ?)")
+                ps.setLong(1, packedFileType)
+                ps.setBytes(2, fileXml.toByteArray(Charsets.UTF_8))
+                ps.executeUpdate()
+                ps.close()
+            }
+        }
+
+        val capturedPrompts = mutableListOf<String>()
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            capturedPrompts.add(body)
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"Algorithms Final Exam","message_ids":[1,2],"category":"EXAM"}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                else ->
+                    """{"is_relevant":true,"events":[{"title":"Algorithms Final Exam Seating","summary":"Algorithms Final is in Auditorium C-201 on Nov 29 at 09:00 per exam_seats.xlsx.","category":"EXAM","priority":"IMPORTANT","source_message_ids":[1,2]}]}"""
+            }
+            val payload = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}"""
+            respond(payload, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+        }
+
+        val checkpointStore = SyncCheckpointStore(appDb)
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = checkpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val result = service.syncNow(
+            AppSettings(
+                wechatDataDir = dbDir.absolutePath,
+                monitoredRoomIds = setOf(room),
+                parseAttachmentContents = true,
+                llm = LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, apiKey = "k")
+            )
+        )
+        assertTrue(result is SyncResult.Success)
+        assertEquals(1, (result as SyncResult.Success).newEventsCount)
+
+        assertTrue(
+            capturedPrompts.any { it.contains("Auditorium C-201") && it.contains("[Shared File: exam_seats.xlsx") },
+            "Prompts must receive bounded spreadsheet preview content"
+        )
+
+        val storedCard = eventCardStore.listActive().single()
+        assertEquals(1, storedCard.attachments.size)
+        assertEquals("exam_seats.xlsx", storedCard.attachments.single().fileName)
+        assertEquals(excelFile.canonicalPath, storedCard.attachments.single().localPath)
+        assertFalse(storedCard.sourceMessages.contains("Auditorium C-201"), "Raw spreadsheet preview should stay out of stored sourceMessages")
     }
 }

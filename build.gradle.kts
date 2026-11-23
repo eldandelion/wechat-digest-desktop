@@ -22,6 +22,9 @@ dependencies {
     implementation("com.github.luben:zstd-jni:1.5.6-8")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
+    implementation("org.apache.poi:poi:5.3.0")
+    implementation("org.apache.poi:poi-ooxml:5.3.0")
+    implementation("org.apache.pdfbox:pdfbox:3.0.3")
 
     // Compose Desktop & Material 3
     implementation(compose.desktop.currentOs)

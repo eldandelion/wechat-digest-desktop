@@ -1,5 +1,7 @@
 package com.wechatdigest.storage
 
+import com.wechatdigest.core.llm.LlmJsonUtils
+import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
@@ -38,9 +40,9 @@ class EventCardStore(private val db: AppDatabase) {
             INSERT OR IGNORE INTO event_cards (
                 id, dedupe_key, title, summary, translated_summary, sections, category, priority,
                 event_date, action_items, original_sender, source_room_id,
-                source_room_name, source_messages, translated_source_messages,
+                source_room_name, source_messages, translated_source_messages, attachments,
                 timestamp_seconds, is_read, is_starred, is_dismissed, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """.trimIndent()
 
         var insertedCount = 0
@@ -66,11 +68,12 @@ class EventCardStore(private val db: AppDatabase) {
                         stmt.setString(13, card.sourceRoomName)
                         stmt.setString(14, card.sourceMessages)
                         stmt.setString(15, card.translatedSourceMessages)
-                        stmt.setLong(16, card.timestampSeconds)
-                        stmt.setInt(17, if (card.isRead) 1 else 0)
-                        stmt.setInt(18, if (card.isStarred) 1 else 0)
-                        stmt.setInt(19, if (card.isDismissed) 1 else 0)
-                        stmt.setLong(20, now)
+                        stmt.setString(16, json.encodeToString(card.attachments))
+                        stmt.setLong(17, card.timestampSeconds)
+                        stmt.setInt(18, if (card.isRead) 1 else 0)
+                        stmt.setInt(19, if (card.isStarred) 1 else 0)
+                        stmt.setInt(20, if (card.isDismissed) 1 else 0)
+                        stmt.setLong(21, now)
 
                         if (stmt.executeUpdate() > 0) {
                             insertedCount++
@@ -92,7 +95,7 @@ class EventCardStore(private val db: AppDatabase) {
         val sql = """
             SELECT id, title, summary, translated_summary, sections, category, priority,
                    event_date, original_sender, source_room_id,
-                   source_room_name, source_messages, translated_source_messages,
+                   source_room_name, source_messages, translated_source_messages, attachments,
                    timestamp_seconds, is_read, is_starred, is_dismissed
             FROM event_cards
             WHERE is_dismissed = 0
@@ -111,9 +114,10 @@ class EventCardStore(private val db: AppDatabase) {
         try {
             db.getConnection().use { conn ->
                 conn.createStatement().use { stmt ->
-                    val rs = stmt.executeQuery(sql)
-                    while (rs.next()) {
-                        results.add(mapRowToEventCard(rs))
+                    stmt.executeQuery(sql).use { rs ->
+                        while (rs.next()) {
+                            results.add(mapRowToEventCard(rs))
+                        }
                     }
                 }
             }
@@ -128,7 +132,7 @@ class EventCardStore(private val db: AppDatabase) {
         val sql = """
             SELECT id, title, summary, translated_summary, sections, category, priority,
                    event_date, original_sender, source_room_id,
-                   source_room_name, source_messages, translated_source_messages,
+                   source_room_name, source_messages, translated_source_messages, attachments,
                    timestamp_seconds, is_read, is_starred, is_dismissed
             FROM event_cards
             WHERE is_dismissed = 0 AND source_room_id = ?
@@ -143,14 +147,15 @@ class EventCardStore(private val db: AppDatabase) {
                 conn.prepareStatement(sql).use { stmt ->
                     stmt.setString(1, roomId)
                     stmt.setInt(2, limit)
-                    val rs = stmt.executeQuery()
-                    while (rs.next()) {
-                        results.add(mapRowToEventCard(rs))
+                    stmt.executeQuery().use { rs ->
+                        while (rs.next()) {
+                            results.add(mapRowToEventCard(rs))
+                        }
                     }
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[EventCardStore] Error listing recent room cards: ${e.message}")
+            System.err.println("[EventCardStore] Error listing recent room cards: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
         return results
     }
@@ -161,6 +166,12 @@ class EventCardStore(private val db: AppDatabase) {
             emptyList()
         } else {
             runCatching { json.decodeFromString<List<EventSection>>(rawSections) }.getOrDefault(emptyList())
+        }
+        val rawAttachments = rs.getString("attachments")
+        val decodedAttachments = if (rawAttachments.isNullOrBlank()) {
+            emptyList()
+        } else {
+            runCatching { json.decodeFromString<List<EventAttachment>>(rawAttachments) }.getOrDefault(emptyList())
         }
         return EventCard(
             id = rs.getString("id"),
@@ -176,6 +187,7 @@ class EventCardStore(private val db: AppDatabase) {
             sourceRoomName = rs.getString("source_room_name") ?: "",
             sourceMessages = rs.getString("source_messages") ?: "",
             translatedSourceMessages = rs.getString("translated_source_messages") ?: "",
+            attachments = decodedAttachments,
             timestampSeconds = rs.getLong("timestamp_seconds"),
             isRead = rs.getInt("is_read") == 1,
             isStarred = rs.getInt("is_starred") == 1,
@@ -191,9 +203,21 @@ class EventCardStore(private val db: AppDatabase) {
         executeUpdate("UPDATE event_cards SET is_read = 0 WHERE id = ?", id)
     }
 
+    /** Sets the `is_starred` flag for card [id] using a parameterized SQL update. */
     fun setStarred(id: String, starred: Boolean) {
         val value = if (starred) 1 else 0
-        executeUpdate("UPDATE event_cards SET is_starred = $value WHERE id = ?", id)
+        val sql = "UPDATE event_cards SET is_starred = ? WHERE id = ?"
+        try {
+            db.getConnection().use { conn ->
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.setInt(1, value)
+                    stmt.setString(2, id)
+                    stmt.executeUpdate()
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error updating star state: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
     }
 
     fun dismiss(id: String) {
@@ -211,7 +235,34 @@ class EventCardStore(private val db: AppDatabase) {
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[EventCardStore] Error updating translated source messages: ${e.message}")
+            System.err.println(
+                "[EventCardStore] Error updating translated source messages: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
+            )
+        }
+    }
+
+    /**
+     * Persists [attachments] as JSON for card [id], throwing on database errors.
+     */
+    fun updateAttachmentsOrThrow(id: String, attachments: List<EventAttachment>) {
+        val sql = "UPDATE event_cards SET attachments = ? WHERE id = ?"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                stmt.setString(1, json.encodeToString(attachments))
+                stmt.setString(2, id)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    /**
+     * Persists [attachments] for card [id], logging and absorbing database errors.
+     */
+    fun updateAttachments(id: String, attachments: List<EventAttachment>) {
+        try {
+            updateAttachmentsOrThrow(id, attachments)
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error updating attachments: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
     }
 
@@ -224,7 +275,7 @@ class EventCardStore(private val db: AppDatabase) {
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[EventCardStore] Error clearing all cards: ${e.message}")
+            System.err.println("[EventCardStore] Error clearing all cards: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
     }
 
@@ -237,7 +288,7 @@ class EventCardStore(private val db: AppDatabase) {
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[EventCardStore] Error executing update: ${e.message}")
+            System.err.println("[EventCardStore] Error executing update: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
     }
 

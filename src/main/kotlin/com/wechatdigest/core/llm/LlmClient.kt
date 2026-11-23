@@ -18,6 +18,8 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.net.URI
+import java.util.Locale
 
 // OpenAI Request / Response DTOs
 @Serializable
@@ -123,7 +125,8 @@ class KtorLlmClient(
     }
 
     private suspend fun executeOpenAi(systemPrompt: String, userPrompt: String): String {
-        val baseUrl = config.endpointUrl.trimEnd('/')
+        val baseUrl = config.endpointUrl.trim().trimEnd('/')
+        validateTransportSecurity(baseUrl)
         val url = if (baseUrl.endsWith("/chat/completions")) baseUrl else "$baseUrl/chat/completions"
 
         val requestPayload = OpenAiRequest(
@@ -163,7 +166,8 @@ class KtorLlmClient(
     }
 
     private suspend fun executeOllama(systemPrompt: String, userPrompt: String): String {
-        val baseUrl = config.endpointUrl.trimEnd('/')
+        val baseUrl = config.endpointUrl.trim().trimEnd('/')
+        validateTransportSecurity(baseUrl)
         val url = if (baseUrl.endsWith("/api/chat")) baseUrl else "$baseUrl/api/chat"
 
         val requestPayload = OllamaRequest(
@@ -208,6 +212,14 @@ class KtorLlmClient(
         }
         return response.message?.content?.takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("Empty or missing message in Ollama response")
+    }
+
+    private fun validateTransportSecurity(baseUrl: String) {
+        val parsed = runCatching { URI(baseUrl) }.getOrNull()
+        val scheme = parsed?.scheme?.lowercase(Locale.ROOT)
+        require(scheme == "https" || (scheme == "http" && EventExtractor.isLocalEndpoint(baseUrl))) {
+            "Remote LLM endpoints must use https:// (cleartext http:// is permitted only for local loopback endpoints)."
+        }
     }
 
     override fun close() {
