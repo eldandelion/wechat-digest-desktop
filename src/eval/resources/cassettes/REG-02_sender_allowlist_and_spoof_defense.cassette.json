@@ -2,19 +2,19 @@
     "version": 1,
     "scenarioId": "REG-02_sender_allowlist_and_spoof_defense",
     "descriptions": {
+        "2f1c047285d18b0f61940276b50be1dc191c9305da35ee049844367e1cb65ddc": "pass3_synthesis",
         "2f325783720d9d2f4b91057810048929fd2813954be8bf7d01874b900876eb88": "pass1_triage",
-        "a33b230742a8df008ef2797d8d50da9a8bc93e17fbb96f4f175ad593db68ac47": "pass2_gatekeeper",
-        "b3dc3cf43962f3ba08aefbc1ad588bc7394c7103d65eb349a7ad2c7243e796de": "pass3_synthesis"
+        "a33b230742a8df008ef2797d8d50da9a8bc93e17fbb96f4f175ad593db68ac47": "pass2_gatekeeper"
     },
     "entries": {
+        "2f1c047285d18b0f61940276b50be1dc191c9305da35ee049844367e1cb65ddc": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Lab Safety Inspection\",\"summary\":\"Lab safety inspection will take place on Wednesday at 14:00 in Building C Room 204.\",\"translated_summary\":\"Lab safety inspection will take place on Wednesday at 14:00 in Building C Room 204.\",\"sections\":[{\"heading\":\"Time & Venue\",\"content\":\"- Wednesday 14:00, Building C Room 204\"}],\"category\":\"NOTICE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[201]}]}"
+        ],
         "2f325783720d9d2f4b91057810048929fd2813954be8bf7d01874b900876eb88": [
             "{\"chunks\":[{\"topic\":\"Lab Safety Inspection\",\"message_ids\":[201],\"category\":\"NOTICE\",\"reason\":\"Scheduled safety inspection\"}]}"
         ],
         "a33b230742a8df008ef2797d8d50da9a8bc93e17fbb96f4f175ad593db68ac47": [
             "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official inspection time and room\"}]}"
-        ],
-        "b3dc3cf43962f3ba08aefbc1ad588bc7394c7103d65eb349a7ad2c7243e796de": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Lab Safety Inspection\",\"summary\":\"Lab safety inspection will take place on Wednesday at 14:00 in Building C Room 204.\",\"translated_summary\":\"Lab safety inspection will take place on Wednesday at 14:00 in Building C Room 204.\",\"sections\":[{\"heading\":\"Time & Venue\",\"content\":\"- Wednesday 14:00, Building C Room 204\"}],\"category\":\"NOTICE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[201]}]}"
         ]
     }
 }

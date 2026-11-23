@@ -2,16 +2,16 @@
     "version": 1,
     "scenarioId": "REG-01_emoji_acks_and_bare_mentions",
     "descriptions": {
-        "437ae8fc0d8267bd1c2987f2a6ed883a31d0e24163c1d3dfd0a6a6bcf2e8dab9": "pass3_synthesis",
         "5cf3bf819ab0e7d9141475d76b00ffcb7b3e07e8111734889ec69aeaebc0a67d": "pass2_gatekeeper",
+        "789226a4164a9508187fdfdfef9e99090938277169d447a546431d5b8289f5d2": "pass3_synthesis",
         "ae852a120003affdbe179cc1f07b9db4da1622affee528c8c5eb0d5592a77e8f": "pass1_triage"
     },
     "entries": {
-        "437ae8fc0d8267bd1c2987f2a6ed883a31d0e24163c1d3dfd0a6a6bcf2e8dab9": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Final Project Report Deadline\",\"summary\":\"Final project report submission closes Friday at 17:00 on Canvas (Room 305 lab).\",\"translated_summary\":\"Final project report submission closes Friday at 17:00 on Canvas (Room 305 lab).\",\"sections\":[{\"heading\":\"Submission Details\",\"content\":\"- Platform: Canvas\\n- Deadline: Friday 17:00\\n- Lab: Room 305\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[108]}]}"
-        ],
         "5cf3bf819ab0e7d9141475d76b00ffcb7b3e07e8111734889ec69aeaebc0a67d": [
             "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Concrete Canvas deadline and room\"}]}"
+        ],
+        "789226a4164a9508187fdfdfef9e99090938277169d447a546431d5b8289f5d2": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Final Project Report Deadline\",\"summary\":\"Final project report submission closes Friday at 17:00 on Canvas (Room 305 lab).\",\"translated_summary\":\"Final project report submission closes Friday at 17:00 on Canvas (Room 305 lab).\",\"sections\":[{\"heading\":\"Submission Details\",\"content\":\"- Platform: Canvas\\n- Deadline: Friday 17:00\\n- Lab: Room 305\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[108]}]}"
         ],
         "ae852a120003affdbe179cc1f07b9db4da1622affee528c8c5eb0d5592a77e8f": [
             "{\"chunks\":[{\"topic\":\"Final Project Report Deadline\",\"message_ids\":[108],\"category\":\"DEADLINE\",\"reason\":\"Concrete project submission deadline\"}]}"

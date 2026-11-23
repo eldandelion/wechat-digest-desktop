@@ -7,6 +7,8 @@ import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
+import com.wechatdigest.core.model.EventDetailItem
+import com.wechatdigest.core.model.EventDetailKind
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.core.sanitizer.PrefilterConfig
@@ -528,5 +530,89 @@ class StorageTest {
         val reloaded = eventCardStore.listRecentByRoom("exam@chatroom").single()
         assertEquals(downloadedFile.absolutePath, reloaded.attachments.single().localPath)
         assertTrue(reloaded.attachments.single().isLocalFilePresent())
+    }
+
+    @Test
+    fun `event card store round-trips section items and reads legacy section json safely`() {
+        val structuredCard = EventCard(
+            id = "items-card-1",
+            title = "Final Exam Details",
+            summary = "Exam on June 15.",
+            translatedSummary = "Exam on June 15.",
+            sections = listOf(
+                EventSection(
+                    heading = "Exam Details",
+                    content = "Bring student ID.",
+                    items = listOf(
+                        EventDetailItem(EventDetailKind.DATE, "Date", "2026-06-15"),
+                        EventDetailItem(EventDetailKind.TIME, "Time", "14:00 - 16:00"),
+                        EventDetailItem(EventDetailKind.LOCATION, "Location", "Room 302")
+                    )
+                )
+            ),
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Advisor",
+            sourceRoomId = "cs@chatroom",
+            timestampSeconds = 1795000200L
+        )
+        assertEquals(1, eventCardStore.upsert(listOf(structuredCard)))
+
+        val loaded = eventCardStore.listActive().single { it.id == "items-card-1" }
+        assertEquals(3, loaded.sections.single().items.size)
+        assertEquals(EventDetailKind.LOCATION, loaded.sections.single().items[2].kind)
+        assertEquals("Room 302", loaded.sections.single().items[2].value)
+
+        // Legacy row whose sections JSON has no "items" property must still deserialize cleanly
+        appDb.getConnection().prepareStatement(
+            """
+            INSERT INTO event_cards (
+                id, dedupe_key, title, summary, translated_summary, sections, category, priority,
+                event_date, action_items, original_sender, source_room_id, source_room_name,
+                source_messages, translated_source_messages, attachments, timestamp_seconds,
+                is_read, is_starred, is_dismissed, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+            """.trimIndent()
+        ).use { ps ->
+            ps.setString(1, "legacy-sections-1")
+            ps.setString(2, "legacy-dedupe-1")
+            ps.setString(3, "Legacy Notice")
+            ps.setString(4, "Summary")
+            ps.setString(5, "Summary")
+            ps.setString(6, """[{"heading":"Logistics","content":"- Location: 422-1"}]""")
+            ps.setString(7, "NOTICE")
+            ps.setString(8, "NORMAL")
+            ps.setString(9, null)
+            ps.setString(10, "[]")
+            ps.setString(11, "Admin")
+            ps.setString(12, "cs@chatroom")
+            ps.setString(13, "CS Group")
+            ps.setString(14, "")
+            ps.setString(15, "")
+            ps.setString(16, "[]")
+            ps.setLong(17, 1795000100L)
+            ps.setLong(18, 1795000100L)
+            ps.executeUpdate()
+        }
+
+        val legacyLoaded = eventCardStore.listActive().single { it.id == "legacy-sections-1" }
+        assertEquals("Logistics", legacyLoaded.sections.single().heading)
+        assertTrue(legacyLoaded.sections.single().items.isEmpty())
+        assertEquals("- Location: 422-1", legacyLoaded.sections.single().content)
+
+        // Verify updateSections persists Pass 4 enriched items & bullets cleanly
+        val updatedSections = listOf(
+            EventSection(
+                heading = "Logistics",
+                content = "",
+                items = listOf(EventDetailItem(EventDetailKind.LOCATION, "Venue", "Room 422-1")),
+                bullets = listOf("Location: 422-1")
+            )
+        )
+        eventCardStore.updateSections("legacy-sections-1", updatedSections)
+        val enrichedLoaded = eventCardStore.listActive().single { it.id == "legacy-sections-1" }
+        assertEquals(1, enrichedLoaded.sections.single().items.size)
+        assertEquals("Venue", enrichedLoaded.sections.single().items.single().label)
+        assertEquals(listOf("Location: 422-1"), enrichedLoaded.sections.single().bullets)
     }
 }

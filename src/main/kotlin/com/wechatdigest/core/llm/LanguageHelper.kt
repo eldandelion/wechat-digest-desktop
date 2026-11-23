@@ -36,6 +36,7 @@ object LanguageHelper {
     private val sourceLineSenderRegex = Regex("(?m)^\\[[^\\]]{1,32}\\]\\s+([^:\\r\\n]{2,64}):")
     private val asciiWordRegex = Regex("^[A-Za-z0-9_.-]+$")
     private val unsafeTargetCharsRegex = Regex("[^A-Za-z0-9 ()_-]+")
+    private val identifierSplitRegex = Regex("""[\s,;/()]+""")
 
     private val knownLanguages = mapOf(
         "en" to "English",
@@ -160,6 +161,21 @@ object LanguageHelper {
             if (section.content.isNotBlank() && !isTextCompliant(section.content, profile, exemptPatterns)) {
                 flagged.add("section[$idx].content")
             }
+            section.items.forEachIndexed { itemIdx, item ->
+                if (item.label.isNotBlank() && !isTextCompliant(item.label, profile, exemptPatterns)) {
+                    flagged.add("section[$idx].item[$itemIdx].label")
+                }
+                val checkValue = item.value.isNotBlank() &&
+                    !(profile != ScriptProfile.LATIN && isShortAsciiIdentifier(item.value, exemptPatterns))
+                if (checkValue && !isTextCompliant(item.value, profile, exemptPatterns)) {
+                    flagged.add("section[$idx].item[$itemIdx].value")
+                }
+            }
+            section.bullets.forEachIndexed { bulletIdx, bullet ->
+                if (bullet.isNotBlank() && !isTextCompliant(bullet, profile, exemptPatterns)) {
+                    flagged.add("section[$idx].bullet[$bulletIdx]")
+                }
+            }
         }
 
         return LanguageComplianceResult(
@@ -185,6 +201,14 @@ object LanguageHelper {
                 Regex(Regex.escape(sender), RegexOption.IGNORE_CASE)
             }
         }
+    }
+
+    private fun isShortAsciiIdentifier(value: String, exemptPatterns: List<Regex>): Boolean {
+        val cleaned = stripNonLinguisticTokens(value.take(MAX_COMPLIANCE_TEXT_LENGTH), exemptPatterns, stripShortAcronyms = true)
+        if (cleaned.isBlank()) return true
+        if (!cleaned.all { it.code < 128 }) return false
+        val words = cleaned.split(identifierSplitRegex).filter { token -> token.any { it.isLetter() } }
+        return words.size <= 2
     }
 
     private fun isTextCompliant(

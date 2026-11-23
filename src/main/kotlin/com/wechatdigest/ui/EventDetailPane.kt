@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -24,6 +25,7 @@ import androidx.compose.material.icons.automirrored.filled.EventNote
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarToday
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
@@ -57,11 +59,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventDetailItem
+import com.wechatdigest.core.model.EventDetailItemParser
 import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.ui.theme.LocalIsDarkTheme
 import com.wechatdigest.ui.theme.PriorityColors
@@ -113,7 +118,9 @@ internal fun EventDetailPane(
     onToggleStar: () -> Unit,
     onToggleRead: () -> Unit,
     onAddToCalendar: () -> Unit,
-    onRequestDelete: () -> Unit
+    onRequestDelete: () -> Unit,
+    isEnrichingSections: Boolean = false,
+    onEnrichSections: (Int?) -> Unit = {}
 ) {
     var showTranslatedMessages by remember(card.id) { mutableStateOf(false) }
     var autoRevealTranslation by remember(card.id) { mutableStateOf(false) }
@@ -154,7 +161,9 @@ internal fun EventDetailPane(
                 isTranslatingMessages = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
                 isRecheckingAttachments = isRecheckingAttachments,
+                isEnrichingSections = isEnrichingSections,
                 onTranslateAction = handleTranslationAction,
+                onEnrichSections = onEnrichSections,
                 onOpenAttachment = onOpenAttachment,
                 onRevealAttachmentInFinder = onRevealAttachmentInFinder,
                 onRecheckAttachments = onRecheckAttachments,
@@ -243,7 +252,9 @@ private fun EventDetailScrollContent(
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
     isRecheckingAttachments: Boolean,
+    isEnrichingSections: Boolean,
     onTranslateAction: () -> Unit,
+    onEnrichSections: (Int?) -> Unit,
     onOpenAttachment: (EventAttachment) -> Unit,
     onRevealAttachmentInFinder: (EventAttachment) -> Unit,
     onRecheckAttachments: () -> Unit,
@@ -264,15 +275,28 @@ private fun EventDetailScrollContent(
             roomName = roomName,
             priorityColor = priorityColor,
             priorityContainer = priorityContainer,
-            isTranslatingMessages = isTranslatingMessages,
-            isShowingTranslation = isShowingTranslation,
-            isRecheckingAttachments = isRecheckingAttachments,
-            onTranslateAction = onTranslateAction,
-            onOpenAttachment = onOpenAttachment,
-            onRevealAttachmentInFinder = onRevealAttachmentInFinder,
-            onRecheckAttachments = onRecheckAttachments,
             onAddToCalendar = onAddToCalendar
         )
+        if (card.sections.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                card.sections.forEachIndexed { idx, section ->
+                    EventDetailSectionCard(
+                        section = section,
+                        isEnrichingSections = isEnrichingSections,
+                        onEnrichSections = { onEnrichSections(idx) }
+                    )
+                }
+            }
+        }
+        if (card.attachments.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            AttachmentsSection(card.attachments, isRecheckingAttachments, onOpenAttachment, onRevealAttachmentInFinder, onRecheckAttachments)
+        }
+        if (card.sourceMessages.isNotBlank()) {
+            Spacer(Modifier.height(12.dp))
+            EventDetailSourceMessagesBox(card, isTranslatingMessages, isShowingTranslation, onTranslateAction)
+        }
     }
 }
 
@@ -326,13 +350,6 @@ private fun EventDetailCardBody(
     roomName: String,
     priorityColor: Color,
     priorityContainer: Color,
-    isTranslatingMessages: Boolean,
-    isShowingTranslation: Boolean,
-    isRecheckingAttachments: Boolean,
-    onTranslateAction: () -> Unit,
-    onOpenAttachment: (EventAttachment) -> Unit,
-    onRevealAttachmentInFinder: (EventAttachment) -> Unit,
-    onRecheckAttachments: () -> Unit,
     onAddToCalendar: () -> Unit
 ) {
     Card(
@@ -344,20 +361,6 @@ private fun EventDetailCardBody(
             EventDetailSenderRow(card = card, roomName = roomName, priorityColor = priorityColor, priorityContainer = priorityContainer)
             Spacer(Modifier.height(16.dp))
             Text(text = card.translatedSummary.ifBlank { card.summary }, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
-            if (card.sections.isNotEmpty()) {
-                Spacer(Modifier.height(14.dp))
-                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    card.sections.forEach { EventDetailSectionCard(it) }
-                }
-            }
-            if (card.attachments.isNotEmpty()) {
-                Spacer(Modifier.height(16.dp))
-                AttachmentsSection(card.attachments, isRecheckingAttachments, onOpenAttachment, onRevealAttachmentInFinder, onRecheckAttachments)
-            }
-            if (card.sourceMessages.isNotBlank()) {
-                Spacer(Modifier.height(16.dp))
-                EventDetailSourceMessagesBox(card, isTranslatingMessages, isShowingTranslation, onTranslateAction)
-            }
             if (!card.eventDate.isNullOrBlank()) {
                 Spacer(Modifier.height(16.dp))
                 EventDetailCalendarFooter(onAddToCalendar = onAddToCalendar)
@@ -398,17 +401,139 @@ private fun EventDetailSenderRow(card: EventCard, roomName: String, priorityColo
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun EventDetailSectionCard(section: EventSection) {
+private fun EventDetailSectionCard(
+    section: EventSection,
+    isEnrichingSections: Boolean,
+    onEnrichSections: () -> Unit
+) {
+    val resolved = remember(section) { EventDetailItemParser.resolveSectionDisplay(section) }
+    val safeHeading = remember(section.heading) {
+        EventDetailItemParser.sanitizeSingleLine(section.heading, EventDetailItemParser.MAX_SECTION_HEADING_CHARS)
+    }
+    val canEnrichWithAi = remember(section, resolved.items.size) {
+        EventDetailItemParser.hasUnstructuredBullets(section) || resolved.items.isNotEmpty()
+    }
+    if (safeHeading.isBlank() && resolved.items.isEmpty() && resolved.remainingContent.isBlank()) {
+        return
+    }
     Column(
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceContainerLow).padding(horizontal = 14.dp, vertical = 12.dp)
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerLowest)
+            .padding(horizontal = 18.dp, vertical = 14.dp)
     ) {
-        if (section.heading.isNotBlank()) {
-            Text(text = section.heading, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+        val hasHeaderRow = safeHeading.isNotBlank() || canEnrichWithAi
+        if (hasHeaderRow) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (safeHeading.isNotBlank()) {
+                    Text(
+                        text = safeHeading,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                } else {
+                    Spacer(Modifier.weight(1f))
+                }
+                if (canEnrichWithAi) {
+                    if (isEnrichingSections) {
+                        Box(modifier = Modifier.size(28.dp), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        }
+                    } else {
+                        IconButton(onClick = onEnrichSections, modifier = Modifier.size(28.dp)) {
+                            Icon(
+                                imageVector = Icons.Default.AutoAwesome,
+                                contentDescription = "Structure detail cards with AI",
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+            }
         }
-        if (section.content.isNotBlank()) {
-            if (section.heading.isNotBlank()) Spacer(Modifier.height(4.dp))
-            Text(text = section.content, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (resolved.items.isNotEmpty()) {
+            if (hasHeaderRow) Spacer(Modifier.height(8.dp))
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                resolved.items.forEach { item ->
+                    DetailMetadataTile(item = item)
+                }
+            }
+        }
+        if (resolved.remainingContent.isNotBlank()) {
+            when {
+                resolved.items.isNotEmpty() -> Spacer(Modifier.height(10.dp))
+                hasHeaderRow -> Spacer(Modifier.height(4.dp))
+            }
+            Text(
+                text = resolved.remainingContent,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun DetailMetadataTile(item: EventDetailItem) {
+    val visuals = detailItemVisuals(item)
+    val labelText = item.label.ifBlank { EventDetailItemParser.defaultLabel(item.kind) }
+
+    Surface(
+        modifier = Modifier
+            .widthIn(min = 124.dp, max = 380.dp)
+            .semantics(mergeDescendants = true) {},
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Surface(
+                modifier = Modifier.size(28.dp),
+                shape = CircleShape,
+                color = visuals.badgeContainerColor
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = visuals.icon,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                        tint = visuals.badgeIconColor
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text(
+                    text = labelText,
+                    style = MaterialTheme.typography.labelSmall.copy(lineHeight = MaterialTheme.typography.labelSmall.fontSize),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = item.value,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
         }
     }
 }
@@ -421,7 +546,7 @@ private fun EventDetailSourceMessagesBox(
     onTranslateAction: () -> Unit
 ) {
     val activeText = if (isShowingTranslation) card.translatedSourceMessages else card.sourceMessages
-    Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceContainerLow).padding(14.dp)) {
+    Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerLowest).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text(
                 text = if (isShowingTranslation) "Source Messages (Translated)" else "Source Messages",
@@ -528,7 +653,7 @@ private fun AttachmentRow(
         else -> "$sizeText • Open in WeChat, then Re-check"
     }
 
-    Surface(modifier = Modifier.fillMaxWidth(), shape = shape, color = MaterialTheme.colorScheme.surfaceContainerLow) {
+    Surface(modifier = Modifier.fillMaxWidth(), shape = shape, color = MaterialTheme.colorScheme.surfaceContainerLowest) {
         Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             AttachmentRowLeadingIcon(fileExtension = attachment.fileExtension, isPresent = isPresent)
             Spacer(Modifier.width(12.dp))

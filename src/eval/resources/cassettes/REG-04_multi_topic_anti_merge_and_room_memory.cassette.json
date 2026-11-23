@@ -2,23 +2,23 @@
     "version": 1,
     "scenarioId": "REG-04_multi_topic_anti_merge_and_room_memory",
     "descriptions": {
-        "0838a7c1ece26ff7c003961c810e2109ce7c4584497df1524188995b8b6b329f": "pass3_synthesis",
         "1ed275bfa858c332f0425267fb0faa1205d2617594a702f68d55e9992c7f149b": "pass2_gatekeeper",
         "553a098a35585acb4aa5e96a9132b7350233e61da2a0e1c197d72dbecf52b0a1": "pass1_triage",
-        "b264c69fca19c02b8274f238762faa3849373a368eaa4c4b61ce4f3659510594": "pass3_synthesis"
+        "5752b8f1dbd59aa909ece3db9c9015751eb6fe770f0073b9635a5c2a9838298e": "pass3_synthesis",
+        "b04d1f55ae69916bca1afec6e6d1616ff1af9e2b09a7634f87e61b653a96b205": "pass3_synthesis"
     },
     "entries": {
-        "0838a7c1ece26ff7c003961c810e2109ce7c4584497df1524188995b8b6b329f": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Graduate Academic Conference Registration\",\"summary\":\"Annual Graduate Academic Conference registration closes 2026-06-12 at Lecture Hall B; submit abstract if presenting.\",\"translated_summary\":\"Annual Graduate Academic Conference registration closes 2026-06-12 at Lecture Hall B; submit abstract if presenting.\",\"sections\":[{\"heading\":\"Registration\",\"content\":\"- Deadline: 2026-06-12\\n- Venue: Lecture Hall B\"}],\"category\":\"ACTIVITY\",\"priority\":\"NORMAL\",\"event_date\":\"2026-06-12\",\"source_message_ids\":[402]}]}"
-        ],
         "1ed275bfa858c332f0425267fb0faa1205d2617594a702f68d55e9992c7f149b": [
             "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"New declaration deadline\"},{\"chunk_index\":1,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"New conference registration\"},{\"chunk_index\":2,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"is_duplicate\":true,\"keep\":false,\"reason\":\"Already covered by Dormitory Hot Water Maintenance\"}]}"
         ],
         "553a098a35585acb4aa5e96a9132b7350233e61da2a0e1c197d72dbecf52b0a1": [
             "{\"chunks\":[{\"topic\":\"AI Use Declaration Deadline\",\"message_ids\":[401],\"category\":\"DEADLINE\",\"reason\":\"Mandatory thesis declaration\"},{\"topic\":\"Graduate Academic Conference\",\"message_ids\":[402],\"category\":\"ACTIVITY\",\"reason\":\"Conference registration deadline\"},{\"topic\":\"Dorm Hot Water Reminder\",\"message_ids\":[403],\"category\":\"NOTICE\",\"reason\":\"Repeated dorm maintenance note\"}]}"
         ],
-        "b264c69fca19c02b8274f238762faa3849373a368eaa4c4b61ce4f3659510594": [
+        "5752b8f1dbd59aa909ece3db9c9015751eb6fe770f0073b9635a5c2a9838298e": [
             "{\"is_relevant\":true,\"events\":[{\"title\":\"AI Use Declaration Deadline\",\"summary\":\"All thesis candidates must sign and upload the AI Use Declaration PDF to Canvas before 2026-06-05 23:59.\",\"translated_summary\":\"All thesis candidates must sign and upload the AI Use Declaration PDF to Canvas before 2026-06-05 23:59.\",\"sections\":[{\"heading\":\"Submission\",\"content\":\"- Upload signed PDF to Canvas before 2026-06-05 23:59\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"event_date\":\"2026-06-05\",\"source_message_ids\":[401]}]}"
+        ],
+        "b04d1f55ae69916bca1afec6e6d1616ff1af9e2b09a7634f87e61b653a96b205": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Graduate Academic Conference Registration\",\"summary\":\"Annual Graduate Academic Conference registration closes 2026-06-12 at Lecture Hall B; submit abstract if presenting.\",\"translated_summary\":\"Annual Graduate Academic Conference registration closes 2026-06-12 at Lecture Hall B; submit abstract if presenting.\",\"sections\":[{\"heading\":\"Registration\",\"items\":[{\"kind\":\"DEADLINE\",\"label\":\"Deadline\",\"value\":\"2026-06-12\"},{\"kind\":\"LOCATION\",\"label\":\"Venue\",\"value\":\"Lecture Hall B\"}],\"content\":\"\"}],\"category\":\"ACTIVITY\",\"priority\":\"NORMAL\",\"event_date\":\"2026-06-12\",\"source_message_ids\":[402]}]}"
         ]
     }
 }

@@ -274,6 +274,7 @@ private fun EventDetailHost(
 ) {
     val translatingCardIds by appState.translatingCardIds.collectAsState()
     val recheckingCardIds by appState.recheckingAttachmentCardIds.collectAsState()
+    val enrichingCardIds by appState.enrichingCardIds.collectAsState()
 
     EventDetailPane(
         card = selectedCard,
@@ -286,7 +287,9 @@ private fun EventDetailHost(
         onSelectNext = { if (selectedIndex in 0 until visibleEvents.lastIndex) appState.selectEvent(visibleEvents[selectedIndex + 1].id) },
         isTranslatingMessages = selectedCard.id in translatingCardIds,
         isRecheckingAttachments = selectedCard.id in recheckingCardIds,
+        isEnrichingSections = selectedCard.id in enrichingCardIds,
         onTranslateSourceMessages = { appState.translateSourceMessages(selectedCard.id) },
+        onEnrichSections = { targetSectionIdx -> appState.enrichSectionCards(selectedCard.id, targetSectionIdx) },
         onOpenAttachment = { appState.openAttachment(it) },
         onRevealAttachmentInFinder = { appState.revealAttachmentInFinder(it) },
         onRecheckAttachments = { appState.recheckCardAttachments(selectedCard.id) },

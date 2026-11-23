@@ -3,6 +3,7 @@ package com.wechatdigest.core.llm
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
+import com.wechatdigest.core.model.EventDetailItemParser
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.core.model.LlmExtractedEvent
@@ -80,9 +81,18 @@ internal object ExtractionCardConsolidator {
 
         val (collectedSections, promotedFlatItem) = collectConsolidatedSections(extractedEvents)
         return EventCard(
-            title = resolveConsolidatedTitle(extractedEvents, fallbackTitle, joinDistinctTitles, collectedSections.size),
-            summary = resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
-            translatedSummary = resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
+            title = EventDetailItemParser.sanitizeSingleLine(
+                resolveConsolidatedTitle(extractedEvents, fallbackTitle, joinDistinctTitles, collectedSections.size),
+                EventDetailItemParser.MAX_CARD_TITLE_CHARS
+            ),
+            summary = EventDetailItemParser.sanitizeMultiLine(
+                resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
+                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+            ),
+            translatedSummary = EventDetailItemParser.sanitizeMultiLine(
+                resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
+                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+            ),
             sections = collectedSections,
             category = extractedEvents.map { EventCategory.fromString(it.category) }.firstOrNull { it != EventCategory.OTHER } ?: EventCategory.OTHER,
             priority = extractedEvents.minOf { EventPriority.fromString(it.priority) },
@@ -109,9 +119,18 @@ internal object ExtractionCardConsolidator {
         val preferredSummary = single.translatedSummary.ifBlank { single.summary }
         val fallbackSummary = single.summary.ifBlank { single.translatedSummary }
         return EventCard(
-            title = single.title.ifBlank { fallbackTitle },
-            summary = fallbackSummary,
-            translatedSummary = preferredSummary,
+            title = EventDetailItemParser.sanitizeSingleLine(
+                single.title.ifBlank { fallbackTitle },
+                EventDetailItemParser.MAX_CARD_TITLE_CHARS
+            ),
+            summary = EventDetailItemParser.sanitizeMultiLine(
+                fallbackSummary,
+                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+            ),
+            translatedSummary = EventDetailItemParser.sanitizeMultiLine(
+                preferredSummary,
+                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+            ),
             sections = sanitizeSections(single.sections),
             category = EventCategory.fromString(single.category),
             priority = EventPriority.fromString(single.priority),
@@ -133,7 +152,7 @@ internal object ExtractionCardConsolidator {
     private fun collectConsolidatedSections(extractedEvents: List<LlmExtractedEvent>): Pair<List<EventSection>, Boolean> {
         var promotedFlatItem = false
         val collectedSections = mutableListOf<EventSection>()
-        val seenSections = mutableSetOf<Pair<String, String>>()
+        val seenSections = mutableSetOf<String>()
         for (item in extractedEvents) {
             val existingSections = sanitizeSections(item.sections)
             val candidates = if (existingSections.isNotEmpty()) {
@@ -149,8 +168,17 @@ internal object ExtractionCardConsolidator {
                 }
             }
             for (section in candidates) {
-                val key = section.heading.lowercase(Locale.ROOT) to section.content.lowercase(Locale.ROOT)
-                if (seenSections.add(key)) {
+                val itemsKey = section.items.joinToString("|") {
+                    "${it.kind.name}:${it.label.lowercase(Locale.ROOT)}=${it.value.lowercase(Locale.ROOT)}"
+                }
+                val bulletsKey = section.bullets.joinToString("|") { it.lowercase(Locale.ROOT) }
+                val key = listOf(
+                    section.heading.lowercase(Locale.ROOT),
+                    section.content.lowercase(Locale.ROOT),
+                    itemsKey,
+                    bulletsKey
+                ).joinToString("::")
+                if (seenSections.add(key) && collectedSections.size < MAX_SECTIONS_PER_CARD) {
                     collectedSections.add(section)
                 }
             }
@@ -192,9 +220,23 @@ internal object ExtractionCardConsolidator {
 
     private fun sanitizeSections(rawSections: List<EventSection>): List<EventSection> {
         return rawSections.mapNotNull { section ->
-            val heading = section.heading.trim()
-            val content = section.content.trim()
-            if (heading.isBlank() && content.isBlank()) null else EventSection(heading = heading, content = content)
-        }
+            val heading = EventDetailItemParser.sanitizeSingleLine(
+                section.heading,
+                EventDetailItemParser.MAX_SECTION_HEADING_CHARS
+            )
+            val content = EventDetailItemParser.sanitizeMultiLine(
+                section.content,
+                EventDetailItemParser.MAX_SECTION_CONTENT_CHARS
+            )
+            val items = EventDetailItemParser.sanitizeItems(section.items)
+            val bullets = EventDetailItemParser.sanitizeBullets(section.bullets)
+            if (content.isBlank() && items.isEmpty() && bullets.isEmpty()) {
+                null
+            } else {
+                EventSection(heading = heading, content = content, items = items, bullets = bullets)
+            }
+        }.take(MAX_SECTIONS_PER_CARD)
     }
+
+    private const val MAX_SECTIONS_PER_CARD = 16
 }

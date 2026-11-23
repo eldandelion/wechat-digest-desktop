@@ -3,18 +3,18 @@
     "scenarioId": "REG-03_pass2_student_ping_veto",
     "descriptions": {
         "0ded921853178a330038ce42c7a26047e9e1a29bd9032c28527730fc15dc3612": "pass2_gatekeeper",
-        "9bd8c94e89f74308388ebdfe82dda8415135d5295ffeefdafb3e7ed6c1430347": "pass3_synthesis",
-        "ae95b2f0a8b642b8887d8478014955a8c024552c65845e6c88c4757cd494c60e": "pass1_triage"
+        "ae95b2f0a8b642b8887d8478014955a8c024552c65845e6c88c4757cd494c60e": "pass1_triage",
+        "e649809044357e9d1f68bb23f84e48ce179e8e72840dc2a44e467c679a422345": "pass3_synthesis"
     },
     "entries": {
         "0ded921853178a330038ce42c7a26047e9e1a29bd9032c28527730fc15dc3612": [
             "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official submission deadline\"},{\"chunk_index\":1,\"is_group_notice\":false,\"passes_rules\":false,\"has_substance\":false,\"keep\":false,\"reason\":\"Personal student email request\"}]}"
         ],
-        "9bd8c94e89f74308388ebdfe82dda8415135d5295ffeefdafb3e7ed6c1430347": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Thesis Hard Copy Submission Deadline\",\"summary\":\"All thesis applicants must submit printed copies on Nov 26 at 10:00 in Room 422-1.\",\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[301]}]}"
-        ],
         "ae95b2f0a8b642b8887d8478014955a8c024552c65845e6c88c4757cd494c60e": [
             "{\"chunks\":[{\"topic\":\"Hard Copy Submission\",\"message_ids\":[301],\"category\":\"DEADLINE\"},{\"topic\":\"Student Email\",\"message_ids\":[302],\"category\":\"NOTICE\"}]}"
+        ],
+        "e649809044357e9d1f68bb23f84e48ce179e8e72840dc2a44e467c679a422345": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Thesis Hard Copy Submission Deadline\",\"summary\":\"All thesis applicants must submit printed copies on Nov 26 at 10:00 in Room 422-1.\",\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[301]}]}"
         ]
     }
 }

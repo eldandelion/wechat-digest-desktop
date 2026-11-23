@@ -3,6 +3,8 @@ package com.wechatdigest.core.model
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.PrimitiveKind
 import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
@@ -31,14 +33,15 @@ internal object FlexibleStringSerializer : KSerializer<String> {
         val jsonDecoder = decoder as? JsonDecoder ?: return decoder.decodeString()
         return when (val element = jsonDecoder.decodeJsonElement()) {
             is JsonNull -> ""
-            is JsonPrimitive -> element.content
-            is JsonArray -> element.mapNotNull { item ->
+            is JsonPrimitive -> element.content.take(EventDetailItemParser.MAX_SECTION_CONTENT_CHARS)
+            is JsonArray -> element.asSequence().take(64).mapNotNull { item ->
                 when (item) {
-                    is JsonPrimitive -> item.content.trim().takeIf { it.isNotBlank() }
-                    else -> item.toString().trim().takeIf { it.isNotBlank() }
+                    is JsonNull -> null
+                    is JsonPrimitive -> item.content.trim().take(EventDetailItemParser.MAX_LEGACY_LINE_CHARS).takeIf { it.isNotBlank() }
+                    else -> null
                 }
-            }.joinToString("\n")
-            else -> element.toString()
+            }.joinToString("\n").take(EventDetailItemParser.MAX_SECTION_CONTENT_CHARS)
+            else -> ""
         }
     }
 }
@@ -81,12 +84,131 @@ enum class EventCategory {
     }
 }
 
+/** Semantic metadata category for structured detail mini-tiles inside an [EventSection]. */
+@Serializable(with = FlexibleDetailKindSerializer::class)
+enum class EventDetailKind {
+    DATE,
+    TIME,
+    DEADLINE,
+    LOCATION,
+    DOCUMENT,
+    COPIES,
+    FORMAT,
+    ELIGIBILITY,
+    EXAM,
+    CONTACT,
+    PERSON,
+    AUDIENCE,
+    LINK,
+    ACTION,
+    REQUIREMENT,
+    RULE,
+    WARNING,
+    PAYMENT,
+    DEVICE,
+    OTHER;
+
+    companion object {
+        /** Maps arbitrary LLM-emitted kind tokens or common synonyms to a canonical [EventDetailKind]. */
+        fun fromString(value: String): EventDetailKind = when (value.uppercase(Locale.ROOT).trim()) {
+            "DATE", "DAY" -> DATE
+            "TIME", "HOURS", "TIME_WINDOW", "SCHEDULE" -> TIME
+            "DEADLINE", "DUE", "DUE_DATE" -> DEADLINE
+            "LOCATION", "VENUE", "ROOM", "PLACE", "ADDRESS", "CLASSROOM" -> LOCATION
+            "DOCUMENT", "DOC", "DOCUMENTS", "FILE", "ATTACHMENT", "FORM", "PAPER", "THESIS" -> DOCUMENT
+            "COPIES", "COPY", "PRINT", "HARD_COPY", "BOUND" -> COPIES
+            "FORMAT", "NAMING", "TEMPLATE", "SUBJECT", "STYLE" -> FORMAT
+            "ELIGIBILITY", "PREREQUISITE", "CREDITS", "QUALIFICATION", "GPA" -> ELIGIBILITY
+            "EXAM", "QUIZ", "TEST", "ASSESSMENT", "GRADING" -> EXAM
+            "CONTACT", "EMAIL", "PHONE", "ORGANIZER" -> CONTACT
+            "PERSON", "ADVISOR", "SPEAKER", "INSTRUCTOR", "TEACHER", "REVIEWER", "SIGNATURE", "TA" -> PERSON
+            "AUDIENCE", "GROUP", "PARTICIPANTS", "STUDENTS", "COHORT", "TARGET" -> AUDIENCE
+            "LINK", "URL", "WEBSITE", "PORTAL" -> LINK
+            "ACTION", "STEP", "TASK", "SUBMIT", "REGISTER" -> ACTION
+            "REQUIREMENT", "REQUIREMENTS", "MATERIALS" -> REQUIREMENT
+            "RULE", "POLICY", "REGULATION", "PENALTY" -> RULE
+            "WARNING", "CAUTION", "ALERT", "NOTICE", "IMPORTANT" -> WARNING
+            "PAYMENT", "FEE", "COST", "PRICE", "STIPEND", "SCHOLARSHIP", "AWARD", "REWARD" -> PAYMENT
+            "DEVICE", "EQUIPMENT", "TOOL", "LAPTOP", "SOFTWARE", "ID_CARD", "CALCULATOR" -> DEVICE
+            else -> OTHER
+        }
+    }
+}
+
+/**
+ * Tolerant serializer for [EventDetailKind] so unexpected or lowercase LLM strings degrade
+ * cleanly to [EventDetailKind.fromString] instead of failing deserialization.
+ */
+internal object FlexibleDetailKindSerializer : KSerializer<EventDetailKind> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("FlexibleDetailKind", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: EventDetailKind) {
+        encoder.encodeString(value.name)
+    }
+
+    override fun deserialize(decoder: Decoder): EventDetailKind {
+        val jsonDecoder = decoder as? JsonDecoder ?: return EventDetailKind.fromString(decoder.decodeString())
+        return when (val element = jsonDecoder.decodeJsonElement()) {
+            is JsonNull -> EventDetailKind.OTHER
+            is JsonPrimitive -> EventDetailKind.fromString(element.content)
+            else -> EventDetailKind.OTHER
+        }
+    }
+}
+
+/** Tolerant serializer for string bullet lists accepting JSON arrays, newline-delimited strings, or null. */
+internal object FlexibleStringListSerializer : KSerializer<List<String>> {
+    private val delegate = ListSerializer(String.serializer())
+    override val descriptor: SerialDescriptor = delegate.descriptor
+
+    override fun serialize(encoder: Encoder, value: List<String>) {
+        delegate.serialize(encoder, value)
+    }
+
+    override fun deserialize(decoder: Decoder): List<String> {
+        val jsonDecoder = decoder as? JsonDecoder ?: return delegate.deserialize(decoder)
+        return when (val element = jsonDecoder.decodeJsonElement()) {
+            is JsonNull -> emptyList()
+            is JsonArray -> element.asSequence().take(EventDetailItemParser.MAX_ITEMS_PER_SECTION * 2).mapNotNull { item ->
+                when (item) {
+                    is JsonNull -> null
+                    is JsonPrimitive -> item.content.trim().take(EventDetailItemParser.MAX_LEGACY_LINE_CHARS).takeIf { it.isNotBlank() }
+                    else -> null
+                }
+            }.toList()
+            is JsonPrimitive -> element.content.take(EventDetailItemParser.MAX_SECTION_CONTENT_CHARS)
+                .lineSequence()
+                .map { it.trim().take(EventDetailItemParser.MAX_LEGACY_LINE_CHARS) }
+                .filter { it.isNotBlank() }
+                .take(EventDetailItemParser.MAX_ITEMS_PER_SECTION * 2)
+                .toList()
+            else -> emptyList()
+        }
+    }
+}
+
+/** Single typed key-value logistics snippet (e.g. Date, Time, Location) displayed as an icon mini-tile. */
+@Serializable
+data class EventDetailItem(
+    val kind: EventDetailKind = EventDetailKind.OTHER,
+    @Serializable(with = FlexibleStringSerializer::class)
+    val label: String = "",
+    @Serializable(with = FlexibleStringSerializer::class)
+    val value: String = "",
+    @Serializable(with = FlexibleStringSerializer::class)
+    val icon: String = ""
+)
+
 @Serializable
 data class EventSection(
     @Serializable(with = FlexibleStringSerializer::class)
     val heading: String = "",
     @Serializable(with = FlexibleStringSerializer::class)
-    val content: String = ""
+    val content: String = "",
+    val items: List<EventDetailItem> = emptyList(),
+    @Serializable(with = FlexibleStringListSerializer::class)
+    val bullets: List<String> = emptyList()
 )
 
 @Serializable

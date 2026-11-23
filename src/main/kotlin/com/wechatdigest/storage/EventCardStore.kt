@@ -266,6 +266,31 @@ class EventCardStore(private val db: AppDatabase) {
         }
     }
 
+    /**
+     * Persists updated [sections] JSON for card [id], throwing on database errors.
+     */
+    fun updateSectionsOrThrow(id: String, sections: List<EventSection>) {
+        val sql = "UPDATE event_cards SET sections = ? WHERE id = ?"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                stmt.setString(1, json.encodeToString(sections))
+                stmt.setString(2, id)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    /**
+     * Persists updated [sections] JSON for card [id], logging and absorbing database errors.
+     */
+    fun updateSections(id: String, sections: List<EventSection>) {
+        try {
+            updateSectionsOrThrow(id, sections)
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error updating sections: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
     fun clearAll() {
         val sql = "DELETE FROM event_cards"
         try {

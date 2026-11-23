@@ -160,14 +160,7 @@ object EvalGraders {
             )
         )
 
-        val allTextLower = cards.joinToString("\n") { card ->
-            buildString {
-                append(card.title).append('\n')
-                append(card.translatedSummary).append('\n')
-                append(card.summary).append('\n')
-                card.sections.forEach { append(it.heading).append('\n').append(it.content).append('\n') }
-            }
-        }.lowercase()
+        val allTextLower = buildCardCorpus(cards).lowercase()
 
         val foundPlaceholder = bannedPlaceholders.firstOrNull { it in allTextLower }
         findings.add(
@@ -234,14 +227,7 @@ object EvalGraders {
         val requiredFacts = scenario.expectations.mustContainFacts
         if (requiredFacts.isEmpty()) return emptyList()
 
-        val corpus = cards.joinToString("\n") { card ->
-            buildString {
-                append(card.title).append('\n')
-                append(card.translatedSummary).append('\n')
-                append(card.summary).append('\n')
-                card.sections.forEach { append(it.heading).append('\n').append(it.content).append('\n') }
-            }
-        }
+        val corpus = buildCardCorpus(cards)
         val missing = requiredFacts.filterNot { fact -> corpus.contains(fact, ignoreCase = true) }
         val recall = (requiredFacts.size - missing.size).toDouble() / requiredFacts.size.toDouble()
         return listOf(
@@ -255,6 +241,20 @@ object EvalGraders {
                 }
             )
         )
+    }
+
+    private fun buildCardCorpus(cards: List<EventCard>): String = cards.joinToString("\n") { card ->
+        buildString {
+            append(card.title).append('\n')
+            append(card.translatedSummary).append('\n')
+            append(card.summary).append('\n')
+            card.sections.forEach { section ->
+                append(section.heading).append('\n')
+                section.bullets.forEach { bullet -> append(bullet).append('\n') }
+                section.items.forEach { item -> append(item.label).append(": ").append(item.value).append('\n') }
+                append(section.content).append('\n')
+            }
+        }
     }
 
     private fun gradeLanguageCompliance(

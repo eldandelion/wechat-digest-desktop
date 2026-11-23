@@ -1,12 +1,22 @@
 package com.wechatdigest.app
 
+import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
+import com.wechatdigest.core.model.EventDetailItem
+import com.wechatdigest.core.model.EventDetailKind
 import com.wechatdigest.core.model.EventPriority
+import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.storage.AppDatabase
 import com.wechatdigest.storage.EventCardStore
 import com.wechatdigest.storage.SettingsStore
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.headersOf
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -149,6 +159,43 @@ class AppStateFeedAndAttachmentTest {
     }
 
     @Test
+    fun `visibleEvents searchQuery matches text inside section detail items`() = runBlocking {
+        val examCard = EventCard(
+            id = "search-item-1",
+            title = "Final Exam Notice",
+            summary = "Important logistics.",
+            translatedSummary = "Important logistics.",
+            sections = listOf(
+                EventSection(
+                    heading = "Logistics",
+                    items = listOf(
+                        EventDetailItem(EventDetailKind.LOCATION, "Venue", "Auditorium 401")
+                    )
+                )
+            ),
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Prof",
+            sourceRoomId = "r1@chatroom",
+            timestampSeconds = 2000L
+        )
+        eventCardStore.upsert(listOf(examCard))
+
+        val appState = AppState(settingsStore, eventCardStore, syncService, scope = testScope)
+        appState.loadEvents().join()
+        assertEquals(1, withTimeout(2_000) { appState.visibleEvents.first { it.size == 1 } }.size)
+
+        appState.searchQuery.value = "Auditorium 401"
+        assertEquals(listOf("search-item-1"), appState.visibleEvents.value.map { it.id })
+
+        appState.searchQuery.value = "Venue"
+        assertEquals(listOf("search-item-1"), appState.visibleEvents.value.map { it.id })
+
+        appState.searchQuery.value = "Nonexistent Room"
+        assertTrue(appState.visibleEvents.value.isEmpty())
+    }
+
+    @Test
     fun `selectEvent marks unread card as read and markUnread restores unread status`() = runBlocking {
         val unreadCard = EventCard("u1", "Unread Exam Notice", "Details", "Details", category = EventCategory.EXAM, priority = EventPriority.CRITICAL, originalSender = "Prof", sourceRoomId = "r1@chatroom", timestampSeconds = 3000L, isRead = false)
         eventCardStore.upsert(listOf(unreadCard))
@@ -227,5 +274,71 @@ class AppStateFeedAndAttachmentTest {
         j1.join()
         j2.join()
         assertEquals(setOf("roomA@chatroom", "roomB@chatroom"), appState.settings.value.monitoredRoomIds)
+    }
+
+    @Test
+    fun `enrichSectionCards structures legacy bullets, persists to SQLite, and handles errors safely`() = runBlocking {
+        val legacyCard = EventCard(
+            id = "enrich-state-1",
+            title = "Thesis Defense Submission",
+            summary = "Prepare thesis defense documents.",
+            translatedSummary = "Prepare thesis defense documents.",
+            sections = listOf(
+                EventSection(
+                    heading = "Required Documents",
+                    content = "- Bring three bound copies\n- Submit PDF on portal"
+                )
+            ),
+            category = EventCategory.DEADLINE,
+            priority = EventPriority.IMPORTANT,
+            originalSender = "Advisor",
+            sourceRoomId = "r1@chatroom",
+            timestampSeconds = 2000L
+        )
+        eventCardStore.upsert(listOf(legacyCard))
+
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            scope = testScope,
+            llmClientFactory = { cfg ->
+                KtorLlmClient(
+                    cfg.copy(apiKey = "test-key"),
+                    MockEngine {
+                        val content = """
+                            {
+                              "sections": [
+                                {
+                                  "section_index": 0,
+                                  "items": [
+                                    {"kind": "COPIES", "label": "Bound Copies", "value": "Bring three bound copies"},
+                                    {"kind": "ACTION", "label": "Portal Upload", "value": "Submit PDF on portal"}
+                                  ],
+                                  "content": ""
+                                }
+                              ]
+                            }
+                        """.trimIndent()
+                        val body = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), content)}}}]}"""
+                        respond(body, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+                    }
+                )
+            }
+        )
+        appState.loadEvents().join()
+        assertEquals(1, withTimeout(2_000) { appState.events.first { it.size == 1 } }.size)
+
+        appState.enrichSectionCards("enrich-state-1").join()
+
+        assertTrue(appState.enrichingCardIds.value.isEmpty())
+        val updatedSection = appState.events.value.single().sections.single()
+        assertEquals(2, updatedSection.items.size)
+        assertEquals("Bound Copies", updatedSection.items[0].label)
+        assertEquals("", updatedSection.content)
+
+        val persistedSection = eventCardStore.listActive().single().sections.single()
+        assertEquals(2, persistedSection.items.size)
+        assertEquals(EventDetailKind.COPIES, persistedSection.items[0].kind)
     }
 }

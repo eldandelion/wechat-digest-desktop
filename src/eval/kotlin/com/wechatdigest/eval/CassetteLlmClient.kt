@@ -38,6 +38,7 @@ object CassetteKeyer {
         systemPrompt.contains("Semantic Filter & Topic Chunker") -> "pass1_triage"
         systemPrompt.contains("Rule & Substance Gatekeeper") -> "pass2_gatekeeper"
         systemPrompt.contains("Structured Event Card Translator") -> "card_translator"
+        systemPrompt.contains("Bullet-to-Card Structurer") -> "pass4_bullet_cards"
         systemPrompt.contains("Grounded Card Summarizer") -> "pass3_synthesis"
         else -> "other"
     }

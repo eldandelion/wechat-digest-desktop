@@ -2,31 +2,31 @@
     "version": 1,
     "scenarioId": "REG-12_concurrent_cloud_multi_chunk_order",
     "descriptions": {
-        "02e6c0cc62083cc96301802b573d81a0bb4c787a3a6a5ed464ee4ac70f6ed81f": "pass3_synthesis",
-        "0a6bda47c30e5718240d60f5f1c44f43f04094fec8f81d415e22d53f7fb85fd6": "pass3_synthesis",
         "32bd06819841de440acd28643d36c3f125fc37a4952195a98e9ed22991fda05e": "pass2_gatekeeper",
-        "76381e6de1f65935d241fbc943d8d5a95ff4cb36e6352770f164c16dd410d995": "pass3_synthesis",
-        "93f18b4562a21f3d1ef042e2c8630b71db779bf11e0695e6bad29c70d8c190f5": "pass3_synthesis",
-        "a74f6696ca344bca091bd80837d37805eaeaaf0c734dbe628584f6cbcd4de8f8": "pass1_triage"
+        "777f901a00ca2b3a8996767ad671f4fd7f8b9cb59071eeacd080e14efdc6a5c7": "pass3_synthesis",
+        "93dbaa7118a58b3bd42a70423c98a7205d75d62e77851076661b6b44dcdd219b": "pass3_synthesis",
+        "a74f6696ca344bca091bd80837d37805eaeaaf0c734dbe628584f6cbcd4de8f8": "pass1_triage",
+        "db22b3f23249afd175b9e30e8c5dc49a49d12e5173646ae751226e912fdd303f": "pass3_synthesis",
+        "df958c7e70d201b063e59e9137d2a0815a1776982755dfcdcc9a34d729792b52": "pass3_synthesis"
     },
     "entries": {
-        "02e6c0cc62083cc96301802b573d81a0bb4c787a3a6a5ed464ee4ac70f6ed81f": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Summer Career Fair Registration\",\"summary\":\"Summer Career Fair registration closes May 28 at Student Union Room 202.\",\"translated_summary\":\"Summer Career Fair registration closes May 28 at Student Union Room 202.\",\"sections\":[{\"heading\":\"Venue\",\"content\":\"- Register before May 28 at Room 202\"}],\"category\":\"DEADLINE\",\"priority\":\"NORMAL\",\"source_message_ids\":[1203]}]}"
-        ],
-        "0a6bda47c30e5718240d60f5f1c44f43f04094fec8f81d415e22d53f7fb85fd6": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Mandatory Lab Safety Quiz\",\"summary\":\"Complete the mandatory Lab Safety Quiz before May 29 at 18:00 on Safety Portal.\",\"translated_summary\":\"Complete the mandatory Lab Safety Quiz before May 29 at 18:00 on Safety Portal.\",\"sections\":[{\"heading\":\"Deadline\",\"content\":\"- Complete before May 29 18:00 on Safety Portal\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[1204]}]}"
-        ],
         "32bd06819841de440acd28643d36c3f125fc37a4952195a98e9ed22991fda05e": [
             "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Exam schedule\"},{\"chunk_index\":1,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Library schedule\"},{\"chunk_index\":2,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Career fair deadline\"},{\"chunk_index\":3,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Lab quiz deadline\"}]}"
         ],
-        "76381e6de1f65935d241fbc943d8d5a95ff4cb36e6352770f164c16dd410d995": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"Library Extended Hours\",\"summary\":\"Main Reading Room stays open until 23:30 from June 1 to June 20.\",\"translated_summary\":\"Main Reading Room stays open until 23:30 from June 1 to June 20.\",\"sections\":[{\"heading\":\"Hours\",\"content\":\"- Open until 23:30 (June 1 to June 20)\"}],\"category\":\"NOTICE\",\"priority\":\"NORMAL\",\"source_message_ids\":[1202]}]}"
-        ],
-        "93f18b4562a21f3d1ef042e2c8630b71db779bf11e0695e6bad29c70d8c190f5": [
+        "777f901a00ca2b3a8996767ad671f4fd7f8b9cb59071eeacd080e14efdc6a5c7": [
             "{\"is_relevant\":true,\"events\":[{\"title\":\"Algorithms Final Exam Schedule\",\"summary\":\"Algorithms written exam on June 15 at 09:00 in Hall 101.\",\"translated_summary\":\"Algorithms written exam on June 15 at 09:00 in Hall 101.\",\"sections\":[{\"heading\":\"Exam Venue\",\"content\":\"- June 15 at 09:00 in Hall 101\"}],\"category\":\"EXAM\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[1201]}]}"
+        ],
+        "93dbaa7118a58b3bd42a70423c98a7205d75d62e77851076661b6b44dcdd219b": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Mandatory Lab Safety Quiz\",\"summary\":\"Complete the mandatory Lab Safety Quiz before May 29 at 18:00 on Safety Portal.\",\"translated_summary\":\"Complete the mandatory Lab Safety Quiz before May 29 at 18:00 on Safety Portal.\",\"sections\":[{\"heading\":\"Deadline\",\"content\":\"- Complete before May 29 18:00 on Safety Portal\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[1204]}]}"
         ],
         "a74f6696ca344bca091bd80837d37805eaeaaf0c734dbe628584f6cbcd4de8f8": [
             "{\"chunks\":[{\"topic\":\"Final Exam Schedule\",\"message_ids\":[1201],\"category\":\"EXAM\",\"reason\":\"Exam time and hall\"},{\"topic\":\"Library Extended Hours\",\"message_ids\":[1202],\"category\":\"NOTICE\",\"reason\":\"Extended library hours\"},{\"topic\":\"Summer Career Fair Registration\",\"message_ids\":[1203],\"category\":\"DEADLINE\",\"reason\":\"Career fair registration\"},{\"topic\":\"Mandatory Lab Safety Quiz\",\"message_ids\":[1204],\"category\":\"DEADLINE\",\"reason\":\"Safety quiz deadline\"}]}"
+        ],
+        "db22b3f23249afd175b9e30e8c5dc49a49d12e5173646ae751226e912fdd303f": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Library Extended Hours\",\"summary\":\"Main Reading Room stays open until 23:30 from June 1 to June 20.\",\"translated_summary\":\"Main Reading Room stays open until 23:30 from June 1 to June 20.\",\"sections\":[{\"heading\":\"Hours\",\"content\":\"- Open until 23:30 (June 1 to June 20)\"}],\"category\":\"NOTICE\",\"priority\":\"NORMAL\",\"source_message_ids\":[1202]}]}"
+        ],
+        "df958c7e70d201b063e59e9137d2a0815a1776982755dfcdcc9a34d729792b52": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Summer Career Fair Registration\",\"summary\":\"Summer Career Fair registration closes May 28 at Student Union Room 202.\",\"translated_summary\":\"Summer Career Fair registration closes May 28 at Student Union Room 202.\",\"sections\":[{\"heading\":\"Venue\",\"content\":\"- Register before May 28 at Room 202\"}],\"category\":\"DEADLINE\",\"priority\":\"NORMAL\",\"source_message_ids\":[1203]}]}"
         ]
     }
 }

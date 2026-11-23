@@ -14,8 +14,10 @@ import com.wechatdigest.core.llm.LocalOllamaModel
 import com.wechatdigest.core.llm.MessageTranslator
 import com.wechatdigest.core.llm.OllamaDiscoveryResult
 import com.wechatdigest.core.llm.OllamaService
+import com.wechatdigest.core.llm.SectionCardEnricher
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventDetailItemParser
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.GroupChat
 import com.wechatdigest.core.model.GroupConfig
@@ -38,7 +40,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -46,6 +50,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 
 enum class Screen {
     EVENTS,
@@ -146,7 +151,12 @@ class AppState(
                 card.originalSender.contains(query, ignoreCase = true) ||
                 card.sections.any { section ->
                     section.heading.contains(query, ignoreCase = true) ||
-                    section.content.contains(query, ignoreCase = true)
+                    section.content.contains(query, ignoreCase = true) ||
+                    section.bullets.any { it.contains(query, ignoreCase = true) } ||
+                    section.items.any { item ->
+                        item.label.contains(query, ignoreCase = true) ||
+                        item.value.contains(query, ignoreCase = true)
+                    }
                 }
             }
             matchesPriority && matchesGroup && matchesStarred && matchesUnread && matchesQuery
@@ -182,6 +192,13 @@ class AppState(
 
     /** Card IDs currently re-scanning local WeChat storage for downloaded attachments. */
     val recheckingAttachmentCardIds: StateFlow<Set<String>> = _recheckingAttachmentCardIds.asStateFlow()
+
+    private val _enrichingCardIds = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Card IDs currently converting unstructured bullet sections into structured cards via Pass 4 LLM. */
+    val enrichingCardIds: StateFlow<Set<String>> = _enrichingCardIds.asStateFlow()
+
+    private val enrichmentJobs = ConcurrentHashMap<String, Job>()
 
     private val settingsMutex = Mutex()
     private var refreshRoomsJob: Job? = null
@@ -243,6 +260,7 @@ class AppState(
     }
 
     fun clearEventsAndCheckpoints(): Job = scope.launch {
+        cancelEnrichmentJobs()
         withContext(Dispatchers.IO) {
             eventCardStore.clearAll()
             syncCheckpointStore?.resetAll()
@@ -258,6 +276,7 @@ class AppState(
 
     fun resetLocalAppDatabase(): Job = scope.launch {
         scheduler.stop()
+        cancelEnrichmentJobs()
         withContext(Dispatchers.IO) {
             eventCardStore.clearAll()
             syncCheckpointStore?.resetAll()
@@ -627,6 +646,69 @@ class AppState(
         } finally {
             _translatingCardIds.value = _translatingCardIds.value - cardId
         }
+    }
+
+    /**
+     * Converts unstructured bullet points (or previously merged single cards) inside [cardId]'s
+     * sections into tailored 1-to-1 icon detail cards using Pass 4 ([SectionCardEnricher]) and
+     * persists the updated sections to SQLite.
+     */
+    fun enrichSectionCards(cardId: String, targetSectionIndex: Int? = null): Job {
+        lateinit var launchedJob: Job
+        launchedJob = scope.launch {
+            val previous = _enrichingCardIds.getAndUpdate { it + cardId }
+            if (cardId in previous) return@launch
+            try {
+                val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
+                if (card.sections.isEmpty()) return@launch
+                val explicitTargets = targetSectionIndex
+                    ?.takeIf { it in card.sections.indices }
+                    ?.let { idx ->
+                        val autoTargets = card.sections.indices.filter {
+                            EventDetailItemParser.hasUnstructuredBullets(card.sections[it]) ||
+                                EventDetailItemParser.extractAtomicBulletsForEnrichment(card.sections[it]).size >
+                                EventDetailItemParser.sanitizeItems(card.sections[it].items).size
+                        }
+                        (listOf(idx) + autoTargets).distinct()
+                    }
+
+                val currentSettings = _settings.value
+                val result = withContext(Dispatchers.IO) {
+                    llmClientFactory(currentSettings.llm).use { client ->
+                        SectionCardEnricher(client).enrichCardSections(
+                            card = card,
+                            targetLanguage = currentSettings.targetLanguage,
+                            targetSectionIndices = explicitTargets
+                        )
+                    }
+                }
+                val updatedSections = result.getOrElse { err ->
+                    _snackbarMessage.emit("Section structuring failed: ${LlmJsonUtils.sanitizeLogMessage(err.message)}")
+                    return@launch
+                }
+                withContext(Dispatchers.IO) {
+                    eventCardStore.updateSectionsOrThrow(card.id, updatedSections)
+                }
+                _events.update { list ->
+                    list.map { existing -> if (existing.id == cardId) existing.copy(sections = updatedSections) else existing }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _snackbarMessage.emit("Section structuring failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            } finally {
+                _enrichingCardIds.update { it - cardId }
+            }
+        }
+        enrichmentJobs[cardId] = launchedJob
+        launchedJob.invokeOnCompletion { enrichmentJobs.remove(cardId, launchedJob) }
+        return launchedJob
+    }
+
+    private fun cancelEnrichmentJobs() {
+        val jobs = enrichmentJobs.values.toList()
+        enrichmentJobs.clear()
+        jobs.forEach { it.cancel() }
+        _enrichingCardIds.value = emptySet()
     }
 
     /**
