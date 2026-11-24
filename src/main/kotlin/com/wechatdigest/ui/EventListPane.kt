@@ -47,6 +47,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,7 +57,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -69,6 +72,10 @@ import com.wechatdigest.ui.theme.PriorityColors
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+
+private val EmptySyncStatusFlow: StateFlow<String?> = MutableStateFlow(null)
 
 /**
  * Left-hand master list pane displaying search, filter chips, segmented event rows, and sync FAB.
@@ -97,6 +104,7 @@ internal fun EventListPane(
     onSelectEvent: (String) -> Unit,
     onToggleStarEvent: (String) -> Unit,
     isSyncing: Boolean,
+    syncStatusTextFlow: StateFlow<String?> = EmptySyncStatusFlow,
     onTriggerSync: () -> Unit
 ) {
     val listState = rememberLazyListState()
@@ -132,12 +140,29 @@ internal fun EventListPane(
                 onToggleStarEvent = onToggleStarEvent
             )
         }
-        SyncFloatingActionButton(
-            isSyncing = isSyncing,
-            expanded = isFabExpanded,
-            onTriggerSync = onTriggerSync,
-            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
-        )
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier.weight(1f),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                SyncStatusPill(
+                    isSyncing = isSyncing,
+                    syncStatusTextFlow = syncStatusTextFlow
+                )
+            }
+            SyncFloatingActionButton(
+                isSyncing = isSyncing,
+                expanded = isFabExpanded,
+                onTriggerSync = onTriggerSync
+            )
+        }
     }
 }
 
@@ -297,6 +322,35 @@ private fun EventFeedEmptyState(hasAnyEvents: Boolean) {
                 color = MaterialTheme.colorScheme.outline
             )
         }
+    }
+}
+
+@Composable
+private fun SyncStatusPill(
+    isSyncing: Boolean,
+    syncStatusTextFlow: StateFlow<String?>,
+    modifier: Modifier = Modifier
+) {
+    if (!isSyncing) return
+    val syncStatusText by syncStatusTextFlow.collectAsState()
+    val status = syncStatusText?.takeIf { it.isNotBlank() } ?: return
+    Surface(
+        modifier = modifier.widthIn(max = 360.dp),
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        tonalElevation = 2.dp,
+        shadowElevation = 2.dp
+    ) {
+        Text(
+            text = status,
+            modifier = Modifier
+                .padding(horizontal = 14.dp, vertical = 7.dp)
+                .semantics { liveRegion = LiveRegionMode.Polite },
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSecondaryContainer,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 

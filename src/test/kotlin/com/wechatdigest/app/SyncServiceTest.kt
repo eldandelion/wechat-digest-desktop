@@ -561,7 +561,11 @@ class SyncServiceTest {
                     respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
                 }
                 body.contains("Rule & Substance Gatekeeper") -> {
-                    val content = """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                    val content = if (body.contains("\"verdicts\"") || body.contains("\\\"verdicts\\\"")) {
+                        """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                    } else {
+                        """{"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Clean notice"}"""
+                    }
                     respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
                 }
                 body.contains("Structured Event Card Translator") -> respond("Translator error", HttpStatusCode.InternalServerError)
@@ -704,5 +708,168 @@ class SyncServiceTest {
         assertEquals("exam_seats.xlsx", storedCard.attachments.single().fileName)
         assertEquals(excelFile.canonicalPath, storedCard.attachments.single().localPath)
         assertFalse(storedCard.sourceMessages.contains("Auditorium C-201"), "Raw spreadsheet preview should stay out of stored sourceMessages")
+    }
+
+    @Test
+    fun `syncNow persists cards incrementally and keeps partial cards without advancing checkpoint on mid-room failure`() = runBlocking {
+        val dir = File(tempDir, "incremental_partial_wechat").apply { mkdirs() }
+        val room = "partial@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'Partial Sync Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('teacher', 'Prof_Lin', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'teacher', CAST('Notice 1: Submit form online by Friday.' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800010, 'teacher', CAST('通知2：周五下午三点实验室开会。' AS BLOB))")
+            }
+        }
+
+        var failSecondTranslator = true
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            when {
+                body.contains("Semantic Filter & Topic Chunker") -> {
+                    val content = """{"chunks":[{"topic":"Notice 1","message_ids":[1]},{"topic":"Notice 2","message_ids":[2]}]}"""
+                    respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+                }
+                body.contains("Rule & Substance Gatekeeper") -> {
+                    val content = if (body.contains("\"verdicts\"") || body.contains("\\\"verdicts\\\"")) {
+                        """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                    } else {
+                        """{"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Clean notice"}"""
+                    }
+                    respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+                }
+                body.contains("Structured Event Card Translator") -> {
+                    if (failSecondTranslator) {
+                        respond("Translator 500", HttpStatusCode.InternalServerError)
+                    } else {
+                        val content = """{"title":"Notice 2 Meeting","summary":"Lab meeting at 15:00 on Friday.","sections":[]}"""
+                        respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+                    }
+                }
+                body.contains("Notice 1: Submit form online") -> {
+                    val content = """{"is_relevant":true,"events":[{"title":"Notice 1","summary":"Submit form online by Friday.","category":"DEADLINE","priority":"IMPORTANT","source_message_ids":[1]}]}"""
+                    respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+                }
+                else -> {
+                    // Notice 2 returned untranslated so CardTranslator is triggered
+                    val content = """{"is_relevant":true,"events":[{"title":"通知2：实验室开会","summary":"周五下午三点在实验室开会。","category":"NOTICE","priority":"NORMAL","source_message_ids":[2]}]}"""
+                    respond("""{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+                }
+            }
+        }
+
+        val checkpointStore = SyncCheckpointStore(appDb)
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = checkpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val firstPersisted = mutableListOf<String>()
+        val progressEvents = mutableListOf<SyncProgress>()
+        val firstRun = service.syncNow(
+            settings = AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = setOf(room),
+                targetLanguage = "en",
+                llm = LlmConfig(providerType = LlmProviderType.OLLAMA, endpointUrl = "http://localhost:11434", modelName = "qwen2.5")
+            ),
+            onCardPersisted = { firstPersisted.add(it.title) },
+            onProgress = { progressEvents.add(it) }
+        )
+
+        assertTrue(firstRun is SyncResult.Success)
+        assertEquals(1, (firstRun as SyncResult.Success).newEventsCount)
+        assertEquals(1, firstRun.roomErrors.size)
+        assertEquals(listOf("Notice 1"), firstPersisted)
+        assertEquals(listOf("Notice 1"), eventCardStore.listActive().map { it.title })
+        assertTrue(progressEvents.any { it.stageLabel.contains("Scanning") })
+        kotlin.test.assertNull(checkpointStore.get(room), "Mid-room failure must not advance checkpoint")
+
+        // Second sync recovers Notice 2 and suppresses duplicate Notice 1 via dedupe_key without re-emitting
+        failSecondTranslator = false
+        val secondPersisted = mutableListOf<String>()
+        val secondRun = service.syncNow(
+            settings = AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = setOf(room),
+                targetLanguage = "en",
+                llm = LlmConfig(providerType = LlmProviderType.OLLAMA, endpointUrl = "http://localhost:11434", modelName = "qwen2.5")
+            ),
+            onCardPersisted = { secondPersisted.add(it.title) }
+        )
+        assertTrue(secondRun is SyncResult.Success)
+        assertEquals(1, (secondRun as SyncResult.Success).newEventsCount)
+        assertTrue(secondRun.roomErrors.isEmpty())
+        assertEquals(listOf("Notice 2 Meeting"), secondPersisted)
+        assertEquals(2, eventCardStore.listActive().size)
+        assertEquals(2L, checkpointStore.get(room)?.lastLocalId)
+    }
+
+    @Test
+    fun `syncNow serializes concurrent cloud card upserts cleanly`() = runBlocking {
+        val dir = File(tempDir, "cloud_concurrent_wechat").apply { mkdirs() }
+        val room = "cloud@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'Cloud Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('t1', 'Teacher_1', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                (1..4).forEach { id ->
+                    stmt.executeUpdate("INSERT INTO $table VALUES ($id, ${1794800000 + id * 10}, 't1', CAST('Notice $id details' AS BLOB))")
+                }
+            }
+        }
+
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"T1","message_ids":[1]},{"topic":"T2","message_ids":[2]},{"topic":"T3","message_ids":[3]},{"topic":"T4","message_ids":[4]}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":2,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":3,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                else -> {
+                    val idx = (1..4).first { body.contains("Notice $it details") }
+                    """{"is_relevant":true,"events":[{"title":"Cloud Card $idx","summary":"Notice $idx summary","category":"NOTICE","priority":"NORMAL","source_message_ids":[$idx]}]}"""
+                }
+            }
+            val wrapper = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}"""
+            respond(wrapper, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+        }
+
+        val checkpointStore = SyncCheckpointStore(appDb)
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = checkpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val persistedTitles = mutableListOf<String>()
+        val result = service.syncNow(
+            settings = AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = setOf(room),
+                llm = LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, apiKey = "k")
+            ),
+            onCardPersisted = { persistedTitles.add(it.title) }
+        )
+
+        assertTrue(result is SyncResult.Success)
+        assertEquals(4, (result as SyncResult.Success).newEventsCount)
+        assertEquals(4, persistedTitles.size)
+        assertEquals(4, eventCardStore.listActive().size)
+        assertEquals(4L, checkpointStore.getOrThrow(room)?.lastLocalId)
     }
 }

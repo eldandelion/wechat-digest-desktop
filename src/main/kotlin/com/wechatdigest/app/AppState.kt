@@ -30,9 +30,14 @@ import com.wechatdigest.storage.SettingsStore
 import com.wechatdigest.storage.SyncCheckpointStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -51,6 +56,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 enum class Screen {
     EVENTS,
@@ -185,6 +192,11 @@ class AppState(
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
 
+    private val _syncStatusText = MutableStateFlow<String?>(null)
+
+    /** Human-readable progress status for the currently active sync run, or `null` when idle. */
+    val syncStatusText: StateFlow<String?> = _syncStatusText.asStateFlow()
+
     private val _translatingCardIds = MutableStateFlow<Set<String>>(emptySet())
     val translatingCardIds: StateFlow<Set<String>> = _translatingCardIds.asStateFlow()
 
@@ -201,6 +213,13 @@ class AppState(
     private val enrichmentJobs = ConcurrentHashMap<String, Job>()
 
     private val settingsMutex = Mutex()
+    private val syncExecutionMutex = Mutex()
+    private val eventsDbMutex = Mutex()
+    private val eventsMutationEpoch = AtomicLong(0L)
+    @Volatile
+    private var loadEventsJob: Job? = null
+    @Volatile
+    private var activeSyncJob: Job? = null
     private var refreshRoomsJob: Job? = null
 
     private val _showWizard = MutableStateFlow(false)
@@ -211,12 +230,7 @@ class AppState(
 
     val scheduler: SyncScheduler = syncScheduler ?: SyncScheduler(
         syncAction = {
-            val result = syncService.syncNow(_settings.value)
-            if (result is SyncResult.Success && result.newEventsCount > 0) {
-                loadEvents().join()
-            }
-            loadCheckpoints().join()
-            result
+            runExclusiveSync() ?: SyncResult.Success(newEventsCount = 0, totalScannedMessages = 0)
         },
         notificationDispatcher = notificationDispatcher,
         scope = scope
@@ -251,47 +265,79 @@ class AppState(
 
     fun resetGroupCheckpoint(roomId: String): Job = scope.launch {
         if (syncCheckpointStore != null) {
-            withContext(Dispatchers.IO) {
-                syncCheckpointStore.reset(roomId)
+            activeSyncJob?.cancelAndJoin()
+            syncExecutionMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    syncCheckpointStore.reset(roomId)
+                }
             }
+            loadEvents().join()
             loadCheckpoints().join()
             _snackbarMessage.emit("Checkpoint reset for group. Next sync will scan full history.")
         }
     }
 
     fun clearEventsAndCheckpoints(): Job = scope.launch {
+        scheduler.stop()
+        loadEventsJob?.cancel()
+        activeSyncJob?.cancelAndJoin()
         cancelEnrichmentJobs()
-        withContext(Dispatchers.IO) {
-            eventCardStore.clearAll()
-            syncCheckpointStore?.resetAll()
+        syncExecutionMutex.withLock {
+            eventsDbMutex.withLock {
+                eventsMutationEpoch.incrementAndGet()
+                withContext(Dispatchers.IO) {
+                    eventCardStore.clearAll()
+                    syncCheckpointStore?.resetAll()
+                }
+                _events.value = emptyList()
+            }
+            _syncCheckpoints.value = emptyMap()
         }
-        _events.value = emptyList()
-        _syncCheckpoints.value = emptyMap()
         groupFilter.value = null
         starredOnlyFilter.value = false
         unreadOnlyFilter.value = false
         _selectedEventId.value = null
+        val currentSettings = _settings.value
+        if (currentSettings.autoSyncEnabled && currentSettings.syncIntervalMinutes > 0) {
+            scheduler.start(
+                intervalMinutes = currentSettings.syncIntervalMinutes,
+                notifyOnNewEvents = currentSettings.notifyOnNewEvents
+            )
+        }
         _snackbarMessage.emit("Cleared all extracted events and sync checkpoints.")
     }
 
     fun resetLocalAppDatabase(): Job = scope.launch {
         scheduler.stop()
+        loadEventsJob?.cancel()
+        val pendingRoomsJob = refreshRoomsJob
+        refreshRoomsJob = null
+        pendingRoomsJob?.cancelAndJoin()
+        activeSyncJob?.cancelAndJoin()
         cancelEnrichmentJobs()
-        withContext(Dispatchers.IO) {
-            eventCardStore.clearAll()
-            syncCheckpointStore?.resetAll()
-            groupConfigStore?.clearAll()
-            settingsStore.clear()
-            if (!Files.isSymbolicLink(decryptedCacheDir.toPath()) &&
-                decryptedCacheDir.exists() &&
-                decryptedCacheDir.isDirectory &&
-                decryptedCacheDir.name == "decrypted"
-            ) {
-                decryptedCacheDir.deleteRecursively()
+        syncExecutionMutex.withLock {
+            eventsDbMutex.withLock {
+                eventsMutationEpoch.incrementAndGet()
+                withContext(Dispatchers.IO) {
+                    eventCardStore.clearAll()
+                    syncCheckpointStore?.resetAll()
+                    groupConfigStore?.clearAll()
+                    if (!Files.isSymbolicLink(decryptedCacheDir.toPath()) &&
+                        decryptedCacheDir.exists() &&
+                        decryptedCacheDir.isDirectory &&
+                        decryptedCacheDir.name == "decrypted"
+                    ) {
+                        decryptedCacheDir.deleteRecursively()
+                    }
+                }
+                settingsMutex.withLock {
+                    withContext(Dispatchers.IO) { settingsStore.clear() }
+                    _settings.value = AppSettings()
+                }
+                _events.value = emptyList()
             }
+            _syncCheckpoints.value = emptyMap()
         }
-        _events.value = emptyList()
-        _syncCheckpoints.value = emptyMap()
         _groupConfigs.value = emptyMap()
         _availableRooms.value = emptyList()
         _detectedOllamaModels.value = emptyList()
@@ -304,7 +350,6 @@ class AppState(
         searchQuery.value = ""
         groupSearchQuery.value = ""
         _selectedEventId.value = null
-        _settings.value = AppSettings()
         _snackbarMessage.emit("Local app database reset to defaults. WeChat files untouched.")
     }
 
@@ -405,11 +450,21 @@ class AppState(
         }
     }
 
-    fun loadEvents(): Job = scope.launch {
-        val list = withContext(Dispatchers.IO) {
-            eventCardStore.listActive()
+    fun loadEvents(): Job {
+        loadEventsJob?.cancel()
+        val job = scope.launch {
+            eventsDbMutex.withLock {
+                val capturedEpoch = eventsMutationEpoch.get()
+                val list = withContext(Dispatchers.IO) {
+                    eventCardStore.listActive()
+                }
+                if (eventsMutationEpoch.get() == capturedEpoch) {
+                    _events.value = list
+                }
+            }
         }
-        _events.value = list
+        loadEventsJob = job
+        return job
     }
 
     fun selectEvent(id: String?) {
@@ -423,47 +478,45 @@ class AppState(
     }
 
     fun markRead(id: String): Job = scope.launch {
-        _events.value = _events.value.map { if (it.id == id) it.copy(isRead = true) else it }
-        withContext(Dispatchers.IO) {
-            eventCardStore.markRead(id)
-            eventCardStore.listActive()
-        }.also {
-            _events.value = it
+        eventsMutationEpoch.incrementAndGet()
+        _events.update { list -> list.map { if (it.id == id) it.copy(isRead = true) else it } }
+        eventsDbMutex.withLock {
+            withContext(Dispatchers.IO) { eventCardStore.markRead(id) }
+            // Re-apply idempotently under the lock in case an earlier loadEvents() read pre-write SQLite rows.
+            _events.update { list -> list.map { if (it.id == id) it.copy(isRead = true) else it } }
+            eventsMutationEpoch.incrementAndGet()
         }
     }
 
     fun markUnread(id: String): Job = scope.launch {
-        _events.value = _events.value.map { if (it.id == id) it.copy(isRead = false) else it }
-        withContext(Dispatchers.IO) {
-            eventCardStore.markUnread(id)
-            eventCardStore.listActive()
-        }.also {
-            _events.value = it
+        eventsMutationEpoch.incrementAndGet()
+        _events.update { list -> list.map { if (it.id == id) it.copy(isRead = false) else it } }
+        eventsDbMutex.withLock {
+            withContext(Dispatchers.IO) { eventCardStore.markUnread(id) }
+            _events.update { list -> list.map { if (it.id == id) it.copy(isRead = false) else it } }
+            eventsMutationEpoch.incrementAndGet()
         }
     }
 
     fun toggleStarred(id: String): Job = scope.launch {
-        val current = _events.value.firstOrNull { it.id == id } ?: return@launch
-        val newStarred = !current.isStarred
-        _events.value = _events.value.map { if (it.id == id) it.copy(isStarred = newStarred) else it }
-        withContext(Dispatchers.IO) {
-            eventCardStore.setStarred(id, newStarred)
-            eventCardStore.listActive()
-        }.also {
-            _events.value = it
+        eventsDbMutex.withLock {
+            val current = _events.value.firstOrNull { it.id == id } ?: return@withLock
+            val newStarred = !current.isStarred
+            eventsMutationEpoch.incrementAndGet()
+            _events.update { list -> list.map { if (it.id == id) it.copy(isStarred = newStarred) else it } }
+            withContext(Dispatchers.IO) { eventCardStore.setStarred(id, newStarred) }
+            eventsMutationEpoch.incrementAndGet()
         }
     }
 
     fun dismiss(id: String): Job = scope.launch {
-        if (_selectedEventId.value == id) {
-            _selectedEventId.value = null
-        }
-        _events.value = _events.value.filterNot { it.id == id }
-        withContext(Dispatchers.IO) {
-            eventCardStore.dismiss(id)
-            eventCardStore.listActive()
-        }.also {
-            _events.value = it
+        eventsMutationEpoch.incrementAndGet()
+        _selectedEventId.update { currentId -> if (currentId == id) null else currentId }
+        _events.update { list -> list.filterNot { it.id == id } }
+        eventsDbMutex.withLock {
+            withContext(Dispatchers.IO) { eventCardStore.dismiss(id) }
+            _events.update { list -> list.filterNot { it.id == id } }
+            eventsMutationEpoch.incrementAndGet()
         }
     }
 
@@ -582,11 +635,77 @@ class AppState(
         }
     }
 
+    internal fun mergeStreamedCard(existing: List<EventCard>, incoming: EventCard): List<EventCard> {
+        val withoutDup = existing.filterNot { it.id == incoming.id }
+        return (withoutDup + incoming).sortedWith(
+            compareByDescending<EventCard> { it.timestampSeconds }
+                .thenBy { it.priority.ordinal }
+        )
+    }
+
+    private fun formatSyncProgress(progress: SyncProgress): String {
+        val safeRoom = EventDetailItemParser.sanitizeSingleLine(progress.roomName, 48).ifBlank { "Group ${progress.roomIndex}" }
+        val roomPrefix = if (progress.totalRooms > 1) {
+            "(${progress.roomIndex}/${progress.totalRooms}) $safeRoom: "
+        } else {
+            "$safeRoom: "
+        }
+        val countSuffix = if (progress.newEventsSoFar > 0) " • ${progress.newEventsSoFar} saved" else ""
+        return "$roomPrefix${progress.stageLabel}$countSuffix"
+    }
+
+    private suspend fun executeSerializedSync(): SyncResult = syncExecutionMutex.withLock {
+        val hadStreamedCard = AtomicBoolean(false)
+        _syncStatusText.value = "Starting sync..."
+        val result = syncService.syncNow(
+            settings = _settings.value,
+            onCardPersisted = { card ->
+                hadStreamedCard.set(true)
+                eventsDbMutex.withLock {
+                    eventsMutationEpoch.incrementAndGet()
+                    _events.update { current -> mergeStreamedCard(current, card) }
+                }
+            },
+            onProgress = { progress ->
+                _syncStatusText.value = formatSyncProgress(progress)
+            }
+        )
+        if (hadStreamedCard.get() || (result is SyncResult.Success && result.newEventsCount > 0)) {
+            loadEvents().join()
+        }
+        loadCheckpoints().join()
+        result
+    }
+
+    private suspend fun runExclusiveSync(): SyncResult? {
+        if (!_isSyncing.compareAndSet(expect = false, update = true)) return null
+        return try {
+            var syncResult: SyncResult? = null
+            coroutineScope {
+                // Launch the active sync in a dedicated child job so cancelling activeSyncJob
+                // (e.g. from resetGroupCheckpoint) aborts this run without cancelling SyncScheduler's loop.
+                val syncJob = launch(start = CoroutineStart.LAZY) {
+                    syncResult = executeSerializedSync()
+                }
+                activeSyncJob = syncJob
+                syncJob.start()
+                syncJob.join()
+                if (syncJob.isCancelled) {
+                    currentCoroutineContext().ensureActive()
+                    syncResult = null
+                }
+            }
+            syncResult
+        } finally {
+            activeSyncJob = null
+            _syncStatusText.value = null
+            _isSyncing.value = false
+        }
+    }
+
     fun triggerSync(): Job = scope.launch {
-        if (_isSyncing.value) return@launch
-        _isSyncing.value = true
         try {
-            val result = syncService.syncNow(_settings.value)
+            val result = runExclusiveSync() ?: return@launch
             when (result) {
                 is SyncResult.Success -> {
                     val statusMsg = if (result.roomErrors.isNotEmpty()) {
@@ -595,8 +714,6 @@ class AppState(
                         "Sync complete: ${result.newEventsCount} new events from ${result.totalScannedMessages} messages."
                     }
                     _snackbarMessage.emit(statusMsg)
-                    loadEvents().join()
-                    loadCheckpoints().join()
                 }
                 is SyncResult.Failure -> {
                     _snackbarMessage.emit("Sync failed: ${result.message}")
@@ -605,17 +722,17 @@ class AppState(
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             _snackbarMessage.emit("Sync error: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
-        } finally {
-            _isSyncing.value = false
         }
     }
 
     fun translateSourceMessages(cardId: String): Job = scope.launch {
-        if (cardId in _translatingCardIds.value) return@launch
-        val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
-        if (card.sourceMessages.isBlank() || card.translatedSourceMessages.isNotBlank()) return@launch
-
-        _translatingCardIds.value = _translatingCardIds.value + cardId
+        val previous = _translatingCardIds.getAndUpdate { it + cardId }
+        if (cardId in previous) return@launch
+        val card = _events.value.firstOrNull { it.id == cardId }
+        if (card == null || card.sourceMessages.isBlank() || card.translatedSourceMessages.isNotBlank()) {
+            _translatingCardIds.update { it - cardId }
+            return@launch
+        }
         try {
             val currentSettings = _settings.value
             val result = withContext(Dispatchers.IO) {
@@ -627,14 +744,15 @@ class AppState(
                 }
             }
             result.onSuccess { translated ->
-                withContext(Dispatchers.IO) {
-                    eventCardStore.updateTranslatedSourceMessages(card.id, translated)
-                }
-                _events.value = _events.value.map { existing ->
-                    if (existing.id == cardId) {
-                        existing.copy(translatedSourceMessages = translated)
-                    } else {
-                        existing
+                eventsDbMutex.withLock {
+                    withContext(Dispatchers.IO) {
+                        eventCardStore.updateTranslatedSourceMessages(card.id, translated)
+                    }
+                    eventsMutationEpoch.incrementAndGet()
+                    _events.update { list ->
+                        list.map { existing ->
+                            if (existing.id == cardId) existing.copy(translatedSourceMessages = translated) else existing
+                        }
                     }
                 }
             }.onFailure { err ->
@@ -644,7 +762,7 @@ class AppState(
             if (e is CancellationException) throw e
             _snackbarMessage.emit("Message translation failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         } finally {
-            _translatingCardIds.value = _translatingCardIds.value - cardId
+            _translatingCardIds.update { it - cardId }
         }
     }
 
@@ -686,11 +804,14 @@ class AppState(
                     _snackbarMessage.emit("Section structuring failed: ${LlmJsonUtils.sanitizeLogMessage(err.message)}")
                     return@launch
                 }
-                withContext(Dispatchers.IO) {
-                    eventCardStore.updateSectionsOrThrow(card.id, updatedSections)
-                }
-                _events.update { list ->
-                    list.map { existing -> if (existing.id == cardId) existing.copy(sections = updatedSections) else existing }
+                eventsDbMutex.withLock {
+                    withContext(Dispatchers.IO) {
+                        eventCardStore.updateSectionsOrThrow(card.id, updatedSections)
+                    }
+                    eventsMutationEpoch.incrementAndGet()
+                    _events.update { list ->
+                        list.map { existing -> if (existing.id == cardId) existing.copy(sections = updatedSections) else existing }
+                    }
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -760,24 +881,34 @@ class AppState(
      * downloaded attachments for [cardId] and persists updated paths to [EventCardStore].
      */
     fun recheckCardAttachments(cardId: String): Job = scope.launch {
-        if (cardId in _recheckingAttachmentCardIds.value) return@launch
-        val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
-        if (card.attachments.isEmpty()) return@launch
-
-        _recheckingAttachmentCardIds.value = _recheckingAttachmentCardIds.value + cardId
+        val previous = _recheckingAttachmentCardIds.getAndUpdate { it + cardId }
+        if (cardId in previous) return@launch
+        val card = _events.value.firstOrNull { it.id == cardId }
+        if (card == null || card.attachments.isEmpty()) {
+            _recheckingAttachmentCardIds.update { it - cardId }
+            return@launch
+        }
         try {
-            val (refreshed, foundCount) = withContext(Dispatchers.IO) {
-                val driver = resolveDriverFromSettings() ?: return@withContext null to 0
-                val updatedList = WeChatAttachmentResolver(driver).refreshAttachments(card.attachments)
-                eventCardStore.updateAttachmentsOrThrow(cardId, updatedList)
-                updatedList to updatedList.count { it.isLocalFilePresent() }
+            val (refreshed, foundCount) = eventsDbMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    val driver = resolveDriverFromSettings() ?: return@withContext null to 0
+                    val updatedList = WeChatAttachmentResolver(driver).refreshAttachments(card.attachments)
+                    eventCardStore.updateAttachmentsOrThrow(cardId, updatedList)
+                    updatedList to updatedList.count { it.isLocalFilePresent() }
+                }.also { (updatedList, _) ->
+                    if (updatedList != null) {
+                        eventsMutationEpoch.incrementAndGet()
+                        _events.update { list ->
+                            list.map { existing ->
+                                if (existing.id == cardId) existing.copy(attachments = updatedList) else existing
+                            }
+                        }
+                    }
+                }
             }
             if (refreshed == null) {
                 _snackbarMessage.emit("WeChat data directory is not configured or does not exist.")
                 return@launch
-            }
-            _events.value = _events.value.map { existing ->
-                if (existing.id == cardId) existing.copy(attachments = refreshed) else existing
             }
             if (foundCount > 0) {
                 _snackbarMessage.emit("Located $foundCount downloaded attachment${if (foundCount == 1) "" else "s"}.")
@@ -788,7 +919,7 @@ class AppState(
             if (e is CancellationException) throw e
             _snackbarMessage.emit("Attachment re-check failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         } finally {
-            _recheckingAttachmentCardIds.value = _recheckingAttachmentCardIds.value - cardId
+            _recheckingAttachmentCardIds.update { it - cardId }
         }
     }
 }

@@ -5,12 +5,14 @@ import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LinearProgressIndicator
@@ -240,9 +242,7 @@ fun EventFeedScreen(appState: AppState) {
             EventDetailHost(appState, selectedCard, selectedIndex, visibleEvents, roomNamesMap) { cardPendingDelete = selectedCard }
         }
 
-        if (isSyncing) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter))
-        }
+        SyncTopProgressBar(isSyncing = isSyncing)
         cardPendingDelete?.let { target ->
             DeleteConfirmationDialog(
                 title = "Delete Notice?",
@@ -252,6 +252,17 @@ fun EventFeedScreen(appState: AppState) {
             )
         }
     }
+}
+
+@Composable
+private fun BoxScope.SyncTopProgressBar(isSyncing: Boolean) {
+    if (!isSyncing) return
+    LinearProgressIndicator(
+        modifier = Modifier
+            .fillMaxWidth()
+            .align(Alignment.TopCenter)
+            .semantics { contentDescription = "Sync in progress" }
+    )
 }
 
 @Composable
@@ -298,6 +309,7 @@ private fun EventListHost(
         onSelectEvent = { appState.selectEvent(it) },
         onToggleStarEvent = { appState.toggleStarred(it) },
         isSyncing = isSyncing,
+        syncStatusTextFlow = appState.syncStatusText,
         onTriggerSync = { if (!isSyncing) appState.triggerSync() }
     )
 }

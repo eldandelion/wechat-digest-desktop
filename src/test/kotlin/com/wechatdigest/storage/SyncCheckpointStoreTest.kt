@@ -89,4 +89,21 @@ class SyncCheckpointStoreTest {
 
         assertTrue(store.getAll().isEmpty())
     }
+
+    @Test
+    fun `getOrThrow and saveOrThrow propagate SQLite failures fail-closed`() {
+        val brokenDb = AppDatabase(File(tempDir, "broken_checkpoints.db"))
+        val brokenStore = SyncCheckpointStore(brokenDb)
+        brokenDb.getConnection().use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("DROP TABLE sync_checkpoints")
+            }
+        }
+        kotlin.test.assertFailsWith<java.sql.SQLException> {
+            brokenStore.getOrThrow("room@chatroom")
+        }
+        kotlin.test.assertFailsWith<java.sql.SQLException> {
+            brokenStore.saveOrThrow(SyncCheckpoint("room@chatroom", 10L, 1000L, 1000L))
+        }
+    }
 }

@@ -26,6 +26,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
@@ -340,5 +341,273 @@ class AppStateFeedAndAttachmentTest {
         val persistedSection = eventCardStore.listActive().single().sections.single()
         assertEquals(2, persistedSection.items.size)
         assertEquals(EventDetailKind.COPIES, persistedSection.items[0].kind)
+    }
+
+    @Test
+    fun `triggerSync streams new cards progressively before sync finishes and clears syncStatusText`() = runBlocking {
+        val dir = File(tempDir, "appstate_stream_wechat").apply { mkdirs() }
+        val room = "stream_ui@chatroom"
+        val table = com.wechatdigest.core.db.WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'UI Stream Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('admin', 'Admin_Li', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'admin', CAST('First streamed notice' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800020, 'admin', CAST('Second slower notice' AS BLOB))")
+            }
+        }
+
+        val secondNoticeGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"First","message_ids":[1]},{"topic":"Second","message_ids":[2]}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                body.contains("First streamed notice") ->
+                    """{"is_relevant":true,"events":[{"title":"First Ready Card","summary":"Delivered before second card finishes.","category":"NOTICE","priority":"NORMAL","source_message_ids":[1]}]}"""
+                else -> {
+                    secondNoticeGate.await()
+                    """{"is_relevant":true,"events":[{"title":"Second Ready Card","summary":"Delivered second.","category":"DEADLINE","priority":"CRITICAL","source_message_ids":[2]}]}"""
+                }
+            }
+            val wrapper = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), content)}}}]}"""
+            respond(wrapper, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val streamingSyncService = SyncService(
+            eventCardStore = eventCardStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = streamingSyncService,
+            scope = testScope
+        )
+        appState.updateSettings(
+            AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = setOf(room),
+                llm = com.wechatdigest.core.llm.LlmConfig(
+                    providerType = com.wechatdigest.core.llm.LlmProviderType.OPENAI_COMPATIBLE,
+                    apiKey = "test-key"
+                )
+            )
+        ).join()
+
+        val syncJob = appState.triggerSync()
+
+        // Card #1 must appear in appState.events BEFORE secondNoticeGate releases Card #2!
+        val midSyncEvents = withTimeout(2_000) { appState.events.first { it.isNotEmpty() } }
+        assertEquals(listOf("First Ready Card"), midSyncEvents.map { it.title })
+        assertTrue(appState.isSyncing.value)
+        assertTrue(!appState.syncStatusText.value.isNullOrBlank())
+
+        // Duplicate triggerSync while a sync is active must return without clobbering activeSyncJob
+        val duplicateSyncJob = appState.triggerSync()
+        duplicateSyncJob.join()
+        assertTrue(appState.isSyncing.value)
+
+        // Mark Card #1 read mid-sync before Card #2 finishes; state must survive Card #2 merge + final reconciliation
+        val firstCardId = midSyncEvents.single().id
+        appState.markRead(firstCardId).join()
+        assertTrue(appState.events.value.single { it.id == firstCardId }.isRead)
+
+        secondNoticeGate.complete(Unit)
+        syncJob.join()
+
+        assertFalse(appState.isSyncing.value)
+        assertNull(appState.syncStatusText.value)
+        assertEquals(listOf("Second Ready Card", "First Ready Card"), appState.events.value.map { it.title })
+        assertTrue(appState.events.value.first { it.id == firstCardId }.isRead)
+
+        // Verify mergeStreamedCard deduplicates by id and sorts newest first
+        val older = midSyncEvents.single().copy(id = "a", timestampSeconds = 100L)
+        val newer = midSyncEvents.single().copy(id = "b", timestampSeconds = 200L)
+        val updatedOlder = older.copy(title = "Updated A")
+        val merged = appState.mergeStreamedCard(listOf(newer, older), updatedOlder)
+        assertEquals(listOf("b", "a"), merged.map { it.id })
+        assertEquals("Updated A", merged[1].title)
+
+        // Clear all wipes stores cleanly
+        appState.clearEventsAndCheckpoints().join()
+        assertTrue(appState.events.value.isEmpty())
+    }
+
+    @Test
+    fun `clearEventsAndCheckpoints cancels active sync job before wiping events`() = runBlocking {
+        val dir = File(tempDir, "appstate_cancel_stream_wechat").apply { mkdirs() }
+        val room = "cancel_stream@chatroom"
+        val table = com.wechatdigest.core.db.WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'Cancel Test Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('admin', 'Admin_Li', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'admin', CAST('First notice' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800020, 'admin', CAST('Gated slow notice' AS BLOB))")
+            }
+        }
+
+        val secondNoticeGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"First","message_ids":[1]},{"topic":"Second","message_ids":[2]}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                body.contains("First notice") ->
+                    """{"is_relevant":true,"events":[{"title":"Early Card","summary":"Persisted before cancel.","category":"NOTICE","priority":"NORMAL","source_message_ids":[1]}]}"""
+                else -> {
+                    secondNoticeGate.await()
+                    """{"is_relevant":true,"events":[{"title":"Late Card","summary":"Must not survive cancel.","category":"NOTICE","priority":"NORMAL","source_message_ids":[2]}]}"""
+                }
+            }
+            val wrapper = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), content)}}}]}"""
+            respond(wrapper, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val syncService = SyncService(
+            eventCardStore = eventCardStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            scope = testScope
+        )
+        appState.updateSettings(
+            AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = setOf(room),
+                llm = com.wechatdigest.core.llm.LlmConfig(
+                    providerType = com.wechatdigest.core.llm.LlmProviderType.OPENAI_COMPATIBLE,
+                    apiKey = "test-key"
+                )
+            )
+        ).join()
+
+        val syncJob = appState.triggerSync()
+        withTimeout(2_000) { appState.events.first { it.isNotEmpty() } }
+
+        // Trigger wipe mid-sync while second Notice chunk is still blocked at secondNoticeGate
+        appState.clearEventsAndCheckpoints().join()
+        secondNoticeGate.complete(Unit)
+        syncJob.join()
+
+        assertFalse(appState.isSyncing.value)
+        assertNull(appState.syncStatusText.value)
+        assertTrue(appState.events.value.isEmpty())
+        assertTrue(eventCardStore.listActive().isEmpty())
+    }
+
+    @Test
+    fun `resetGroupCheckpoint during scheduled sync preserves caller and scheduler while clear preserves autoSyncEnabled`() = runBlocking {
+        val dir = File(tempDir, "appstate_sched_cancel_wechat").apply { mkdirs() }
+        val room = "sched_cancel@chatroom"
+        val table = com.wechatdigest.core.db.WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'Scheduled Cancel Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('admin', 'Admin_Li', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800000, 'admin', CAST('Notice 1' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1794800020, 'admin', CAST('Notice 2' AS BLOB))")
+            }
+        }
+
+        val secondNoticeGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"First","message_ids":[2]},{"topic":"Second","message_ids":[3]}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                body.contains("Notice 1") ->
+                    """{"is_relevant":true,"events":[{"title":"Scheduled Card 1","summary":"Arrived before reset.","category":"NOTICE","priority":"NORMAL","source_message_ids":[2]}]}"""
+                else -> {
+                    secondNoticeGate.await()
+                    """{"is_relevant":true,"events":[{"title":"Scheduled Card 2","summary":"Cancelled by reset.","category":"NOTICE","priority":"NORMAL","source_message_ids":[3]}]}"""
+                }
+            }
+            val wrapper = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), content)}}}]}"""
+            respond(wrapper, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val checkpointStore = com.wechatdigest.storage.SyncCheckpointStore(appDb)
+        checkpointStore.save(com.wechatdigest.core.model.SyncCheckpoint(room, 1L, 1794700000L, 1794700000L))
+
+        val syncService = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = checkpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = checkpointStore,
+            syncService = syncService,
+            scope = testScope
+        )
+        try {
+            appState.updateSettings(
+                AppSettings(
+                    wechatDataDir = dir.absolutePath,
+                    monitoredRoomIds = setOf(room),
+                    autoSyncEnabled = true,
+                    syncIntervalMinutes = 60,
+                    llm = com.wechatdigest.core.llm.LlmConfig(
+                        providerType = com.wechatdigest.core.llm.LlmProviderType.OPENAI_COMPATIBLE,
+                        apiKey = "test-key"
+                    )
+                )
+            ).join()
+            assertTrue(appState.scheduler.isRunning)
+
+            var callerCompletedNormally = false
+            val schedulerCallerJob = kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.Unconfined).launch {
+                appState.scheduler.triggerOnceNow(notifyOnNewEvents = false)
+                callerCompletedNormally = true
+            }
+            withTimeout(2_000) { appState.events.first { it.isNotEmpty() } }
+
+            // Cancelling activeSyncJob via resetGroupCheckpoint must NOT cancel the caller loop or stop scheduler.
+            appState.resetGroupCheckpoint(room).join()
+            secondNoticeGate.complete(Unit)
+            schedulerCallerJob.join()
+
+            assertTrue(callerCompletedNormally)
+            assertFalse(schedulerCallerJob.isCancelled)
+            assertTrue(appState.scheduler.isRunning)
+            assertNull(checkpointStore.get(room))
+
+            // clearEventsAndCheckpoints preserves autoSyncEnabled = true and restarts the scheduler.
+            appState.clearEventsAndCheckpoints().join()
+            assertTrue(appState.scheduler.isRunning)
+            assertTrue(appState.events.value.isEmpty())
+        } finally {
+            appState.scheduler.stop()
+        }
     }
 }

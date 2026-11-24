@@ -8,6 +8,8 @@ import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmJsonUtils
+import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventDetailItemParser
 import com.wechatdigest.core.model.GroupConfig
 import com.wechatdigest.core.model.SyncCheckpoint
 import com.wechatdigest.core.model.WeChatMessage
@@ -19,8 +21,11 @@ import com.wechatdigest.storage.GroupConfigStore
 import com.wechatdigest.storage.SyncCheckpointStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Result of executing an end-to-end monitored chatroom sync pass. */
 sealed class SyncResult {
@@ -34,6 +39,15 @@ sealed class SyncResult {
     /** Sync could not run or all rooms failed before scanning any messages. */
     data class Failure(val message: String) : SyncResult()
 }
+
+/** Progress snapshot emitted while [SyncService.syncNow] scans and extracts notices across rooms. */
+data class SyncProgress(
+    val roomIndex: Int,
+    val totalRooms: Int,
+    val roomName: String,
+    val stageLabel: String,
+    val newEventsSoFar: Int
+)
 
 /**
  * Coordinates incremental message reads from WeChat SQLite shards, deterministic sender allowlists,
@@ -49,17 +63,30 @@ class SyncService(
     private companion object {
         const val MIN_MESSAGES_PER_SYNC = 1
         const val MAX_MESSAGES_PER_SYNC = 500
+        const val MAX_ROOM_LABEL_CHARS = 48
+        const val MAX_SYNC_FAILURE_MSG_CHARS = 320
     }
 
     /**
      * Scans all configured chatrooms in [settings] since their last saved checkpoints and persists newly
-     * extracted event cards, advancing checkpoints per room only on clean completion.
+     * extracted event cards incrementally as each card finishes, advancing checkpoints per room only on
+     * clean completion.
+     *
+     * @param onCardPersisted Optional callback invoked sequentially (on [Dispatchers.IO]) whenever a newly
+     *   synthesized card is committed cleanly to [eventCardStore] (duplicates suppressed via `dedupe_key`
+     *   do not trigger it). Exceptions inside UI callbacks are logged without rolling back persisted cards
+     *   or blocking checkpoint advancement.
+     * @param onProgress Optional callback invoked sequentially whenever room scanning/extraction progress advances.
      */
-    suspend fun syncNow(settings: AppSettings): SyncResult = withContext(Dispatchers.IO) {
+    suspend fun syncNow(
+        settings: AppSettings,
+        onCardPersisted: (suspend (EventCard) -> Unit)? = null,
+        onProgress: (suspend (SyncProgress) -> Unit)? = null
+    ): SyncResult = withContext(Dispatchers.IO) {
         validateSettings(settings)?.let { return@withContext SyncResult.Failure(it) }
 
-        val dataDir = File(settings.wechatDataDir)
-        val keysFile = if (settings.keysPath.isNotBlank()) File(settings.keysPath) else null
+        val dataDir = File(settings.wechatDataDir).canonicalFile
+        val keysFile = settings.keysPath.takeIf { it.isNotBlank() }?.let { File(it).canonicalFile }?.takeIf { it.isFile }
         val driver = WeChatDatabaseDriver(baseDir = dataDir, customKeysFile = keysFile)
         val contactRepo = WeChatContactRepository(driver)
         val attachmentResolver = WeChatAttachmentResolver(driver)
@@ -75,7 +102,9 @@ class SyncService(
         }
 
         var totalScanned = 0
-        var totalInserted = 0
+        val totalInsertedCounter = AtomicInteger(0)
+        val totalRooms = settings.monitoredRoomIds.size
+        val callbackMutex = Mutex()
         val errors = mutableListOf<String>()
 
         llmClientFactory(settings.llm).use { llmClient ->
@@ -83,19 +112,30 @@ class SyncService(
                 llmClient = llmClient,
                 maxConcurrency = EventExtractor.resolveConcurrencyForConfig(settings.llm)
             )
-            for (roomId in settings.monitoredRoomIds) {
-                val roomOutcome = syncRoom(roomId, settings, messageRepo, extractor, roomNamesMap[roomId].orEmpty())
+            settings.monitoredRoomIds.forEachIndexed { roomIdx, roomId ->
+                val roomOutcome = syncRoom(
+                    roomId = roomId,
+                    roomIndex = roomIdx + 1,
+                    totalRooms = totalRooms,
+                    settings = settings,
+                    messageRepo = messageRepo,
+                    extractor = extractor,
+                    roomDisplayName = roomNamesMap[roomId].orEmpty(),
+                    totalInsertedCounter = totalInsertedCounter,
+                    callbackMutex = callbackMutex,
+                    onCardPersisted = onCardPersisted,
+                    onProgress = onProgress
+                )
                 totalScanned += roomOutcome.scannedCount
-                totalInserted += roomOutcome.insertedCount
                 roomOutcome.errorMessage?.let { errors.add(it) }
             }
         }
 
         if (totalScanned == 0 && errors.isNotEmpty()) {
-            SyncResult.Failure(errors.joinToString("; "))
+            SyncResult.Failure(errors.joinToString("; ").take(MAX_SYNC_FAILURE_MSG_CHARS))
         } else {
             SyncResult.Success(
-                newEventsCount = totalInserted,
+                newEventsCount = totalInsertedCounter.get(),
                 totalScannedMessages = totalScanned,
                 roomErrors = errors.toList()
             )
@@ -104,7 +144,6 @@ class SyncService(
 
     private data class RoomSyncOutcome(
         val scannedCount: Int = 0,
-        val insertedCount: Int = 0,
         val errorMessage: String? = null
     )
 
@@ -124,15 +163,29 @@ class SyncService(
 
     private suspend fun syncRoom(
         roomId: String,
+        roomIndex: Int,
+        totalRooms: Int,
         settings: AppSettings,
         messageRepo: WeChatMessageRepository,
         extractor: EventExtractor,
-        roomDisplayName: String
+        roomDisplayName: String,
+        totalInsertedCounter: AtomicInteger,
+        callbackMutex: Mutex,
+        onCardPersisted: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (SyncProgress) -> Unit)?
     ): RoomSyncOutcome {
         var scannedInRoom = 0
+        val rawRoomLabel = roomDisplayName.ifBlank { roomId }
+        val roomLabel = EventDetailItemParser.sanitizeSingleLine(rawRoomLabel, MAX_ROOM_LABEL_CHARS)
+            .ifBlank { "Group $roomIndex" }
         return try {
+            notifyProgressSafely(
+                callbackMutex,
+                onProgress,
+                SyncProgress(roomIndex, totalRooms, roomLabel, "Scanning messages...", totalInsertedCounter.get())
+            )
             val batchLimit = settings.messagesPerSync.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
-            val checkpoint = syncCheckpointStore?.get(roomId)
+            val checkpoint = syncCheckpointStore?.getOrThrow(roomId)
             val rawMessages = if (checkpoint != null && checkpoint.lastLocalId > 0L) {
                 messageRepo.getMessagesSince(roomId, sinceLocalId = checkpoint.lastLocalId, limit = batchLimit)
             } else {
@@ -146,26 +199,33 @@ class SyncService(
             val senderFiltered = applySenderAllowlist(rawMessages, groupConfig)
             val substantive = MessageSanitizer.filterSubstantiveMessages(senderFiltered, settings.prefilter)
 
-            val insertedCount = if (substantive.isNotEmpty()) {
+            if (substantive.isNotEmpty()) {
                 extractAndPersistRoomEvents(
                     substantive = substantive,
                     roomId = roomId,
+                    roomIndex = roomIndex,
+                    totalRooms = totalRooms,
                     roomDisplayName = roomDisplayName,
+                    roomLabel = roomLabel,
                     settings = settings,
                     groupConfig = groupConfig,
-                    extractor = extractor
+                    extractor = extractor,
+                    totalInsertedCounter = totalInsertedCounter,
+                    callbackMutex = callbackMutex,
+                    onCardPersisted = onCardPersisted,
+                    onProgress = onProgress
                 )
-            } else {
-                0
             }
 
             advanceCheckpoint(roomId, maxLocalId)
-            RoomSyncOutcome(scannedCount = scannedInRoom, insertedCount = insertedCount)
+            RoomSyncOutcome(scannedCount = scannedInRoom)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            val err = "Error syncing room $roomId: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
+            val safeRoom = LlmJsonUtils.sanitizeLogMessage(roomId)
+            val detail = LlmJsonUtils.sanitizeLogMessage(e.message)
+            val err = "Error syncing room $safeRoom: $detail"
             System.err.println("[SyncService] $err")
-            RoomSyncOutcome(scannedCount = scannedInRoom, insertedCount = 0, errorMessage = err)
+            RoomSyncOutcome(scannedCount = scannedInRoom, errorMessage = err)
         }
     }
 
@@ -184,11 +244,18 @@ class SyncService(
     private suspend fun extractAndPersistRoomEvents(
         substantive: List<com.wechatdigest.core.model.WeChatMessage>,
         roomId: String,
+        roomIndex: Int,
+        totalRooms: Int,
         roomDisplayName: String,
+        roomLabel: String,
         settings: AppSettings,
         groupConfig: GroupConfig?,
-        extractor: EventExtractor
-    ): Int {
+        extractor: EventExtractor,
+        totalInsertedCounter: AtomicInteger,
+        callbackMutex: Mutex,
+        onCardPersisted: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (SyncProgress) -> Unit)?
+    ) {
         val effectiveRules = groupConfig?.customPrompt.orEmpty()
         val effectivePersona = groupConfig?.customPersona?.takeIf { it.isNotBlank() } ?: settings.userPersona
         val recentRoomCards = eventCardStore.listRecentByRoom(roomId, limit = 10)
@@ -201,7 +268,8 @@ class SyncService(
             substantive
         }
 
-        val events = extractor.extractEventsResult(
+        val dbWriteMutex = Mutex()
+        extractor.extractEventsResult(
             messages = preparedMessages,
             roomId = roomId,
             userPersona = effectivePersona,
@@ -209,10 +277,62 @@ class SyncService(
             customRules = effectiveRules,
             roomDisplayName = roomDisplayName,
             prefilterConfig = settings.prefilter,
-            recentRoomCards = recentRoomCards
+            recentRoomCards = recentRoomCards,
+            onCardReady = { card ->
+                val inserted = dbWriteMutex.withLock {
+                    eventCardStore.upsertOrThrow(listOf(card))
+                }
+                if (inserted > 0) {
+                    totalInsertedCounter.addAndGet(inserted)
+                    notifyCardPersistedSafely(callbackMutex, onCardPersisted, card)
+                }
+            },
+            onProgress = { stage, _, _ ->
+                notifyProgressSafely(
+                    callbackMutex,
+                    onProgress,
+                    SyncProgress(
+                        roomIndex = roomIndex,
+                        totalRooms = totalRooms,
+                        roomName = roomLabel,
+                        stageLabel = stage,
+                        newEventsSoFar = totalInsertedCounter.get()
+                    )
+                )
+            }
         ).getOrThrow()
+    }
 
-        return if (events.isNotEmpty()) eventCardStore.upsertOrThrow(events) else 0
+    private suspend fun notifyCardPersistedSafely(
+        callbackMutex: Mutex,
+        onCardPersisted: (suspend (EventCard) -> Unit)?,
+        card: EventCard
+    ) {
+        if (onCardPersisted == null) return
+        callbackMutex.withLock {
+            try {
+                onCardPersisted.invoke(card)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                System.err.println("[SyncService] Card notification error: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            }
+        }
+    }
+
+    private suspend fun notifyProgressSafely(
+        callbackMutex: Mutex,
+        onProgress: (suspend (SyncProgress) -> Unit)?,
+        progress: SyncProgress
+    ) {
+        if (onProgress == null) return
+        callbackMutex.withLock {
+            try {
+                onProgress.invoke(progress)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                System.err.println("[SyncService] Progress callback error: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            }
+        }
     }
 
     private fun enrichMessagesWithAttachmentPreviews(
@@ -248,7 +368,7 @@ class SyncService(
 
     private fun advanceCheckpoint(roomId: String, maxLocalId: Long) {
         val now = System.currentTimeMillis() / 1000
-        syncCheckpointStore?.save(
+        syncCheckpointStore?.saveOrThrow(
             SyncCheckpoint(
                 roomId = roomId,
                 lastLocalId = maxLocalId,

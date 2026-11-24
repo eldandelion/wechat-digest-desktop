@@ -27,7 +27,9 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -1368,5 +1370,79 @@ class SanitizationAndLlmTest {
         assertEquals(2, recovered.single().items.size)
         assertEquals(2, recovered.single().bullets.size)
         sourceRecoveryClient.close()
+    }
+
+    @Test
+    fun testEventExtractorStreamsCardsViaOnCardReadyBeforeSlowSiblingFinishesAndPreservesOrder() = runBlocking {
+        val msg1 = WeChatMessage(301L, 1794800000L, "p1", "Prof_A", "Slow notice: Submit final thesis PDF.", "Slow notice: Submit final thesis PDF.", false)
+        val msg2 = WeChatMessage(302L, 1794800010L, "p2", "Prof_B", "Fast notice: Seminar starts at 15:00 in Room 201.", "Fast notice: Seminar starts at 15:00 in Room 201.", false)
+
+        val slowChunkGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        var failSlow = false
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val json = when {
+                body.contains("Semantic Filter & Topic Chunker") ->
+                    """{"chunks":[{"topic":"Slow Topic","message_ids":[301],"category":"DEADLINE"},{"topic":"Fast Topic","message_ids":[302],"category":"NOTICE"}]}"""
+                body.contains("Rule & Substance Gatekeeper") ->
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                body.contains("Slow notice") -> {
+                    if (!failSlow) slowChunkGate.await()
+                    """{"is_relevant":true,"events":[{"title":"Slow First Notice","summary":"Submit final thesis PDF to department office.","category":"DEADLINE","priority":"IMPORTANT","source_message_ids":[301]}]}"""
+                }
+                else -> {
+                    """{"is_relevant":true,"events":[{"title":"Fast Second Notice","summary":"Seminar starts at 15:00 in Room 201.","category":"NOTICE","priority":"NORMAL","source_message_ids":[302]}]}"""
+                }
+            }
+            val payload = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), json)}}}]}"""
+            respond(payload, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val streamedTitles = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val progressStages = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val firstEmittedSignal = kotlinx.coroutines.CompletableDeferred<Unit>()
+        KtorLlmClient(LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, apiKey = "k"), engine).use { llmClient ->
+            val extractor = EventExtractor(llmClient = llmClient, maxConcurrency = 4)
+            val extractJob = this@runBlocking.async {
+                extractor.extractEventsResult(
+                    messages = listOf(msg1, msg2),
+                    roomId = "stream@chatroom",
+                    onCardReady = { card ->
+                        streamedTitles.add(card.title)
+                        firstEmittedSignal.complete(Unit)
+                    },
+                    onProgress = { stage, _, _ -> progressStages.add(stage) }
+                ).getOrThrow()
+            }
+            // Deterministic barrier: wait until fast card #2 emits before releasing slow card #1
+            withTimeout(2_000) { firstEmittedSignal.await() }
+            assertEquals(listOf("Fast Second Notice"), streamedTitles.toList())
+            slowChunkGate.complete(Unit)
+            val result = extractJob.await()
+
+            // Fast chunk emitted first via onCardReady, while returned list preserves chronological chunk order
+            assertEquals(listOf("Fast Second Notice", "Slow First Notice"), streamedTitles.toList())
+            assertEquals(listOf("Slow First Notice", "Fast Second Notice"), result.map { it.title })
+            assertTrue(progressStages.any { it.contains("Triaging") })
+            assertTrue(progressStages.any { it.contains("Extracting") })
+
+            // Failure inside onCardReady or onProgress fails extractEventsResult closed
+            failSlow = true
+            val failedCardCb = extractor.extractEventsResult(
+                messages = listOf(msg1, msg2),
+                roomId = "stream@chatroom",
+                onCardReady = { throw IllegalStateException("disk full") }
+            )
+            assertTrue(failedCardCb.isFailure)
+            assertTrue(failedCardCb.exceptionOrNull()?.message?.contains("disk full") == true)
+
+            val failedProgressCb = extractor.extractEventsResult(
+                messages = listOf(msg1, msg2),
+                roomId = "stream@chatroom",
+                onProgress = { _, _, _ -> throw IllegalStateException("progress boom") }
+            )
+            assertTrue(failedProgressCb.isFailure)
+            assertTrue(failedProgressCb.exceptionOrNull()?.message?.contains("progress boom") == true)
+        }
     }
 }

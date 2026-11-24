@@ -12,7 +12,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -24,6 +26,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Orchestrates the 3-pass AI extraction pipeline (Triage Chunker -> Batched Rule & Substance Gatekeeper ->
@@ -159,8 +162,9 @@ class EventExtractor(
     }
 
     /**
-     * Extracts event cards using Pass 1 triage, Pass 2 batched gatekeeper, Pass 3 synthesis, and
-     * conditional target-language repair, preserving failures so callers avoid advancing sync checkpoints.
+     * Extracts event cards using Pass 1 triage, Pass 2 batched gatekeeper, and per-chunk fused Pass 3
+     * synthesis + conditional target-language repair, optionally streaming finalized cards via [onCardReady]
+     * and reporting phase progress via [onProgress] while preserving ordered results and fail-closed errors.
      */
     suspend fun extractEventsResult(
         messages: List<WeChatMessage>,
@@ -170,7 +174,9 @@ class EventExtractor(
         customRules: String = "",
         roomDisplayName: String = "",
         prefilterConfig: PrefilterConfig = PrefilterConfig(),
-        recentRoomCards: List<EventCard> = emptyList()
+        recentRoomCards: List<EventCard> = emptyList(),
+        onCardReady: (suspend (EventCard) -> Unit)? = null,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)? = null
     ): Result<List<EventCard>> {
         val substantive = MessageSanitizer.filterSubstantiveMessages(messages, prefilterConfig)
         if (observer !== ExtractionObserver.NoOp) {
@@ -179,6 +185,8 @@ class EventExtractor(
         if (substantive.isEmpty()) return Result.success(emptyList())
 
         val semaphore = Semaphore(effectiveMaxConcurrency)
+        notifyProgress(onProgress, "Triaging messages...", 0, substantive.size)
+            .getOrElse { return Result.failure(it) }
         val discovered = runPass1Triage(substantive, userPersona, targetLanguage, customRules, recentRoomCards, semaphore)
             .getOrElse { return Result.failure(it) }
 
@@ -189,13 +197,25 @@ class EventExtractor(
         }
         if (consolidated.isEmpty()) return Result.success(emptyList())
 
+        notifyProgress(onProgress, "Filtering ${consolidated.size} candidate notice(s)...", 0, consolidated.size)
+            .getOrElse { return Result.failure(it) }
         val verified = runPass2Gatekeeper(consolidated, userPersona, customRules, semaphore)
             .getOrElse { return Result.failure(it) }
         if (verified.isEmpty()) return Result.success(emptyList())
 
-        val synthesized = runPass3Synthesis(verified, roomId, roomDisplayName, userPersona, targetLanguage, customRules, semaphore)
+        notifyProgress(onProgress, "Extracting ${verified.size} notice(s)...", 0, verified.size)
             .getOrElse { return Result.failure(it) }
-        return ensureCardsTranslated(synthesized, targetLanguage, semaphore)
+        return runPass3AndTranslateStreaming(
+            chunks = verified,
+            roomId = roomId,
+            roomDisplayName = roomDisplayName,
+            userPersona = userPersona,
+            targetLanguage = targetLanguage,
+            customRules = customRules,
+            semaphore = semaphore,
+            onCardReady = onCardReady,
+            onProgress = onProgress
+        )
     }
 
     private suspend fun <T, R> mapConcurrent(
@@ -325,20 +345,163 @@ class EventExtractor(
         return batchedPrompt to ExtractionPrompts.buildBatchedGatekeeperUserPrompt(indexed)
     }
 
-    private suspend fun runPass3Synthesis(
+    private suspend fun runPass3AndTranslateStreaming(
         chunks: List<NoticeChunk>,
         roomId: String,
         roomDisplayName: String,
         userPersona: String,
         targetLanguage: String,
         customRules: String,
-        semaphore: Semaphore
+        semaphore: Semaphore,
+        onCardReady: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
     ): Result<List<EventCard>> {
+        if (chunks.isEmpty()) return Result.success(emptyList())
         val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules)
-        return mapConcurrent(chunks, semaphore) { chunk ->
-            val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages))
-            synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName)
-        }.map { cards -> cards.filterNotNull() }
+        val translator = CardTranslator(llmClient)
+        val completedCount = AtomicInteger(0)
+        val progressMutex = Mutex()
+        val runner: suspend (NoticeChunk) -> Result<EventCard?> = { chunk ->
+            processChunkPass3AndTranslate(
+                chunk = chunk,
+                totalChunks = chunks.size,
+                systemPrompt = systemPrompt,
+                roomId = roomId,
+                roomDisplayName = roomDisplayName,
+                targetLanguage = targetLanguage,
+                translator = translator,
+                semaphore = semaphore,
+                completedCount = completedCount,
+                progressMutex = progressMutex,
+                onCardReady = onCardReady,
+                onProgress = onProgress
+            )
+        }
+        if (effectiveMaxConcurrency <= 1 || chunks.size == 1) {
+            return runPass3Sequential(chunks, runner)
+        }
+        return runPass3Concurrent(chunks, runner)
+    }
+
+    private suspend fun runPass3Sequential(
+        chunks: List<NoticeChunk>,
+        runner: suspend (NoticeChunk) -> Result<EventCard?>
+    ): Result<List<EventCard>> {
+        val sequential = ArrayList<EventCard>(chunks.size)
+        for (chunk in chunks) {
+            val card = runner(chunk).getOrElse { err ->
+                if (err is CancellationException) throw err
+                return Result.failure(err)
+            }
+            if (card != null) sequential.add(card)
+        }
+        return Result.success(sequential)
+    }
+
+    private suspend fun runPass3Concurrent(
+        chunks: List<NoticeChunk>,
+        runner: suspend (NoticeChunk) -> Result<EventCard?>
+    ): Result<List<EventCard>> {
+        return try {
+            val orderedCards = coroutineScope {
+                chunks.map { chunk ->
+                    async { runner(chunk).getOrElse { throw StageFailureException(it) } }
+                }.awaitAll().filterNotNull()
+            }
+            Result.success(orderedCards)
+        } catch (e: StageFailureException) {
+            currentCoroutineContext().ensureActive()
+            if (e.failureError is CancellationException) throw e.failureError
+            Result.failure(e.failureError)
+        }
+    }
+
+    private suspend fun processChunkPass3AndTranslate(
+        chunk: NoticeChunk,
+        totalChunks: Int,
+        systemPrompt: String,
+        roomId: String,
+        roomDisplayName: String,
+        targetLanguage: String,
+        translator: CardTranslator,
+        semaphore: Semaphore,
+        completedCount: AtomicInteger,
+        progressMutex: Mutex,
+        onCardReady: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
+    ): Result<EventCard?> {
+        val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages))
+        val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, semaphore)
+            .getOrElse { return Result.failure(it) }
+        if (synthesized == null) {
+            reportPass3Progress(progressMutex, onProgress, completedCount, totalChunks, incrementCompleted = true, translating = false)
+                .getOrElse { return Result.failure(it) }
+            return Result.success(null)
+        }
+
+        val initialCompliance = LanguageHelper.checkCardCompliance(synthesized, targetLanguage)
+        val finalCard = if (initialCompliance.isCompliant) {
+            if (observer !== ExtractionObserver.NoOp) {
+                observer.onLanguageGateResult(synthesized.title, initialCompliance, repairAttempts = 0, jsonRepairedCount = 0, finalCompliant = true)
+            }
+            synthesized
+        } else {
+            reportPass3Progress(progressMutex, onProgress, completedCount, totalChunks, incrementCompleted = false, translating = true)
+                .getOrElse { return Result.failure(it) }
+            repairSingleCard(translator, synthesized, initialCompliance, targetLanguage, semaphore)
+                .getOrElse { return Result.failure(it) }
+        }
+
+        if (onCardReady != null) {
+            try {
+                onCardReady.invoke(finalCard)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                return Result.failure(e)
+            }
+        }
+        reportPass3Progress(progressMutex, onProgress, completedCount, totalChunks, incrementCompleted = true, translating = false)
+            .getOrElse { return Result.failure(it) }
+        return Result.success(finalCard)
+    }
+
+    private suspend fun reportPass3Progress(
+        progressMutex: Mutex,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?,
+        completedCount: AtomicInteger,
+        totalChunks: Int,
+        incrementCompleted: Boolean,
+        translating: Boolean
+    ): Result<Unit> {
+        if (onProgress == null) {
+            if (incrementCompleted) completedCount.incrementAndGet()
+            return Result.success(Unit)
+        }
+        return progressMutex.withLock {
+            val done = if (incrementCompleted) completedCount.incrementAndGet() else completedCount.get()
+            val stage = if (translating) {
+                "Translating notice ($done/$totalChunks)..."
+            } else {
+                "Extracting notices ($done/$totalChunks)..."
+            }
+            notifyProgress(onProgress, stage, done, totalChunks)
+        }
+    }
+
+    private suspend fun notifyProgress(
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?,
+        stage: String,
+        completed: Int,
+        total: Int
+    ): Result<Unit> {
+        if (onProgress == null) return Result.success(Unit)
+        return try {
+            onProgress.invoke(stage, completed, total)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            Result.failure(e)
+        }
     }
 
     private suspend fun synthesizeChunkWithRetry(
@@ -346,7 +509,8 @@ class EventExtractor(
         userPrompt: String,
         chunk: NoticeChunk,
         roomId: String,
-        roomDisplayName: String
+        roomDisplayName: String,
+        semaphore: Semaphore
     ): Result<EventCard?> {
         val startMs = System.currentTimeMillis()
         var lastResult: Result<EventCard?> = Result.failure(IllegalStateException("Pass 3 did not execute"))
@@ -355,13 +519,14 @@ class EventExtractor(
 
         repeat(2) { attempt ->
             attemptsUsed = attempt + 1
-            val rawResponse = queryLlm("Pass 3 chunk synthesis", systemPrompt, userPrompt)
-                .getOrElse { err ->
-                    lastResult = Result.failure(err)
-                    val retryable = attempt == 0 && err.message.orEmpty().contains("Empty or missing message", ignoreCase = true)
-                    if (!retryable) return lastResult
-                    return@repeat
-                }
+            val rawResponse = semaphore.withPermit {
+                queryLlm("Pass 3 chunk synthesis", systemPrompt, userPrompt)
+            }.getOrElse { err ->
+                lastResult = Result.failure(err)
+                val retryable = attempt == 0 && err.message.orEmpty().contains("Empty or missing message", ignoreCase = true)
+                if (!retryable) return lastResult
+                return@repeat
+            }
             var jsonRepaired = false
             val parsed = parseChunkExtractionResult(rawResponse, chunk, roomId, roomDisplayName) { jsonRepaired = true }
             if (jsonRepaired) anyRepaired = true
@@ -386,67 +551,37 @@ class EventExtractor(
         return lastResult
     }
 
-    private suspend fun ensureCardsTranslated(
-        cards: List<EventCard>,
-        targetLanguage: String,
-        semaphore: Semaphore
-    ): Result<List<EventCard>> {
-        if (cards.isEmpty()) return Result.success(emptyList())
-        val complianceResults = cards.map { LanguageHelper.checkCardCompliance(it, targetLanguage) }
-        val nonCompliant = cards.mapIndexedNotNull { index, card ->
-            val compliance = complianceResults[index]
-            if (compliance.isCompliant) {
-                if (observer !== ExtractionObserver.NoOp) {
-                    observer.onLanguageGateResult(card.title, compliance, repairAttempts = 0, jsonRepairedCount = 0, finalCompliant = true)
-                }
-                null
-            } else {
-                Triple(index, card, compliance)
-            }
-        }
-        if (nonCompliant.isEmpty()) return Result.success(cards)
-
-        val translator = CardTranslator(llmClient)
-        val translatedPairs = mapConcurrent(nonCompliant, semaphore) { (index, card, initialCompliance) ->
-            repairSingleCard(translator, index, card, initialCompliance, targetLanguage)
-        }.getOrElse { return Result.failure(it) }
-
-        val updated = cards.toMutableList()
-        for ((index, repairedCard) in translatedPairs) {
-            updated[index] = repairedCard
-        }
-        return Result.success(updated.toList())
-    }
-
     private suspend fun repairSingleCard(
         translator: CardTranslator,
-        index: Int,
         originalCard: EventCard,
         initialCheck: LanguageComplianceResult,
-        targetLanguage: String
-    ): Result<Pair<Int, EventCard>> {
+        targetLanguage: String,
+        semaphore: Semaphore
+    ): Result<EventCard> {
         var jsonRepairedCount = 0
-        val firstAttempt = translator.translateCard(originalCard, targetLanguage) { jsonRepairedCount++ }
-            .getOrElse { return Result.failure(it) }
+        val firstAttempt = semaphore.withPermit {
+            translator.translateCard(originalCard, targetLanguage) { jsonRepairedCount++ }
+        }.getOrElse { return Result.failure(it) }
         val firstCheck = LanguageHelper.checkCardCompliance(firstAttempt, targetLanguage)
         if (firstCheck.isCompliant) {
             if (observer !== ExtractionObserver.NoOp) {
                 observer.onLanguageGateResult(firstAttempt.title, initialCheck, repairAttempts = 1, jsonRepairedCount = jsonRepairedCount, finalCompliant = true)
             }
-            return Result.success(index to firstAttempt)
+            return Result.success(firstAttempt)
         }
 
         val targetName = LanguageHelper.resolveTargetLanguageName(targetLanguage)
         val hint = "Your previous output still contained source-language text in fields: " +
             "${firstCheck.nonCompliantFields.joinToString()}. Translate ALL text strictly into $targetName."
-        val secondAttempt = translator.translateCard(firstAttempt, targetLanguage, correctiveHint = hint) { jsonRepairedCount++ }
-            .getOrElse { return Result.failure(it) }
+        val secondAttempt = semaphore.withPermit {
+            translator.translateCard(firstAttempt, targetLanguage, correctiveHint = hint) { jsonRepairedCount++ }
+        }.getOrElse { return Result.failure(it) }
         val secondCheck = LanguageHelper.checkCardCompliance(secondAttempt, targetLanguage)
         if (secondCheck.isCompliant) {
             if (observer !== ExtractionObserver.NoOp) {
                 observer.onLanguageGateResult(secondAttempt.title, initialCheck, repairAttempts = 2, jsonRepairedCount = jsonRepairedCount, finalCompliant = true)
             }
-            return Result.success(index to secondAttempt)
+            return Result.success(secondAttempt)
         }
 
         val bestCandidate = pickMostCompliantCard(
@@ -463,7 +598,7 @@ class EventExtractor(
             "[EventExtractor] Warning: Card '${bestCandidate.id}' still contains mixed script after 2 translation repairs " +
                 "(remaining: ${secondCheck.nonCompliantFields.joinToString()})."
         )
-        return Result.success(index to bestCandidate)
+        return Result.success(bestCandidate)
     }
 
     private fun pickMostCompliantCard(candidates: List<Pair<EventCard, Int>>): EventCard {
