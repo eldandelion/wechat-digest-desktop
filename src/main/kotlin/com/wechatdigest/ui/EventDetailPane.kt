@@ -1,5 +1,7 @@
 package com.wechatdigest.ui
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,7 +17,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -41,14 +42,17 @@ import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -144,10 +148,21 @@ internal fun EventDetailPane(
         }
     }
 
+    val scrollState = key(card.id) { rememberScrollState() }
+    val isScrolled by remember(scrollState) { derivedStateOf { scrollState.value > 0 } }
+    val topBarColor by animateColorAsState(
+        targetValue = if (isScrolled) {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        } else {
+            MaterialTheme.colorScheme.surface
+        }
+    )
+
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
             EventDetailTopBar(
                 card = card,
+                containerColor = topBarColor,
                 isTranslatingMessages = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
                 onAddToCalendar = onAddToCalendar,
@@ -158,6 +173,7 @@ internal fun EventDetailPane(
             EventDetailScrollContent(
                 card = card,
                 roomName = roomName,
+                scrollState = scrollState,
                 isTranslatingMessages = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
                 isRecheckingAttachments = isRecheckingAttachments,
@@ -188,37 +204,71 @@ internal fun EventDetailPane(
 @Composable
 private fun EventDetailTopBar(
     card: EventCard,
+    containerColor: Color,
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
     onAddToCalendar: () -> Unit,
     onTranslateAction: () -> Unit,
     onRequestDelete: () -> Unit,
-    onToggleRead: () -> Unit
+    onToggleRead: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp),
-        horizontalArrangement = Arrangement.End,
-        verticalAlignment = Alignment.CenterVertically
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = containerColor
     ) {
-        if (!card.eventDate.isNullOrBlank()) {
-            IconButton(onClick = onAddToCalendar) {
-                Icon(Icons.Default.CalendarToday, contentDescription = "Add to Calendar", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 12.dp, top = 8.dp, end = 16.dp, bottom = 8.dp)
+                .height(50.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (!card.eventDate.isNullOrBlank()) {
+                TopBarTonalIconButton(onClick = onAddToCalendar) {
+                    Icon(Icons.Default.CalendarToday, contentDescription = "Add to Calendar", modifier = Modifier.size(20.dp))
+                }
+            }
+            if (card.sourceMessages.isNotBlank()) {
+                TranslationActionButton(
+                    isTranslating = isTranslatingMessages,
+                    isShowingTranslation = isShowingTranslation,
+                    onClick = onTranslateAction,
+                    buttonSizeDp = 40,
+                    iconSizeDp = 20,
+                    useSecondaryContainer = true
+                )
+            }
+            TopBarTonalIconButton(onClick = onRequestDelete) {
+                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete notice", modifier = Modifier.size(20.dp))
+            }
+            TopBarTonalIconButton(onClick = onToggleRead) {
+                Icon(
+                    imageVector = if (card.isRead) Icons.Default.MarkEmailUnread else Icons.Default.MarkEmailRead,
+                    contentDescription = if (card.isRead) "Mark as unread" else "Mark as read",
+                    modifier = Modifier.size(20.dp)
+                )
             }
         }
-        if (card.sourceMessages.isNotBlank()) {
-            TranslationActionButton(isTranslating = isTranslatingMessages, isShowingTranslation = isShowingTranslation, onClick = onTranslateAction, buttonSizeDp = 40, iconSizeDp = 24)
-        }
-        IconButton(onClick = onRequestDelete) {
-            Icon(Icons.Default.DeleteOutline, contentDescription = "Delete notice", tint = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        IconButton(onClick = onToggleRead) {
-            Icon(
-                imageVector = if (card.isRead) Icons.Default.MarkEmailUnread else Icons.Default.MarkEmailRead,
-                contentDescription = if (card.isRead) "Mark as unread" else "Mark as read",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
     }
+}
+
+@Composable
+private fun TopBarTonalIconButton(
+    onClick: () -> Unit,
+    contentColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    content: @Composable () -> Unit
+) {
+    FilledTonalIconButton(
+        onClick = onClick,
+        modifier = Modifier.size(40.dp),
+        colors = IconButtonDefaults.filledTonalIconButtonColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
+            contentColor = contentColor
+        ),
+        content = content
+    )
 }
 
 @Composable
@@ -227,21 +277,51 @@ private fun TranslationActionButton(
     isShowingTranslation: Boolean,
     onClick: () -> Unit,
     buttonSizeDp: Int,
-    iconSizeDp: Int
+    iconSizeDp: Int,
+    useSecondaryContainer: Boolean = false
 ) {
     if (isTranslating) {
-        Box(modifier = Modifier.size(buttonSizeDp.dp), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+        if (useSecondaryContainer) {
+            Surface(
+                modifier = Modifier.size(buttonSizeDp.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            Box(modifier = Modifier.size(buttonSizeDp.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            }
         }
         return
     }
-    IconButton(onClick = onClick, modifier = Modifier.size(buttonSizeDp.dp)) {
-        Icon(
-            imageVector = Icons.Default.Translate,
-            contentDescription = if (isShowingTranslation) "Show original groupchat message" else "Translate groupchat message",
-            modifier = Modifier.size(iconSizeDp.dp),
-            tint = if (isShowingTranslation) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-        )
+    if (useSecondaryContainer) {
+        TopBarTonalIconButton(
+            onClick = onClick,
+            contentColor = if (isShowingTranslation) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+        ) {
+            Icon(
+                imageVector = Icons.Default.Translate,
+                contentDescription = if (isShowingTranslation) "Show original groupchat message" else "Translate groupchat message",
+                modifier = Modifier.size(iconSizeDp.dp)
+            )
+        }
+    } else {
+        IconButton(onClick = onClick, modifier = Modifier.size(buttonSizeDp.dp)) {
+            Icon(
+                imageVector = Icons.Default.Translate,
+                contentDescription = if (isShowingTranslation) "Show original groupchat message" else "Translate groupchat message",
+                modifier = Modifier.size(iconSizeDp.dp),
+                tint = if (isShowingTranslation) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 
@@ -249,6 +329,7 @@ private fun TranslationActionButton(
 private fun EventDetailScrollContent(
     card: EventCard,
     roomName: String,
+    scrollState: ScrollState,
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
     isRecheckingAttachments: Boolean,
@@ -266,7 +347,7 @@ private fun EventDetailScrollContent(
     val priorityContainer = PriorityColors.getContainerColor(card.priority, isDark)
 
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 16.dp, bottom = 84.dp)
+        modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(start = 12.dp, top = 8.dp, end = 16.dp, bottom = 84.dp)
     ) {
         EventDetailTitleRow(card = card, priorityColor = priorityColor, priorityContainer = priorityContainer, onToggleStar = onToggleStar)
         Spacer(Modifier.height(16.dp))
@@ -316,7 +397,8 @@ private fun EventDetailTitleRow(
                 DetailBadgeChip(text = formatPriorityLabel(card.priority), containerColor = priorityContainer, textColor = priorityColor)
                 DetailBadgeChip(text = formatCategoryLabel(card.category), containerColor = MaterialTheme.colorScheme.surfaceContainerHigh, textColor = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (!card.eventDate.isNullOrBlank()) {
-                    DetailBadgeChip(text = card.eventDate, containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f), textColor = MaterialTheme.colorScheme.onPrimaryContainer)
+                    val formattedEventDate = remember(card.eventDate) { formatEventDateLabel(card.eventDate) }
+                    DetailBadgeChip(text = formattedEventDate, containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f), textColor = MaterialTheme.colorScheme.onPrimaryContainer)
                 }
             }
         }
@@ -401,7 +483,6 @@ private fun EventDetailSenderRow(card: EventCard, roomName: String, priorityColo
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun EventDetailSectionCard(
     section: EventSection,
@@ -418,17 +499,21 @@ private fun EventDetailSectionCard(
     if (safeHeading.isBlank() && resolved.items.isEmpty() && resolved.remainingContent.isBlank()) {
         return
     }
-    Column(
-        modifier = Modifier
+    val hasBulletCards = resolved.items.isNotEmpty()
+    val sectionContainerModifier = if (hasBulletCards) {
+        Modifier.fillMaxWidth()
+    } else {
+        Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerLowest)
             .padding(horizontal = 18.dp, vertical = 14.dp)
-    ) {
+    }
+    Column(modifier = sectionContainerModifier) {
         val hasHeaderRow = safeHeading.isNotBlank() || canEnrichWithAi
         if (hasHeaderRow) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = if (hasBulletCards) Modifier.fillMaxWidth().padding(horizontal = 4.dp) else Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -461,50 +546,58 @@ private fun EventDetailSectionCard(
                 }
             }
         }
-        if (resolved.items.isNotEmpty()) {
+        if (hasBulletCards) {
             if (hasHeaderRow) Spacer(Modifier.height(8.dp))
-            FlowRow(
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                resolved.items.forEach { item ->
-                    DetailMetadataTile(item = item)
+                resolved.items.forEachIndexed { index, item ->
+                    DetailMetadataRow(
+                        item = item,
+                        shape = segmentedItemShape(index = index, totalCount = resolved.items.size)
+                    )
                 }
             }
         }
         if (resolved.remainingContent.isNotBlank()) {
             when {
-                resolved.items.isNotEmpty() -> Spacer(Modifier.height(10.dp))
+                hasBulletCards -> Spacer(Modifier.height(10.dp))
                 hasHeaderRow -> Spacer(Modifier.height(4.dp))
             }
             Text(
                 text = resolved.remainingContent,
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = if (hasBulletCards) Modifier.padding(horizontal = 4.dp) else Modifier
             )
         }
     }
 }
 
 @Composable
-private fun DetailMetadataTile(item: EventDetailItem) {
+private fun DetailMetadataRow(
+    item: EventDetailItem,
+    shape: RoundedCornerShape
+) {
     val visuals = detailItemVisuals(item)
     val labelText = item.label.ifBlank { EventDetailItemParser.defaultLabel(item.kind) }
 
     Surface(
         modifier = Modifier
-            .widthIn(min = 124.dp, max = 380.dp)
+            .fillMaxWidth()
             .semantics(mergeDescendants = true) {},
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceContainerLowest
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Surface(
-                modifier = Modifier.size(28.dp),
+                modifier = Modifier.size(36.dp),
                 shape = CircleShape,
                 color = visuals.badgeContainerColor
             ) {
@@ -512,16 +605,17 @@ private fun DetailMetadataTile(item: EventDetailItem) {
                     Icon(
                         imageVector = visuals.icon,
                         contentDescription = null,
-                        modifier = Modifier.size(15.dp),
+                        modifier = Modifier.size(18.dp),
                         tint = visuals.badgeIconColor
                     )
                 }
             }
-            Spacer(Modifier.width(8.dp))
-            Column {
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = labelText,
-                    style = MaterialTheme.typography.labelSmall.copy(lineHeight = MaterialTheme.typography.labelSmall.fontSize),
+                    style = MaterialTheme.typography.labelMedium.copy(lineHeight = MaterialTheme.typography.labelMedium.fontSize),
+                    fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -529,8 +623,7 @@ private fun DetailMetadataTile(item: EventDetailItem) {
                 Spacer(Modifier.height(2.dp))
                 Text(
                     text = item.value,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
@@ -546,18 +639,37 @@ private fun EventDetailSourceMessagesBox(
     onTranslateAction: () -> Unit
 ) {
     val activeText = if (isShowingTranslation) card.translatedSourceMessages else card.sourceMessages
-    Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceContainerLowest).padding(16.dp)) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
                 text = if (isShowingTranslation) "Source Messages (Translated)" else "Source Messages",
-                style = MaterialTheme.typography.labelMedium,
+                style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
             )
-            TranslationActionButton(isTranslating = isTranslatingMessages, isShowingTranslation = isShowingTranslation, onClick = onTranslateAction, buttonSizeDp = 28, iconSizeDp = 16)
+            TranslationActionButton(
+                isTranslating = isTranslatingMessages,
+                isShowingTranslation = isShowingTranslation,
+                onClick = onTranslateAction,
+                buttonSizeDp = 28,
+                iconSizeDp = 16
+            )
         }
-        Spacer(Modifier.height(6.dp))
-        Text(text = activeText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(8.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerLowest)
+                .padding(horizontal = 18.dp, vertical = 14.dp)
+        ) {
+            Text(text = activeText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 

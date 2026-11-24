@@ -38,6 +38,11 @@ import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.GroupChat
 import java.awt.Cursor
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 internal data class GroupFilterOption(
@@ -57,6 +62,40 @@ internal fun formatPriorityLabel(priority: EventPriority): String =
 
 internal fun formatCategoryLabel(category: EventCategory): String =
     category.name.lowercase(Locale.ROOT).replaceFirstChar { it.titlecase(Locale.ROOT) }
+
+private val eventDateOnlyDisplayFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy", Locale.ENGLISH)
+private val eventDateTimeDisplayFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy • HH:mm", Locale.ENGLISH)
+private val inlineIsoDateTimeSeparatorRegex = Regex("""(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}(?::\d{2})?)""")
+
+/**
+ * Formats an ISO-8601 [rawDate] string (e.g. `2026-11-25T15:30:00` or `2026-11-25`) into a
+ * human-readable badge label while preserving unparseable fallback text cleanly without a raw `T`.
+ */
+internal fun formatEventDateLabel(rawDate: String): String {
+    val trimmed = rawDate.trim()
+    if (trimmed.isEmpty()) return ""
+
+    runCatching { LocalDate.parse(trimmed) }.getOrNull()?.let { date ->
+        return eventDateOnlyDisplayFormatter.format(date)
+    }
+
+    val normalized = trimmed.replace(' ', 'T')
+    val localDateTime = runCatching {
+        when {
+            normalized.length == 16 -> LocalDateTime.parse("$normalized:00")
+            normalized.contains('.') -> LocalDateTime.parse(normalized.substringBefore('.'))
+            else -> LocalDateTime.parse(normalized)
+        }
+    }.getOrNull() ?: runCatching {
+        OffsetDateTime.parse(normalized).atZoneSameInstant(ZoneId.systemDefault()).toLocalDateTime()
+    }.getOrNull()
+
+    if (localDateTime != null) {
+        return eventDateTimeDisplayFormatter.format(localDateTime)
+    }
+
+    return trimmed.replace(inlineIsoDateTimeSeparatorRegex, "$1 $2")
+}
 
 internal fun resolveRoomDisplayName(roomNamesMap: Map<String, String>, card: EventCard): String =
     roomNamesMap[card.sourceRoomId]?.ifBlank { null }

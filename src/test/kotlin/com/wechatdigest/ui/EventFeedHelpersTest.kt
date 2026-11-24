@@ -168,4 +168,14 @@ class EventFeedHelpersTest {
         assertEquals("18 KB", formatFileSizeLabel(18_432L))
         assertEquals("1.8 MB", formatFileSizeLabel(1_887_436L))
     }
+
+    @Test
+    fun `formatEventDateLabel formats ISO dates and datetimes without raw T separator`() {
+        assertEquals("", formatEventDateLabel("   "))
+        assertEquals("Nov 25, 2026 • 15:30", formatEventDateLabel("2026-11-25T15:30:00"))
+        assertEquals("Nov 25, 2026 • 15:30", formatEventDateLabel("2026-11-25T15:30"))
+        assertEquals("Nov 25, 2026 • 15:30", formatEventDateLabel("2026-11-25 15:30:00.123"))
+        assertEquals("Nov 25, 2026", formatEventDateLabel("2026-11-25"))
+        assertEquals("2026-11-25 15:30 (Room 302)", formatEventDateLabel("2026-11-25T15:30 (Room 302)"))
+    }
 }
