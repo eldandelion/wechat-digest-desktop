@@ -1,6 +1,12 @@
 package com.wechatdigest.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -62,6 +68,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -257,15 +266,19 @@ private fun EventDetailTopBar(
 @Composable
 private fun TopBarTonalIconButton(
     onClick: () -> Unit,
+    enabled: Boolean = true,
     contentColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     content: @Composable () -> Unit
 ) {
     FilledTonalIconButton(
         onClick = onClick,
+        enabled = enabled,
         modifier = Modifier.size(40.dp),
         colors = IconButtonDefaults.filledTonalIconButtonColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
-            contentColor = contentColor
+            contentColor = contentColor,
+            disabledContainerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.30f),
+            disabledContentColor = contentColor
         ),
         content = content
     )
@@ -280,46 +293,35 @@ private fun TranslationActionButton(
     iconSizeDp: Int,
     useSecondaryContainer: Boolean = false
 ) {
-    if (isTranslating) {
-        if (useSecondaryContainer) {
-            Surface(
-                modifier = Modifier.size(buttonSizeDp.dp),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        } else {
-            Box(modifier = Modifier.size(buttonSizeDp.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-            }
-        }
-        return
+    val iconTint = when {
+        isTranslating -> MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+        isShowingTranslation -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val description = when {
+        isTranslating -> "Translating groupchat message"
+        isShowingTranslation -> "Show original groupchat message"
+        else -> "Translate groupchat message"
     }
     if (useSecondaryContainer) {
         TopBarTonalIconButton(
             onClick = onClick,
-            contentColor = if (isShowingTranslation) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            enabled = !isTranslating,
+            contentColor = iconTint
         ) {
             Icon(
                 imageVector = Icons.Default.Translate,
-                contentDescription = if (isShowingTranslation) "Show original groupchat message" else "Translate groupchat message",
+                contentDescription = description,
                 modifier = Modifier.size(iconSizeDp.dp)
             )
         }
     } else {
-        IconButton(onClick = onClick, modifier = Modifier.size(buttonSizeDp.dp)) {
+        IconButton(onClick = onClick, enabled = !isTranslating, modifier = Modifier.size(buttonSizeDp.dp)) {
             Icon(
                 imageVector = Icons.Default.Translate,
-                contentDescription = if (isShowingTranslation) "Show original groupchat message" else "Translate groupchat message",
+                contentDescription = description,
                 modifier = Modifier.size(iconSizeDp.dp),
-                tint = if (isShowingTranslation) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                tint = iconTint
             )
         }
     }
@@ -632,6 +634,32 @@ private fun DetailMetadataRow(
 }
 
 @Composable
+private fun Modifier.shimmerOverlay(enabled: Boolean, highlightColor: Color): Modifier {
+    if (!enabled) return this
+    val transition = rememberInfiniteTransition()
+    val progress by transition.animateFloat(
+        initialValue = -0.6f,
+        targetValue = 1.6f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1250, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        )
+    )
+    return this.drawWithContent {
+        drawContent()
+        val bandWidth = size.width * 0.55f
+        val startX = (size.width * progress) - bandWidth * 0.5f
+        drawRect(
+            brush = Brush.linearGradient(
+                colors = listOf(Color.Transparent, highlightColor, Color.Transparent),
+                start = Offset(startX, 0f),
+                end = Offset(startX + bandWidth, size.height)
+            )
+        )
+    }
+}
+
+@Composable
 private fun EventDetailSourceMessagesBox(
     card: EventCard,
     isTranslatingMessages: Boolean,
@@ -639,6 +667,16 @@ private fun EventDetailSourceMessagesBox(
     onTranslateAction: () -> Unit
 ) {
     val activeText = if (isShowingTranslation) card.translatedSourceMessages else card.sourceMessages
+    val headingText = when {
+        isTranslatingMessages -> "Source Messages (Translating…)"
+        isShowingTranslation -> "Source Messages (Translated)"
+        else -> "Source Messages"
+    }
+    val textColor = if (isTranslatingMessages) {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
@@ -646,7 +684,7 @@ private fun EventDetailSourceMessagesBox(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = if (isShowingTranslation) "Source Messages (Translated)" else "Source Messages",
+                text = headingText,
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface,
@@ -666,9 +704,13 @@ private fun EventDetailSourceMessagesBox(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(16.dp))
                 .background(MaterialTheme.colorScheme.surfaceContainerLowest)
+                .shimmerOverlay(
+                    enabled = isTranslatingMessages,
+                    highlightColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
+                )
                 .padding(horizontal = 18.dp, vertical = 14.dp)
         ) {
-            Text(text = activeText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(text = activeText, style = MaterialTheme.typography.bodySmall, color = textColor)
         }
     }
 }
