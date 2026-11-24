@@ -35,7 +35,10 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material.icons.outlined.Flag
+import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.MarkEmailUnread
+import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -63,6 +66,7 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.EventSortOrder
 import com.wechatdigest.core.model.EventCard
@@ -105,13 +109,14 @@ internal fun EventListPane(
     onToggleStarEvent: (String) -> Unit,
     isSyncing: Boolean,
     syncStatusTextFlow: StateFlow<String?> = EmptySyncStatusFlow,
+    contentEndPadding: Dp = 16.dp,
     onTriggerSync: () -> Unit
 ) {
     val listState = rememberLazyListState()
     val isFabExpanded = rememberFabExpandedState(listState)
 
     Box(modifier = modifier) {
-        Column(modifier = Modifier.fillMaxSize().padding(start = 16.dp, top = 8.dp, end = 12.dp)) {
+        Column(modifier = Modifier.fillMaxSize().padding(start = 16.dp, top = 8.dp, end = contentEndPadding)) {
             PillSearchBar(query = searchQuery, onQueryChange = onSearchQueryChange, placeholder = "Search events", modifier = Modifier.fillMaxWidth())
             // FilterChip has 8.dp built-in vertical touch padding above and below its pill, so 8.dp spacers give 16.dp visual gaps on both sides.
             Spacer(Modifier.height(8.dp))
@@ -224,7 +229,13 @@ private fun EventListFilterBar(
         DropdownFilterChip(
             selected = selectedFilter != null,
             label = if (selectedFilter == null) "Priority" else "Priority: ${formatPriorityLabel(selectedFilter)}",
-            leadingIcon = { Icon(Icons.Default.Flag, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (selectedFilter != null) Icons.Filled.Flag else Icons.Outlined.Flag,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+            },
             items = priorityItems,
             isItemSelected = { it == selectedFilter },
             onSelect = onSelectPriority
@@ -232,7 +243,13 @@ private fun EventListFilterBar(
         DropdownFilterChip(
             selected = selectedGroupId != null,
             label = if (selectedGroupId == null) "Group" else "Group: ${selectedGroupName.orEmpty()}",
-            leadingIcon = { Icon(Icons.Default.Group, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (selectedGroupId != null) Icons.Filled.Group else Icons.Outlined.Group,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+            },
             items = groupItems,
             isItemSelected = { it == selectedGroupId },
             onSelect = onSelectGroup
@@ -240,7 +257,13 @@ private fun EventListFilterBar(
         DropdownFilterChip(
             selected = sortOrder != EventSortOrder.NEWEST_FIRST,
             label = sortOrder.label,
-            leadingIcon = { Icon(Icons.Default.SwapVert, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (sortOrder != EventSortOrder.NEWEST_FIRST) Icons.Filled.SwapVert else Icons.Outlined.SwapVert,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+            },
             items = sortItems,
             isItemSelected = { it == sortOrder },
             onSelect = onSelectSortOrder

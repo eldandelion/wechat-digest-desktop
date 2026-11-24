@@ -31,6 +31,7 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppState
 import com.wechatdigest.app.EventSortOrder
@@ -226,20 +227,58 @@ fun EventFeedScreen(appState: AppState) {
 
         if (totalWidth >= 680.dp) {
             Row(modifier = Modifier.fillMaxSize()) {
-                EventListHost(appState, allEvents, visibleEvents, roomNamesMap, groupOptions, selectedCard?.id, isSyncing, Modifier.width(totalWidth * splitFraction).fillMaxHeight())
+                EventListHost(
+                    appState = appState,
+                    allEvents = allEvents,
+                    visibleEvents = visibleEvents,
+                    roomNamesMap = roomNamesMap,
+                    groupOptions = groupOptions,
+                    selectedEventId = selectedCard?.id,
+                    isSyncing = isSyncing,
+                    contentEndPadding = 12.dp,
+                    modifier = Modifier.width(totalWidth * splitFraction).fillMaxHeight()
+                )
                 SplitResizeHandle { deltaPx -> splitFraction = (splitFraction + deltaPx / totalWidthPx).coerceIn(0.28f, 0.65f) }
                 Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                     if (selectedCard == null) {
                         EventDetailEmptyState()
                     } else {
-                        EventDetailHost(appState, selectedCard, selectedIndex, visibleEvents, roomNamesMap) { cardPendingDelete = selectedCard }
+                        EventDetailHost(
+                            appState = appState,
+                            selectedCard = selectedCard,
+                            selectedIndex = selectedIndex,
+                            visibleEvents = visibleEvents,
+                            roomNamesMap = roomNamesMap,
+                            contentStartPadding = 12.dp,
+                            onNavigateBack = null,
+                            onRequestDelete = { cardPendingDelete = selectedCard }
+                        )
                     }
                 }
             }
         } else if (selectedCard == null) {
-            EventListHost(appState, allEvents, visibleEvents, roomNamesMap, groupOptions, null, isSyncing, Modifier.fillMaxSize())
+            EventListHost(
+                appState = appState,
+                allEvents = allEvents,
+                visibleEvents = visibleEvents,
+                roomNamesMap = roomNamesMap,
+                groupOptions = groupOptions,
+                selectedEventId = null,
+                isSyncing = isSyncing,
+                contentEndPadding = 16.dp,
+                modifier = Modifier.fillMaxSize()
+            )
         } else {
-            EventDetailHost(appState, selectedCard, selectedIndex, visibleEvents, roomNamesMap) { cardPendingDelete = selectedCard }
+            EventDetailHost(
+                appState = appState,
+                selectedCard = selectedCard,
+                selectedIndex = selectedIndex,
+                visibleEvents = visibleEvents,
+                roomNamesMap = roomNamesMap,
+                contentStartPadding = 16.dp,
+                onNavigateBack = { appState.selectEvent(null) },
+                onRequestDelete = { cardPendingDelete = selectedCard }
+            )
         }
 
         SyncTopProgressBar(isSyncing = isSyncing)
@@ -274,6 +313,7 @@ private fun EventListHost(
     groupOptions: List<GroupFilterOption>,
     selectedEventId: String?,
     isSyncing: Boolean,
+    contentEndPadding: Dp,
     modifier: Modifier
 ) {
     val selectedFilter by appState.priorityFilter.collectAsState()
@@ -310,6 +350,7 @@ private fun EventListHost(
         onToggleStarEvent = { appState.toggleStarred(it) },
         isSyncing = isSyncing,
         syncStatusTextFlow = appState.syncStatusText,
+        contentEndPadding = contentEndPadding,
         onTriggerSync = { if (!isSyncing) appState.triggerSync() }
     )
 }
@@ -321,6 +362,8 @@ private fun EventDetailHost(
     selectedIndex: Int,
     visibleEvents: List<EventCard>,
     roomNamesMap: Map<String, String>,
+    contentStartPadding: Dp,
+    onNavigateBack: (() -> Unit)?,
     onRequestDelete: () -> Unit
 ) {
     val translatingCardIds by appState.translatingCardIds.collectAsState()
@@ -347,7 +390,9 @@ private fun EventDetailHost(
         onToggleStar = { appState.toggleStarred(selectedCard.id) },
         onToggleRead = { if (selectedCard.isRead) appState.markUnread(selectedCard.id) else appState.markRead(selectedCard.id) },
         onAddToCalendar = { appState.exportToCalendar(selectedCard) },
-        onRequestDelete = onRequestDelete
+        onRequestDelete = onRequestDelete,
+        contentStartPadding = contentStartPadding,
+        onNavigateBack = onNavigateBack
     )
 }
 

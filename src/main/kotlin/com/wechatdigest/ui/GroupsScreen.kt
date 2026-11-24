@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -74,7 +76,7 @@ fun GroupsScreen(appState: AppState) {
     val canScan = !isLoading && settings.wechatDataDir.isNotBlank()
 
     Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize().padding(start = 24.dp, top = 8.dp, end = 24.dp)) {
+        Column(modifier = Modifier.fillMaxSize().padding(start = 16.dp, top = 8.dp, end = 16.dp)) {
             PillSearchBar(query = query, onQueryChange = { appState.groupSearchQuery.value = it }, placeholder = "Search groups", modifier = Modifier.fillMaxWidth())
             if (settings.wechatDataDir.isBlank()) {
                 Spacer(Modifier.height(8.dp))
@@ -101,7 +103,7 @@ fun GroupsScreen(appState: AppState) {
         if (isLoading) {
             LinearProgressIndicator(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter))
         }
-        GroupsScanFab(isLoading = isLoading, canScan = canScan, onScan = { appState.refreshRooms() }, modifier = Modifier.align(Alignment.BottomEnd).padding(24.dp))
+        GroupsScanFab(isLoading = isLoading, canScan = canScan, onScan = { appState.refreshRooms() }, modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp))
         editingRoom?.let { targetRoom ->
             val rememberedLoadMembers = remember(targetRoom.roomId) { suspend { appState.loadRoomMembers(targetRoom.roomId) } }
             GroupRuleDialog(
@@ -157,13 +159,25 @@ private fun GroupsFilterChipsRow(totalRooms: Int, selectedCount: Int, showSelect
         FilterChip(
             selected = !showSelectedOnly,
             onClick = { onSelectMode(false) },
-            leadingIcon = { Icon(Icons.Default.Group, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (!showSelectedOnly) Icons.Filled.Group else Icons.Outlined.Group,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+            },
             label = { Text("All ($totalRooms)") }
         )
         FilterChip(
             selected = showSelectedOnly,
             onClick = { onSelectMode(true) },
-            leadingIcon = { Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (showSelectedOnly) Icons.Filled.CheckCircle else Icons.Outlined.CheckCircle,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+            },
             label = { Text("Selected ($selectedCount)") }
         )
     }

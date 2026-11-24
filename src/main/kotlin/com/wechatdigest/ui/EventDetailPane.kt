@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.EventNote
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -75,6 +76,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
@@ -133,7 +135,9 @@ internal fun EventDetailPane(
     onAddToCalendar: () -> Unit,
     onRequestDelete: () -> Unit,
     isEnrichingSections: Boolean = false,
-    onEnrichSections: (Int?) -> Unit = {}
+    onEnrichSections: (Int?) -> Unit = {},
+    contentStartPadding: Dp = 16.dp,
+    onNavigateBack: (() -> Unit)? = null
 ) {
     var showTranslatedMessages by remember(card.id) { mutableStateOf(false) }
     var autoRevealTranslation by remember(card.id) { mutableStateOf(false) }
@@ -172,6 +176,8 @@ internal fun EventDetailPane(
             EventDetailTopBar(
                 card = card,
                 containerColor = topBarColor,
+                contentStartPadding = contentStartPadding,
+                onNavigateBack = onNavigateBack,
                 isTranslatingMessages = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
                 onAddToCalendar = onAddToCalendar,
@@ -183,6 +189,7 @@ internal fun EventDetailPane(
                 card = card,
                 roomName = roomName,
                 scrollState = scrollState,
+                contentStartPadding = contentStartPadding,
                 isTranslatingMessages = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
                 isRecheckingAttachments = isRecheckingAttachments,
@@ -214,6 +221,8 @@ internal fun EventDetailPane(
 private fun EventDetailTopBar(
     card: EventCard,
     containerColor: Color,
+    contentStartPadding: Dp,
+    onNavigateBack: (() -> Unit)?,
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
     onAddToCalendar: () -> Unit,
@@ -229,11 +238,21 @@ private fun EventDetailTopBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 12.dp, top = 8.dp, end = 16.dp, bottom = 8.dp)
+                .padding(start = contentStartPadding, top = 8.dp, end = 16.dp, bottom = 8.dp)
                 .height(50.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            if (onNavigateBack != null) {
+                TopBarTonalIconButton(onClick = onNavigateBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back to events",
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.weight(1f))
             if (!card.eventDate.isNullOrBlank()) {
                 TopBarTonalIconButton(onClick = onAddToCalendar) {
                     Icon(Icons.Default.CalendarToday, contentDescription = "Add to Calendar", modifier = Modifier.size(20.dp))
@@ -332,6 +351,7 @@ private fun EventDetailScrollContent(
     card: EventCard,
     roomName: String,
     scrollState: ScrollState,
+    contentStartPadding: Dp,
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
     isRecheckingAttachments: Boolean,
@@ -349,7 +369,7 @@ private fun EventDetailScrollContent(
     val priorityContainer = PriorityColors.getContainerColor(card.priority, isDark)
 
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(start = 12.dp, top = 8.dp, end = 16.dp, bottom = 84.dp)
+        modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(start = contentStartPadding, top = 8.dp, end = 16.dp, bottom = 84.dp)
     ) {
         EventDetailTitleRow(card = card, priorityColor = priorityColor, priorityContainer = priorityContainer, onToggleStar = onToggleStar)
         Spacer(Modifier.height(16.dp))

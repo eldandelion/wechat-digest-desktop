@@ -22,6 +22,9 @@ import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.SettingsBrightness
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.outlined.DarkMode
+import androidx.compose.material.icons.outlined.LightMode
+import androidx.compose.material.icons.outlined.SettingsBrightness
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -107,13 +110,14 @@ internal fun ThemeSettingsCard(
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AppThemeMode.entries.forEach { mode ->
+                val isSelected = selectedTheme == mode
                 val icon = when (mode) {
-                    AppThemeMode.SYSTEM -> Icons.Default.SettingsBrightness
-                    AppThemeMode.LIGHT -> Icons.Default.LightMode
-                    AppThemeMode.DARK -> Icons.Default.DarkMode
+                    AppThemeMode.SYSTEM -> if (isSelected) Icons.Filled.SettingsBrightness else Icons.Outlined.SettingsBrightness
+                    AppThemeMode.LIGHT -> if (isSelected) Icons.Filled.LightMode else Icons.Outlined.LightMode
+                    AppThemeMode.DARK -> if (isSelected) Icons.Filled.DarkMode else Icons.Outlined.DarkMode
                 }
                 FilterChip(
-                    selected = selectedTheme == mode,
+                    selected = isSelected,
                     onClick = { onSelectTheme(mode) },
                     leadingIcon = {
                         Icon(
@@ -398,7 +402,7 @@ internal fun PersonaLocalizationCard(
 @Composable
 internal fun LocalAppDataResetCard(onClearEventsClick: () -> Unit, onFactoryResetClick: () -> Unit) {
     SettingsSectionCard {
-        Text(text = "Local App Data & Reset", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+        Text(text = "Local App Data & Reset", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Text(
             text = "Clear WeChat Digest's own local SQLite database (app.db) and decrypted mirror cache. Your original WeChat messages and files are strictly read-only and will NEVER be modified.",
             style = MaterialTheme.typography.bodySmall,
