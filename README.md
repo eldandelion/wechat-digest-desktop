@@ -1,6 +1,6 @@
 # WeChat Digest Desktop
 
-A native macOS Compose Multiplatform desktop application that turns noisy WeChat group chats into a clean, structured, searchable digest of announcements, deadlines, and events — powered by local Ollama or OpenAI-compatible LLMs in strict read-only mode.
+A native macOS Compose Multiplatform desktop application that turns noisy WeChat group chats into a clean, structured, searchable digest of announcements, deadlines, and events — powered by built-in local GGUF models (`llama-server`), local Ollama, or OpenAI-compatible LLMs in strict read-only mode.
 
 ## Highlights
 
@@ -17,14 +17,14 @@ A native macOS Compose Multiplatform desktop application that turns noisy WeChat
 
 ## Installation (macOS)
 
-Download the latest **`WeChatDigest-1.0.0.dmg`** from the [GitHub Releases](../../releases) page, open the disk image, and drag **WeChatDigest.app** into your `/Applications` folder.
+Download the latest **`WeChatDigest-1.1.0.dmg`** from the [GitHub Releases](../../releases) page, open the disk image, and drag **WeChatDigest.app** into your `/Applications` folder.
 
 ## Building & Running from Source
 
 ### Prerequisites
 - macOS (Apple Silicon or Intel)
 - JDK 21
-- Optional: [Ollama](https://ollama.com) running locally (`http://localhost:11434`) or an OpenAI-compatible API endpoint
+- Optional: Built-in local GGUF model manager (downloads curated models & `llama-server` on first use), [Ollama](https://ollama.com) running locally (`http://localhost:11434`), or an OpenAI-compatible API endpoint
 
 ### Run in Development
 ```bash
@@ -35,7 +35,7 @@ Download the latest **`WeChatDigest-1.0.0.dmg`** from the [GitHub Releases](../.
 ```bash
 ./gradlew packageDmg
 ```
-The signed/packaged `.dmg` will be generated at `build/compose/binaries/main/dmg/WeChatDigest-1.0.0.dmg`.
+The signed/packaged `.dmg` will be generated at `build/compose/binaries/main/dmg/WeChatDigest-1.1.0.dmg`.
 
 ## Testing & AI Pipeline Evaluation Testbed
 

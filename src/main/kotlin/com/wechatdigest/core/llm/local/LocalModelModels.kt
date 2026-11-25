@@ -262,6 +262,7 @@ data class SystemHardwareInfo(
  */
 sealed class LocalModelDownloadState {
     data object Idle : LocalModelDownloadState()
+    data object Starting : LocalModelDownloadState()
     data class Downloading(
         val bytesDownloaded: Long,
         val totalBytes: Long,

@@ -654,7 +654,7 @@ private fun DetailMetadataRow(
 }
 
 @Composable
-private fun Modifier.shimmerOverlay(enabled: Boolean, highlightColor: Color): Modifier {
+internal fun Modifier.shimmerOverlay(enabled: Boolean, highlightColor: Color): Modifier {
     if (!enabled) return this
     val transition = rememberInfiniteTransition()
     val progress by transition.animateFloat(

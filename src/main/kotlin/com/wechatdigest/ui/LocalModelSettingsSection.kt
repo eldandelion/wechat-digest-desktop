@@ -283,6 +283,7 @@ private fun CatalogModelRow(
     onCancelDownload: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val isInitializing = downloadState is LocalModelDownloadState.Starting
     val containerColor = if (isSelected) {
         MaterialTheme.colorScheme.secondaryContainer
     } else {
@@ -295,6 +296,10 @@ private fun CatalogModelRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
+            .shimmerOverlay(
+                enabled = isInitializing,
+                highlightColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+            )
             .let { base -> if (isDownloaded && !isSelected) base.clickable(onClick = onSelect) else base }
     ) {
         Column(
@@ -365,7 +370,9 @@ private fun CatalogModelRow(
                 }
 
                 when {
-                    downloadState is LocalModelDownloadState.Downloading || downloadState is LocalModelDownloadState.Verifying -> {
+                    downloadState is LocalModelDownloadState.Starting ||
+                        downloadState is LocalModelDownloadState.Downloading ||
+                        downloadState is LocalModelDownloadState.Verifying -> {
                         OutlinedButton(onClick = onCancelDownload) {
                             Icon(Icons.Default.Cancel, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
@@ -414,6 +421,13 @@ private fun CatalogModelRow(
             }
 
             when (downloadState) {
+                is LocalModelDownloadState.Starting -> {
+                    Text(
+                        text = "Initializing download…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
                 is LocalModelDownloadState.Downloading -> {
                     LinearProgressIndicator(
                         progress = { downloadState.progressFraction },

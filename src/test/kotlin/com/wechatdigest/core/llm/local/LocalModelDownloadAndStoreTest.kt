@@ -411,4 +411,40 @@ class LocalModelDownloadAndStoreTest {
             server.stop(0)
         }
     }
+
+    @Test
+    fun `startDownload immediately emits Starting state before network initialization completes`() = kotlinx.coroutines.runBlocking {
+        val payload = validGgufPayload(256)
+        val spec = testSpec(payload)
+        val paths = LocalModelPaths(tempDir)
+        val store = LocalModelStore(paths)
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val mockEngine = MockEngine { request ->
+            if (request.method == HttpMethod.Head) {
+                gate.await()
+                respond(ByteReadChannel(""), HttpStatusCode.OK)
+            } else {
+                respond(
+                    content = ByteReadChannel(payload),
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentLength, payload.size.toString())
+                )
+            }
+        }
+
+        val manager = LocalModelDownloadManager(store, engine = mockEngine, minDiskBufferBytes = 0L)
+        val pausedScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default
+        )
+        val job = manager.startDownload(pausedScope, spec, LocalModelMirror.HF_OFFICIAL)
+        // Synchronous Starting state must be visible immediately after startDownload returns.
+        assertEquals(LocalModelDownloadState.Starting, manager.downloadStates.value[spec.id])
+
+        // Cancelling during Starting must cleanly clear download state back to idle/absent.
+        manager.cancelDownload(spec.id)
+        job.join()
+        assertFalse(spec.id in manager.downloadStates.value)
+        gate.complete(Unit)
+        manager.close()
+    }
 }

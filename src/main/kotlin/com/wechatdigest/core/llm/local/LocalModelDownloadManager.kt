@@ -60,7 +60,21 @@ class LocalModelDownloadManager(
                 onCompleted?.invoke(result)
             }
             activeJobs[spec.id] = createdJob
-            createdJob.invokeOnCompletion { activeJobs.remove(spec.id, createdJob) }
+            _downloadStates.update { it + (spec.id to LocalModelDownloadState.Starting) }
+            createdJob.invokeOnCompletion {
+                activeJobs.remove(spec.id, createdJob)
+                _downloadStates.update { current ->
+                    val state = current[spec.id]
+                    if (state is LocalModelDownloadState.Starting ||
+                        state is LocalModelDownloadState.Downloading ||
+                        state is LocalModelDownloadState.Verifying
+                    ) {
+                        current - spec.id
+                    } else {
+                        current
+                    }
+                }
+            }
             createdJob
         }
         jobToStart.start()
@@ -94,6 +108,7 @@ class LocalModelDownloadManager(
             return@withContext Result.failure(IllegalStateException("Download already in progress for ${spec.displayName}."))
         }
 
+        _downloadStates.update { it + (spec.id to LocalModelDownloadState.Starting) }
         try {
             LocalModelPaths.ensureOwnerOnlyDirectory(store.paths.modelsDir)
             val finalFile = store.paths.modelFile(spec)
