@@ -5,7 +5,8 @@ import kotlinx.serialization.Serializable
 @Serializable
 enum class LlmProviderType {
     OPENAI_COMPATIBLE,
-    OLLAMA
+    OLLAMA,
+    BUILT_IN_LOCAL
 }
 
 @Serializable
@@ -15,5 +16,9 @@ data class LlmConfig(
     val apiKey: String = "",
     val modelName: String = "gpt-4o-mini",
     val temperature: Double = 0.2,
-    val timeoutSeconds: Long = 180
+    val timeoutSeconds: Long = 180,
+    val localModelId: String = "",
+    val localModelMirror: String = "HF_OFFICIAL",
+    val localContextSize: Int = 8192,
+    val localIdleUnloadMinutes: Int = 10
 )

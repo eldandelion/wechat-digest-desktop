@@ -2,7 +2,15 @@ package com.wechatdigest.app
 
 import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmConfig
+import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.OllamaService
+import com.wechatdigest.core.llm.local.LlamaRuntimeManager
+import com.wechatdigest.core.llm.local.LlamaServerManager
+import com.wechatdigest.core.llm.local.LocalModelDownloadManager
+import com.wechatdigest.core.llm.local.LocalModelMirror
+import com.wechatdigest.core.llm.local.LocalModelPaths
+import com.wechatdigest.core.llm.local.LocalModelStore
+import com.wechatdigest.core.llm.local.LocalServerState
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
@@ -720,6 +728,48 @@ class AppStateTest {
         // Clearing groupFilter restores all cards
         appState.groupFilter.value = null
         assertEquals(3, appState.visibleEvents.value.size)
+    }
+
+    @Test
+    fun `built-in local model selection, import, and factory reset keep model files intact`() = runBlocking {
+        val localPaths = LocalModelPaths(File(tempDir, "app-support"))
+        LocalModelPaths.ensureOwnerOnlyDirectory(localPaths.modelsDir)
+        val externalGguf = File(tempDir, "external-local.gguf").apply {
+            writeBytes(byteArrayOf('G'.code.toByte(), 'G'.code.toByte(), 'U'.code.toByte(), 'F'.code.toByte(), 3, 0, 0, 0) + ByteArray(64))
+        }
+        val localStore = LocalModelStore(localPaths)
+        val downloadManager = LocalModelDownloadManager(localStore, engine = MockEngine { respond("", HttpStatusCode.OK) })
+        val runtimeManager = LlamaRuntimeManager(localPaths, engine = MockEngine { respond("", HttpStatusCode.OK) })
+        val serverManager = LlamaServerManager(runtimeManager, scope = testScope, healthEngine = MockEngine { respond("", HttpStatusCode.OK) })
+
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            scope = testScope,
+            localModelStore = localStore,
+            localModelDownloadManager = downloadManager,
+            llamaRuntimeManager = runtimeManager,
+            llamaServerManager = serverManager
+        )
+
+        appState.selectLocalMirror(LocalModelMirror.HF_MIRROR).join()
+        assertEquals("HF_MIRROR", appState.settings.value.llm.localModelMirror)
+
+        var importedId: String? = null
+        appState.importLocalGgufFile(externalGguf) { importedId = it.id }.join()
+        assertTrue(!importedId.isNullOrBlank())
+        assertEquals(LlmProviderType.BUILT_IN_LOCAL, appState.settings.value.llm.providerType)
+        assertEquals(importedId, appState.settings.value.llm.localModelId)
+        assertEquals(1, appState.importedLocalModels.value.size)
+
+        // Reset local DB resets settings to defaults without deleting imported GGUF file on disk.
+        appState.resetLocalAppDatabase().join()
+        assertEquals(AppSettings(), appState.settings.value)
+        assertTrue(externalGguf.exists())
+        assertTrue(appState.localServerState.value is LocalServerState.Stopped)
+
+        appState.close()
     }
 }
 

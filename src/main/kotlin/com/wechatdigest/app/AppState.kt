@@ -10,11 +10,25 @@ import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmJsonUtils
+import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.LocalOllamaModel
 import com.wechatdigest.core.llm.MessageTranslator
 import com.wechatdigest.core.llm.OllamaDiscoveryResult
 import com.wechatdigest.core.llm.OllamaService
 import com.wechatdigest.core.llm.SectionCardEnricher
+import com.wechatdigest.core.llm.local.ImportedLocalModel
+import com.wechatdigest.core.llm.local.LlamaRuntimeManager
+import com.wechatdigest.core.llm.local.LlamaServerManager
+import com.wechatdigest.core.llm.local.LocalModelCatalog
+import com.wechatdigest.core.llm.local.LocalModelDownloadManager
+import com.wechatdigest.core.llm.local.LocalModelDownloadState
+import com.wechatdigest.core.llm.local.LocalModelMirror
+import com.wechatdigest.core.llm.local.LocalModelSpec
+import com.wechatdigest.core.llm.local.LocalModelStore
+import com.wechatdigest.core.llm.local.LocalRuntimeState
+import com.wechatdigest.core.llm.local.LocalServerState
+import com.wechatdigest.core.llm.local.ManagedLocalLlmClient
+import com.wechatdigest.core.llm.local.SystemHardwareInfo
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventDetailItemParser
@@ -34,6 +48,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -92,8 +107,12 @@ class AppState(
     private val decryptedCacheDir: File = File(System.getProperty("user.home"), "Library/Application Support/WeChatDigest/decrypted"),
     syncScheduler: SyncScheduler? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main),
-    private val llmClientFactory: (LlmConfig) -> LlmClient = { KtorLlmClient(it) },
-    private val attachmentLauncher: AttachmentLauncher = AttachmentLauncher()
+    private val llmClientFactory: ((LlmConfig) -> LlmClient)? = null,
+    private val attachmentLauncher: AttachmentLauncher = AttachmentLauncher(),
+    val localModelStore: LocalModelStore = LocalModelStore(),
+    val localModelDownloadManager: LocalModelDownloadManager = LocalModelDownloadManager(localModelStore),
+    val llamaRuntimeManager: LlamaRuntimeManager = LlamaRuntimeManager(),
+    llamaServerManager: LlamaServerManager? = null
 ) {
     private val _currentScreen = MutableStateFlow(Screen.EVENTS)
     val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
@@ -114,6 +133,27 @@ class AppState(
 
     private val _selectedEventId = MutableStateFlow<String?>(null)
     val selectedEventId: StateFlow<String?> = _selectedEventId.asStateFlow()
+
+    val llamaServerManager: LlamaServerManager = llamaServerManager ?: LlamaServerManager(
+        runtimeManager = llamaRuntimeManager,
+        scope = scope
+    )
+
+    val systemHardwareInfo: SystemHardwareInfo = localModelStore.detectHardwareInfo()
+    val localCatalogModels: List<LocalModelSpec> = LocalModelCatalog.CURATED_MODELS
+    val downloadedLocalModelIds: StateFlow<Set<String>> = localModelStore.downloadedModelIds
+    val importedLocalModels: StateFlow<List<ImportedLocalModel>> = localModelStore.importedModels
+    val localModelDownloadStates: StateFlow<Map<String, LocalModelDownloadState>> = localModelDownloadManager.downloadStates
+    val localRuntimeState: StateFlow<LocalRuntimeState> = llamaRuntimeManager.runtimeState
+    val localServerState: StateFlow<LocalServerState> = this.llamaServerManager.serverState
+
+    private fun createLlmClient(config: LlmConfig): LlmClient {
+        llmClientFactory?.let { return it(config) }
+        return when (config.providerType) {
+            LlmProviderType.BUILT_IN_LOCAL -> ManagedLocalLlmClient(config, localModelStore, this.llamaServerManager)
+            else -> KtorLlmClient(config)
+        }
+    }
 
     private val _detectedOllamaModels = MutableStateFlow<List<LocalOllamaModel>>(emptyList())
     val detectedOllamaModels: StateFlow<List<LocalOllamaModel>> = _detectedOllamaModels.asStateFlow()
@@ -309,12 +349,14 @@ class AppState(
 
     fun resetLocalAppDatabase(): Job = scope.launch {
         scheduler.stop()
+        localModelDownloadManager.cancelAll()
         loadEventsJob?.cancel()
         val pendingRoomsJob = refreshRoomsJob
         refreshRoomsJob = null
         pendingRoomsJob?.cancelAndJoin()
         activeSyncJob?.cancelAndJoin()
         cancelEnrichmentJobs()
+        llamaServerManager.stop()
         syncExecutionMutex.withLock {
             eventsDbMutex.withLock {
                 eventsMutationEpoch.incrementAndGet()
@@ -329,6 +371,7 @@ class AppState(
                     ) {
                         decryptedCacheDir.deleteRecursively()
                     }
+                    localModelStore.refresh()
                 }
                 settingsMutex.withLock {
                     withContext(Dispatchers.IO) { settingsStore.clear() }
@@ -350,7 +393,7 @@ class AppState(
         searchQuery.value = ""
         groupSearchQuery.value = ""
         _selectedEventId.value = null
-        _snackbarMessage.emit("Local app database reset to defaults. WeChat files untouched.")
+        _snackbarMessage.emit("Local app database reset to defaults. WeChat files and downloaded local models untouched.")
     }
 
     fun setShowWizard(show: Boolean) {
@@ -558,7 +601,153 @@ class AppState(
                     scheduler.stop()
                 }
             }
+
+            val localServerShouldReset = (previous.llm.providerType == LlmProviderType.BUILT_IN_LOCAL &&
+                updated.llm.providerType != LlmProviderType.BUILT_IN_LOCAL) ||
+                updated.llm.localModelId != previous.llm.localModelId ||
+                updated.llm.localContextSize != previous.llm.localContextSize
+            if (localServerShouldReset) {
+                llamaServerManager.stop()
+            }
         }
+    }
+
+    fun selectLocalModel(modelId: String): Job {
+        return transformSettings { current ->
+            val resolvedName = localModelStore.resolveModel(modelId)?.displayName
+                ?: LocalModelCatalog.findById(modelId)?.displayName
+                ?: current.llm.modelName
+            current.copy(
+                llm = current.llm.copy(
+                    providerType = LlmProviderType.BUILT_IN_LOCAL,
+                    localModelId = modelId,
+                    modelName = resolvedName
+                )
+            )
+        }
+    }
+
+    fun selectLocalMirror(mirror: LocalModelMirror): Job {
+        return transformSettings { current ->
+            current.copy(llm = current.llm.copy(localModelMirror = mirror.name))
+        }
+    }
+
+    fun downloadLocalModel(
+        modelId: String,
+        mirrorOverride: LocalModelMirror? = null,
+        autoSelectIfNone: Boolean = true,
+        onDownloaded: ((LocalModelSpec) -> Unit)? = null
+    ): Job {
+        val spec = LocalModelCatalog.findById(modelId) ?: return scope.launch { }
+        val mirror = mirrorOverride ?: LocalModelMirror.fromKey(_settings.value.llm.localModelMirror)
+        return localModelDownloadManager.startDownload(scope, spec, mirror) { result ->
+            result.onSuccess {
+                scope.launch {
+                    val curLlm = _settings.value.llm
+                    if (autoSelectIfNone &&
+                        curLlm.providerType == LlmProviderType.BUILT_IN_LOCAL &&
+                        localModelStore.resolveModel(curLlm.localModelId) == null
+                    ) {
+                        selectLocalModel(spec.id)
+                    }
+                    onDownloaded?.invoke(spec)
+                    _snackbarMessage.emit("Downloaded ${spec.displayName}.")
+                }
+            }.onFailure { err ->
+                if (err !is CancellationException) {
+                    scope.launch {
+                        _snackbarMessage.emit("Download failed for ${spec.displayName}: ${LlmJsonUtils.sanitizeLogMessage(err.message)}")
+                    }
+                }
+            }
+        }
+    }
+
+    fun cancelLocalModelDownload(modelId: String) {
+        localModelDownloadManager.cancelDownload(modelId)
+    }
+
+    fun deleteDownloadedLocalModel(modelId: String): Job = scope.launch {
+        localModelDownloadManager.cancelDownload(modelId)?.cancelAndJoin()
+        val wasActive = _settings.value.llm.localModelId == modelId
+        if (wasActive) {
+            llamaServerManager.stop()
+        }
+        val deleted = withContext(Dispatchers.IO) {
+            localModelStore.deleteCatalogModel(modelId)
+        }
+        if (wasActive) {
+            fallbackToAvailableLocalModel(modelId)
+        }
+        if (deleted) {
+            _snackbarMessage.emit("Deleted local model files.")
+        }
+    }
+
+    fun importLocalGgufFile(
+        file: File,
+        autoSelect: Boolean = true,
+        onImported: ((ImportedLocalModel) -> Unit)? = null
+    ): Job = scope.launch {
+        val result = withContext(Dispatchers.IO) {
+            localModelStore.importGgufFile(file)
+        }
+        result.onSuccess { imported ->
+            if (autoSelect) {
+                selectLocalModel(imported.id)
+            }
+            onImported?.invoke(imported)
+            _snackbarMessage.emit("Imported ${imported.displayName}.")
+        }.onFailure { err ->
+            _snackbarMessage.emit("Import failed: ${LlmJsonUtils.sanitizeLogMessage(err.message)}")
+        }
+    }
+
+    fun removeImportedLocalModel(modelId: String): Job = scope.launch {
+        val wasActive = _settings.value.llm.localModelId == modelId
+        if (wasActive) {
+            llamaServerManager.stop()
+        }
+        val removed = withContext(Dispatchers.IO) {
+            localModelStore.removeImportedModel(modelId)
+        }
+        if (wasActive) {
+            fallbackToAvailableLocalModel(modelId)
+        }
+        if (removed) {
+            _snackbarMessage.emit("Removed imported model from list (original file kept on disk).")
+        }
+    }
+
+    private suspend fun fallbackToAvailableLocalModel(removedModelId: String) {
+        val fallbackId = localModelStore.downloadedModelIds.value.firstOrNull()
+            ?: localModelStore.importedModels.value.firstOrNull { localModelStore.resolveModel(it.id) != null }?.id
+            ?: ""
+        transformSettings { cur ->
+            if (cur.llm.localModelId == removedModelId) {
+                val resolvedName = localModelStore.resolveModel(fallbackId)?.displayName ?: cur.llm.modelName
+                cur.copy(llm = cur.llm.copy(localModelId = fallbackId, modelName = resolvedName))
+            } else {
+                cur
+            }
+        }.join()
+    }
+
+    fun unloadLocalModel(): Job = scope.launch {
+        llamaServerManager.stop()
+        _snackbarMessage.emit("Unloaded local model from memory.")
+    }
+
+    fun close() {
+        scheduler.stop()
+        localModelDownloadManager.cancelAll()
+        scope.cancel()
+        llamaServerManager.shutdownBlocking()
+        runCatching { ollamaService.close() }
+        runCatching { localModelDownloadManager.close() }
+        runCatching { llamaRuntimeManager.close() }
+        runCatching { llamaServerManager.close() }
     }
 
     fun toggleRoomMonitored(roomId: String): Job {
@@ -736,7 +925,7 @@ class AppState(
         try {
             val currentSettings = _settings.value
             val result = withContext(Dispatchers.IO) {
-                llmClientFactory(currentSettings.llm).use { client ->
+                createLlmClient(currentSettings.llm).use { client ->
                     MessageTranslator(client).translateMessages(
                         sourceMessages = card.sourceMessages,
                         targetLanguage = currentSettings.targetLanguage
@@ -792,7 +981,7 @@ class AppState(
 
                 val currentSettings = _settings.value
                 val result = withContext(Dispatchers.IO) {
-                    llmClientFactory(currentSettings.llm).use { client ->
+                    createLlmClient(currentSettings.llm).use { client ->
                         SectionCardEnricher(client).enrichCardSections(
                             card = card,
                             targetLanguage = currentSettings.targetLanguage,

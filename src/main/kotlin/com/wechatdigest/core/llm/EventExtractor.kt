@@ -78,7 +78,10 @@ class EventExtractor(
          * URLs (to prevent queue timeouts) and `4` for remote cloud OpenAI-compatible APIs.
          */
         fun resolveConcurrencyForConfig(config: LlmConfig): Int {
-            if (config.providerType == LlmProviderType.OLLAMA || isLocalEndpoint(config.endpointUrl)) {
+            if (config.providerType == LlmProviderType.OLLAMA ||
+                config.providerType == LlmProviderType.BUILT_IN_LOCAL ||
+                isLocalEndpoint(config.endpointUrl)
+            ) {
                 return DEFAULT_LOCAL_CONCURRENCY
             }
             return DEFAULT_CLOUD_CONCURRENCY

@@ -26,6 +26,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -39,6 +40,15 @@ import androidx.compose.ui.window.Tray
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.WindowState
 import androidx.compose.ui.window.application
+import com.wechatdigest.core.llm.KtorLlmClient
+import com.wechatdigest.core.llm.LlmClient
+import com.wechatdigest.core.llm.LlmConfig
+import com.wechatdigest.core.llm.LlmProviderType
+import com.wechatdigest.core.llm.local.LlamaRuntimeManager
+import com.wechatdigest.core.llm.local.LlamaServerManager
+import com.wechatdigest.core.llm.local.LocalModelDownloadManager
+import com.wechatdigest.core.llm.local.LocalModelStore
+import com.wechatdigest.core.llm.local.ManagedLocalLlmClient
 import com.wechatdigest.storage.AppDatabase
 import com.wechatdigest.storage.EventCardStore
 import com.wechatdigest.storage.GroupConfigStore
@@ -50,9 +60,15 @@ import com.wechatdigest.ui.OnboardingWizardDialog
 import com.wechatdigest.ui.SettingsScreen
 import com.wechatdigest.ui.TrayIconHelper
 import com.wechatdigest.ui.theme.WeChatDigestTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 
-fun main() = application {
+fun main() {
+    System.setProperty("java.net.useSystemProxies", "true")
+    application {
     val windowState = remember {
         WindowState(
             size = DpSize(1040.dp, 720.dp)
@@ -64,8 +80,51 @@ fun main() = application {
     val eventCardStore = remember { EventCardStore(appDatabase) }
     val groupConfigStore = remember { GroupConfigStore(appDatabase) }
     val syncCheckpointStore = remember { SyncCheckpointStore(appDatabase) }
-    val syncService = remember { SyncService(eventCardStore, groupConfigStore, syncCheckpointStore) }
-    val appState = remember { AppState(settingsStore, eventCardStore, syncService, groupConfigStore, syncCheckpointStore = syncCheckpointStore) }
+    val localModelStore = remember { LocalModelStore() }
+    val localModelDownloadManager = remember { LocalModelDownloadManager(localModelStore) }
+    val llamaRuntimeManager = remember { LlamaRuntimeManager() }
+    val llamaServerScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+    val llamaServerManager = remember { LlamaServerManager(llamaRuntimeManager, scope = llamaServerScope) }
+    val llmClientFactory: (LlmConfig) -> LlmClient = remember {
+        { config ->
+            when (config.providerType) {
+                LlmProviderType.BUILT_IN_LOCAL -> ManagedLocalLlmClient(config, localModelStore, llamaServerManager)
+                else -> KtorLlmClient(config)
+            }
+        }
+    }
+    val syncService = remember {
+        SyncService(
+            eventCardStore = eventCardStore,
+            groupConfigStore = groupConfigStore,
+            syncCheckpointStore = syncCheckpointStore,
+            llmClientFactory = llmClientFactory
+        )
+    }
+    val appState = remember {
+        AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            groupConfigStore = groupConfigStore,
+            syncCheckpointStore = syncCheckpointStore,
+            llmClientFactory = llmClientFactory,
+            localModelStore = localModelStore,
+            localModelDownloadManager = localModelDownloadManager,
+            llamaRuntimeManager = llamaRuntimeManager,
+            llamaServerManager = llamaServerManager
+        )
+    }
+
+    DisposableEffect(Unit) {
+        val shutdownHook = Thread({ llamaServerManager.shutdownBlocking() }, "llama-server-shutdown")
+        Runtime.getRuntime().addShutdownHook(shutdownHook)
+        onDispose {
+            runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
+            llamaServerScope.cancel()
+            appState.close()
+        }
+    }
 
     var isWindowVisible by remember { mutableStateOf(true) }
     val trayIcon = remember { TrayIconHelper.createTrayIconPainter() }
@@ -114,6 +173,7 @@ fun main() = application {
                 MainAppShell(appState)
             }
         }
+    }
     }
 }
 

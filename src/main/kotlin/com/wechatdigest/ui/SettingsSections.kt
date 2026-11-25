@@ -4,6 +4,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,14 +18,20 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ArrowDropUp
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.SettingsBrightness
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.LightMode
+import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.SettingsBrightness
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -59,6 +67,14 @@ import com.wechatdigest.app.AppThemeMode
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.LocalOllamaModel
+import com.wechatdigest.core.llm.local.ImportedLocalModel
+import com.wechatdigest.core.llm.local.LocalModelDownloadState
+import com.wechatdigest.core.llm.local.LocalModelMirror
+import com.wechatdigest.core.llm.local.LocalModelSpec
+import com.wechatdigest.core.llm.local.LocalRuntimeState
+import com.wechatdigest.core.llm.local.LocalServerState
+import com.wechatdigest.core.llm.local.SystemHardwareInfo
+import java.io.File
 import java.util.Locale
 
 @Composable
@@ -224,6 +240,7 @@ internal fun BackgroundSyncSettingsCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun LlmEngineSettingsCard(
     providerType: LlmProviderType,
@@ -233,13 +250,31 @@ internal fun LlmEngineSettingsCard(
     detectedOllamaModels: List<LocalOllamaModel>,
     isDetectingOllama: Boolean,
     ollamaStatusMessage: String?,
+    hardwareInfo: SystemHardwareInfo,
+    localCatalogModels: List<LocalModelSpec>,
+    downloadedLocalModelIds: Set<String>,
+    importedLocalModels: List<ImportedLocalModel>,
+    localModelDownloadStates: Map<String, LocalModelDownloadState>,
+    localRuntimeState: LocalRuntimeState,
+    localServerState: LocalServerState,
+    localModelId: String,
+    localModelMirror: LocalModelMirror,
+    onSelectBuiltInLocal: () -> Unit,
     onSelectOpenAi: () -> Unit,
     onSelectOllama: () -> Unit,
     onDetectOllama: () -> Unit,
     onEndpointChange: (String) -> Unit,
     onApiKeyChange: (String) -> Unit,
     onModelNameChange: (String) -> Unit,
-    onSelectOllamaModel: (String) -> Unit
+    onSelectOllamaModel: (String) -> Unit,
+    onSelectLocalMirror: (LocalModelMirror) -> Unit,
+    onSelectLocalModel: (String) -> Unit,
+    onDownloadLocalModel: (String) -> Unit,
+    onCancelLocalDownload: (String) -> Unit,
+    onDeleteLocalModel: (String) -> Unit,
+    onImportGgufFile: (File) -> Unit,
+    onRemoveImportedModel: (String) -> Unit,
+    onUnloadLocalServer: () -> Unit
 ) {
     var isPasswordVisible by remember { mutableStateOf(false) }
     var isModelDropdownOpen by remember { mutableStateOf(false) }
@@ -250,37 +285,99 @@ internal fun LlmEngineSettingsCard(
 
     SettingsSectionCard {
         Text(text = "AI / LLM Engine", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(selected = providerType == LlmProviderType.OPENAI_COMPATIBLE, onClick = onSelectOpenAi, label = { Text("OpenAI / Cloud Compatible") })
-            FilterChip(selected = providerType == LlmProviderType.OLLAMA, onClick = onSelectOllama, label = { Text("Local Ollama") })
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            val builtInSelected = providerType == LlmProviderType.BUILT_IN_LOCAL
+            FilterChip(
+                selected = builtInSelected,
+                onClick = onSelectBuiltInLocal,
+                label = { Text("Built-in Local") },
+                leadingIcon = {
+                    Icon(
+                        imageVector = if (builtInSelected) Icons.Filled.Memory else Icons.Outlined.Memory,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            )
+            val ollamaSelected = providerType == LlmProviderType.OLLAMA
+            FilterChip(
+                selected = ollamaSelected,
+                onClick = onSelectOllama,
+                label = { Text("Local Ollama") },
+                leadingIcon = {
+                    Icon(
+                        imageVector = if (ollamaSelected) Icons.Filled.Computer else Icons.Outlined.Computer,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            )
+            val openAiSelected = providerType == LlmProviderType.OPENAI_COMPATIBLE
+            FilterChip(
+                selected = openAiSelected,
+                onClick = onSelectOpenAi,
+                label = { Text("OpenAI / Cloud Compatible") },
+                leadingIcon = {
+                    Icon(
+                        imageVector = if (openAiSelected) Icons.Filled.Cloud else Icons.Outlined.Cloud,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            )
         }
-        if (providerType == LlmProviderType.OLLAMA) {
-            OllamaDetectionRow(isDetecting = isDetectingOllama, statusMessage = ollamaStatusMessage, onDetect = onDetectOllama)
+        if (providerType == LlmProviderType.BUILT_IN_LOCAL) {
+            LocalModelSettingsSection(
+                hardwareInfo = hardwareInfo,
+                catalogModels = localCatalogModels,
+                downloadedModelIds = downloadedLocalModelIds,
+                importedModels = importedLocalModels,
+                downloadStates = localModelDownloadStates,
+                runtimeState = localRuntimeState,
+                serverState = localServerState,
+                activeModelId = localModelId,
+                selectedMirror = localModelMirror,
+                onSelectMirror = onSelectLocalMirror,
+                onSelectModel = onSelectLocalModel,
+                onDownloadModel = onDownloadLocalModel,
+                onCancelDownload = onCancelLocalDownload,
+                onDeleteDownloadedModel = onDeleteLocalModel,
+                onImportGgufFile = onImportGgufFile,
+                onRemoveImportedModel = onRemoveImportedModel,
+                onUnloadServer = onUnloadLocalServer
+            )
+        } else {
+            if (providerType == LlmProviderType.OLLAMA) {
+                OllamaDetectionRow(isDetecting = isDetectingOllama, statusMessage = ollamaStatusMessage, onDetect = onDetectOllama)
+            }
+            OutlinedTextField(
+                value = endpointUrl,
+                onValueChange = onEndpointChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Endpoint Base URL") },
+                isError = insecureRemoteUrl,
+                supportingText = if (insecureRemoteUrl) {
+                    { Text("Remote endpoints must use https:// to protect your API key and chat contents.") }
+                } else null,
+                singleLine = true
+            )
+            if (providerType == LlmProviderType.OPENAI_COMPATIBLE) {
+                ApiKeyField(apiKey = apiKey, visible = isPasswordVisible, onToggleVisibility = { isPasswordVisible = !isPasswordVisible }, onValueChange = onApiKeyChange)
+            }
+            ModelSelectorField(
+                providerType = providerType,
+                modelName = modelName,
+                detectedModels = detectedOllamaModels,
+                isDropdownOpen = isModelDropdownOpen,
+                onToggleDropdown = { isModelDropdownOpen = !isModelDropdownOpen },
+                onDismissDropdown = { isModelDropdownOpen = false },
+                onValueChange = onModelNameChange,
+                onSelectModel = { name -> isModelDropdownOpen = false; onSelectOllamaModel(name) }
+            )
         }
-        OutlinedTextField(
-            value = endpointUrl,
-            onValueChange = onEndpointChange,
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("Endpoint Base URL") },
-            isError = insecureRemoteUrl,
-            supportingText = if (insecureRemoteUrl) {
-                { Text("Remote endpoints must use https:// to protect your API key and chat contents.") }
-            } else null,
-            singleLine = true
-        )
-        if (providerType == LlmProviderType.OPENAI_COMPATIBLE) {
-            ApiKeyField(apiKey = apiKey, visible = isPasswordVisible, onToggleVisibility = { isPasswordVisible = !isPasswordVisible }, onValueChange = onApiKeyChange)
-        }
-        ModelSelectorField(
-            providerType = providerType,
-            modelName = modelName,
-            detectedModels = detectedOllamaModels,
-            isDropdownOpen = isModelDropdownOpen,
-            onToggleDropdown = { isModelDropdownOpen = !isModelDropdownOpen },
-            onDismissDropdown = { isModelDropdownOpen = false },
-            onValueChange = onModelNameChange,
-            onSelectModel = { name -> isModelDropdownOpen = false; onSelectOllamaModel(name) }
-        )
     }
 }
 
@@ -445,7 +542,7 @@ internal fun SettingsResetDialogs(
         AlertDialog(
             onDismissRequest = onDismissFactoryReset,
             title = { Text("Reset Local App Database?") },
-            text = { Text("This will permanently wipe all WeChat Digest local data (event cards, sync checkpoints, custom group rules, saved settings, and local decrypted cache) and restore factory defaults.\n\nNote: Your original WeChat messages and database container will NEVER be modified or deleted.") },
+            text = { Text("This will permanently wipe all WeChat Digest local data (event cards, sync checkpoints, custom group rules, saved settings, and local decrypted cache) and restore factory defaults.\n\nNote: Downloaded built-in local models (~models/) and your original WeChat messages/database container will NEVER be deleted.") },
             confirmButton = {
                 Button(onClick = onConfirmFactoryReset, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) {
                     Text("Reset App Database")

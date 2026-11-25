@@ -18,6 +18,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.net.InetAddress
 import java.net.URI
 import java.util.Locale
 
@@ -88,9 +89,12 @@ interface ConcurrencyAwareLlmClient : LlmClient {
 
 class KtorLlmClient(
     val config: LlmConfig,
-    engine: HttpClientEngine = CIO.create(),
+    engine: HttpClientEngine? = null,
     private val onTelemetry: ((LlmHttpTelemetry) -> Unit)? = null
 ) : ConcurrencyAwareLlmClient {
+
+    private val ownsEngine = engine == null
+    private val resolvedEngine: HttpClientEngine = engine ?: CIO.create()
 
     override val recommendedConcurrency: Int
         get() = EventExtractor.resolveConcurrencyForConfig(config)
@@ -101,11 +105,14 @@ class KtorLlmClient(
         encodeDefaults = true
     }
 
-    private val client = HttpClient(engine) {
+    private val client = HttpClient(resolvedEngine) {
         install(ContentNegotiation) {
             json(json)
         }
-        val effectiveTimeoutSeconds = if (config.providerType == LlmProviderType.OLLAMA) {
+        val effectiveTimeoutSeconds = if (
+            config.providerType == LlmProviderType.OLLAMA ||
+            config.providerType == LlmProviderType.BUILT_IN_LOCAL
+        ) {
             maxOf(config.timeoutSeconds, 180L)
         } else {
             maxOf(config.timeoutSeconds, 60L)
@@ -121,6 +128,15 @@ class KtorLlmClient(
         return when (config.providerType) {
             LlmProviderType.OPENAI_COMPATIBLE -> executeOpenAi(systemPrompt, userPrompt)
             LlmProviderType.OLLAMA -> executeOllama(systemPrompt, userPrompt)
+            LlmProviderType.BUILT_IN_LOCAL -> {
+                val baseUrl = config.endpointUrl.trim().trimEnd('/')
+                if (!isStrictLoopbackHttpUrl(baseUrl)) {
+                    throw IllegalStateException(
+                        "Built-in local model server is not active. Select or download a local model in Settings."
+                    )
+                }
+                executeOpenAi(systemPrompt, userPrompt)
+            }
         }
     }
 
@@ -142,7 +158,7 @@ class KtorLlmClient(
         val startMs = System.currentTimeMillis()
         val response = client.post(url) {
             contentType(ContentType.Application.Json)
-            if (config.apiKey.isNotBlank()) {
+            if (config.providerType != LlmProviderType.BUILT_IN_LOCAL && config.apiKey.isNotBlank()) {
                 header("Authorization", "Bearer ${config.apiKey}")
             }
             setBody(requestPayload)
@@ -152,7 +168,7 @@ class KtorLlmClient(
         val firstChoice = response.choices.firstOrNull()
         onTelemetry?.invoke(
             LlmHttpTelemetry(
-                providerType = LlmProviderType.OPENAI_COMPATIBLE,
+                providerType = config.providerType,
                 model = config.modelName,
                 durationMs = durationMs,
                 finishReason = firstChoice?.finishReason,
@@ -222,7 +238,22 @@ class KtorLlmClient(
         }
     }
 
+    private fun isStrictLoopbackHttpUrl(baseUrl: String): Boolean {
+        val parsed = runCatching { URI(baseUrl) }.getOrNull() ?: return false
+        val scheme = parsed.scheme?.lowercase(Locale.ROOT) ?: return false
+        if (scheme != "http") return false
+        val rawHost = parsed.host?.trimEnd('.')?.removePrefix("[")?.removeSuffix("]")?.lowercase(Locale.ROOT)
+            ?: return false
+        if (rawHost == "localhost" || rawHost == "127.0.0.1" || rawHost == "::1") return true
+        val looksLikeIpLiteral = rawHost.matches(Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")) || ':' in rawHost
+        if (!looksLikeIpLiteral) return false
+        return runCatching { InetAddress.getByName(rawHost).isLoopbackAddress }.getOrDefault(false)
+    }
+
     override fun close() {
         client.close()
+        if (ownsEngine) {
+            runCatching { resolvedEngine.close() }
+        }
     }
 }

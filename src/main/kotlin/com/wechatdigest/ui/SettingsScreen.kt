@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppSettings
 import com.wechatdigest.app.AppState
 import com.wechatdigest.core.llm.LlmProviderType
+import com.wechatdigest.core.llm.local.LocalModelMirror
 import com.wechatdigest.core.sanitizer.PrefilterConfig
 import kotlinx.coroutines.launch
 
@@ -90,6 +91,11 @@ fun SettingsScreen(appState: AppState) {
     val detectedOllamaModels by appState.detectedOllamaModels.collectAsState()
     val isDetectingOllama by appState.isDetectingOllama.collectAsState()
     val ollamaStatusMessage by appState.ollamaStatusMessage.collectAsState()
+    val downloadedLocalModelIds by appState.downloadedLocalModelIds.collectAsState()
+    val importedLocalModels by appState.importedLocalModels.collectAsState()
+    val localModelDownloadStates by appState.localModelDownloadStates.collectAsState()
+    val localRuntimeState by appState.localRuntimeState.collectAsState()
+    val localServerState by appState.localServerState.collectAsState()
 
     val runDetectOllama: (String) -> Unit = { preferred ->
         appState.detectLocalOllama(preferred) { detectedEndpoint, firstModel ->
@@ -182,6 +188,30 @@ fun SettingsScreen(appState: AppState) {
             detectedOllamaModels = detectedOllamaModels,
             isDetectingOllama = isDetectingOllama,
             ollamaStatusMessage = ollamaStatusMessage,
+            hardwareInfo = appState.systemHardwareInfo,
+            localCatalogModels = appState.localCatalogModels,
+            downloadedLocalModelIds = downloadedLocalModelIds,
+            importedLocalModels = importedLocalModels,
+            localModelDownloadStates = localModelDownloadStates,
+            localRuntimeState = localRuntimeState,
+            localServerState = localServerState,
+            localModelId = currentSettings.llm.localModelId,
+            localModelMirror = LocalModelMirror.fromKey(currentSettings.llm.localModelMirror),
+            onSelectBuiltInLocal = {
+                appState.transformSettings { cur ->
+                    val autoSelectedId = cur.llm.localModelId.ifBlank {
+                        downloadedLocalModelIds.firstOrNull()
+                            ?: importedLocalModels.firstOrNull()?.id
+                            ?: ""
+                    }
+                    cur.copy(
+                        llm = cur.llm.copy(
+                            providerType = LlmProviderType.BUILT_IN_LOCAL,
+                            localModelId = autoSelectedId
+                        )
+                    )
+                }
+            },
             onSelectOpenAi = {
                 val nextUrl = if (endpointUrl == "http://localhost:11434") "https://api.openai.com/v1" else endpointUrl
                 endpointUrl = nextUrl
@@ -201,7 +231,15 @@ fun SettingsScreen(appState: AppState) {
             onEndpointChange = { next -> endpointUrl = next; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(endpointUrl = next.trim())) } },
             onApiKeyChange = { next -> apiKey = next; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(apiKey = next.trim())) } },
             onModelNameChange = { next -> modelName = next; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(modelName = next.trim())) } },
-            onSelectOllamaModel = { selected -> modelName = selected; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(modelName = selected)) } }
+            onSelectOllamaModel = { selected -> modelName = selected; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(modelName = selected)) } },
+            onSelectLocalMirror = { mirror -> appState.selectLocalMirror(mirror) },
+            onSelectLocalModel = { id -> appState.selectLocalModel(id) },
+            onDownloadLocalModel = { id -> appState.downloadLocalModel(id) },
+            onCancelLocalDownload = { id -> appState.cancelLocalModelDownload(id) },
+            onDeleteLocalModel = { id -> appState.deleteDownloadedLocalModel(id) },
+            onImportGgufFile = { file -> appState.importLocalGgufFile(file) },
+            onRemoveImportedModel = { id -> appState.removeImportedLocalModel(id) },
+            onUnloadLocalServer = { appState.unloadLocalModel() }
         )
         PersonaLocalizationCard(
             persona = persona,
