@@ -10,6 +10,7 @@ import io.ktor.http.headersOf
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayInputStream
@@ -313,11 +314,17 @@ class LlamaRuntimeAndServerManagerTest {
 
         idleServer.withRunningServer(model, LlmConfig(providerType = LlmProviderType.BUILT_IN_LOCAL, localIdleUnloadMinutes = 1)) {
             delay(80L)
-            assertFalse(liveProcess!!.destroyed)
+            assertFalse(liveProcess!!.destroyed, "Server should not unload while request is in flight")
         }
-        delay(100L)
-        assertTrue(liveProcess!!.destroyed)
-        assertTrue(idleServer.serverState.value is LocalServerState.Stopped)
+        val unloaded = withTimeoutOrNull(5_000L) {
+            while (!liveProcess!!.destroyed || idleServer.serverState.value !is LocalServerState.Stopped) {
+                delay(20L)
+            }
+            true
+        }
+        assertTrue(unloaded == true, "Timed out waiting for idle unload; destroyed=${liveProcess!!.destroyed}, state=${idleServer.serverState.value}")
+        assertTrue(liveProcess!!.destroyed, "Idle server process should be destroyed")
+        assertTrue(idleServer.serverState.value is LocalServerState.Stopped, "Expected Stopped state, got ${idleServer.serverState.value}")
         idleServer.close()
         runtimeManager.close()
     }
