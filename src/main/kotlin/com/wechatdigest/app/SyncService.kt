@@ -3,6 +3,7 @@ package com.wechatdigest.app
 import com.wechatdigest.core.attachment.AttachmentContentExtractor
 import com.wechatdigest.core.attachment.WeChatAttachmentResolver
 import com.wechatdigest.core.db.WeChatDatabaseDriver
+import com.wechatdigest.core.db.WeChatSessionContext
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
@@ -57,6 +58,7 @@ class SyncService(
     private val eventCardStore: EventCardStore,
     private val groupConfigStore: GroupConfigStore? = null,
     val syncCheckpointStore: SyncCheckpointStore? = null,
+    private val decryptedCacheDir: File = File(System.getProperty("user.home"), "Library/Application Support/WeChatDigest/decrypted"),
     private val llmClientFactory: (LlmConfig) -> LlmClient = { KtorLlmClient(it) }
 ) {
 
@@ -87,19 +89,11 @@ class SyncService(
 
         val dataDir = File(settings.wechatDataDir).canonicalFile
         val keysFile = settings.keysPath.takeIf { it.isNotBlank() }?.let { File(it).canonicalFile }?.takeIf { it.isFile }
-        val driver = WeChatDatabaseDriver(baseDir = dataDir, customKeysFile = keysFile)
-        val contactRepo = WeChatContactRepository(driver)
-        val attachmentResolver = WeChatAttachmentResolver(driver)
-        val messageRepo = WeChatMessageRepository(driver, contactRepo, attachmentResolver)
-        val roomNamesMap = try {
-            contactRepo.listAllChatrooms().associate { it.roomId to it.displayName }
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            System.err.println(
-                "[SyncService] Failed loading chatroom display names: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
-            )
-            emptyMap()
-        }
+        val driver = WeChatDatabaseDriver(
+            baseDir = dataDir,
+            customKeysFile = keysFile,
+            cacheDir = decryptedCacheDir
+        )
 
         var totalScanned = 0
         val totalInsertedCounter = AtomicInteger(0)
@@ -107,27 +101,47 @@ class SyncService(
         val callbackMutex = Mutex()
         val errors = mutableListOf<String>()
 
-        llmClientFactory(settings.llm).use { llmClient ->
-            val extractor = EventExtractor(
-                llmClient = llmClient,
-                maxConcurrency = EventExtractor.resolveConcurrencyForConfig(settings.llm)
+        WeChatSessionContext(driver).use { session ->
+            val contactRepo = WeChatContactRepository(driver, sessionContext = session)
+            val attachmentResolver = WeChatAttachmentResolver(driver)
+            val messageRepo = WeChatMessageRepository(
+                driver = driver,
+                contactRepository = contactRepo,
+                attachmentResolver = attachmentResolver,
+                sessionContext = session
             )
-            settings.monitoredRoomIds.forEachIndexed { roomIdx, roomId ->
-                val roomOutcome = syncRoom(
-                    roomId = roomId,
-                    roomIndex = roomIdx + 1,
-                    totalRooms = totalRooms,
-                    settings = settings,
-                    messageRepo = messageRepo,
-                    extractor = extractor,
-                    roomDisplayName = roomNamesMap[roomId].orEmpty(),
-                    totalInsertedCounter = totalInsertedCounter,
-                    callbackMutex = callbackMutex,
-                    onCardPersisted = onCardPersisted,
-                    onProgress = onProgress
+            val roomNamesMap = try {
+                contactRepo.listAllChatrooms().associate { it.roomId to it.displayName }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                System.err.println(
+                    "[SyncService] Failed loading chatroom display names: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
                 )
-                totalScanned += roomOutcome.scannedCount
-                roomOutcome.errorMessage?.let { errors.add(it) }
+                emptyMap()
+            }
+
+            llmClientFactory(settings.llm).use { llmClient ->
+                val extractor = EventExtractor(
+                    llmClient = llmClient,
+                    maxConcurrency = EventExtractor.resolveConcurrencyForConfig(settings.llm)
+                )
+                settings.monitoredRoomIds.forEachIndexed { roomIdx, roomId ->
+                    val roomOutcome = syncRoom(
+                        roomId = roomId,
+                        roomIndex = roomIdx + 1,
+                        totalRooms = totalRooms,
+                        settings = settings,
+                        messageRepo = messageRepo,
+                        extractor = extractor,
+                        roomDisplayName = roomNamesMap[roomId].orEmpty(),
+                        totalInsertedCounter = totalInsertedCounter,
+                        callbackMutex = callbackMutex,
+                        onCardPersisted = onCardPersisted,
+                        onProgress = onProgress
+                    )
+                    totalScanned += roomOutcome.scannedCount
+                    roomOutcome.errorMessage?.let { errors.add(it) }
+                }
             }
         }
 
@@ -186,15 +200,15 @@ class SyncService(
             )
             val batchLimit = settings.messagesPerSync.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
             val checkpoint = syncCheckpointStore?.getOrThrow(roomId)
-            val rawMessages = if (checkpoint != null && checkpoint.lastLocalId > 0L) {
-                messageRepo.getMessagesSince(roomId, sinceLocalId = checkpoint.lastLocalId, limit = batchLimit)
-            } else {
-                messageRepo.getRecentMessages(roomId, limit = batchLimit)
-            }
+            val readResult = messageRepo.getMessagesSinceCheckpoint(
+                roomId = roomId,
+                checkpoint = checkpoint,
+                limit = batchLimit
+            )
+            val rawMessages = readResult.messages
             if (rawMessages.isEmpty()) return RoomSyncOutcome()
 
             scannedInRoom = rawMessages.size
-            val maxLocalId = rawMessages.maxOf { it.localId }
             val groupConfig = groupConfigStore?.getOrThrow(roomId)
             val senderFiltered = applySenderAllowlist(rawMessages, groupConfig)
             val substantive = MessageSanitizer.filterSubstantiveMessages(senderFiltered, settings.prefilter)
@@ -217,7 +231,12 @@ class SyncService(
                 )
             }
 
-            advanceCheckpoint(roomId, maxLocalId)
+            advanceCheckpoint(
+                roomId = roomId,
+                maxLocalId = readResult.latestLocalId,
+                lastShardName = readResult.latestShardName,
+                lastCreateTime = readResult.latestCreateTime
+            )
             RoomSyncOutcome(scannedCount = scannedInRoom)
         } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -366,14 +385,21 @@ class SyncService(
             .toSet()
     }
 
-    private fun advanceCheckpoint(roomId: String, maxLocalId: Long) {
+    private fun advanceCheckpoint(
+        roomId: String,
+        maxLocalId: Long,
+        lastShardName: String = "",
+        lastCreateTime: Long = 0L
+    ) {
         val now = System.currentTimeMillis() / 1000
         syncCheckpointStore?.saveOrThrow(
             SyncCheckpoint(
                 roomId = roomId,
                 lastLocalId = maxLocalId,
                 lastSyncTimestamp = now,
-                updatedAt = now
+                updatedAt = now,
+                lastShardName = lastShardName,
+                lastCreateTime = lastCreateTime
             )
         )
     }

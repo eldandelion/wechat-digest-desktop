@@ -1,13 +1,17 @@
 package com.wechatdigest.core.repository
 
 import com.wechatdigest.core.db.WeChatDatabaseDriver
+import com.wechatdigest.core.db.WeChatSessionContext
 import com.wechatdigest.core.model.GroupChat
 import com.wechatdigest.core.model.GroupMember
 import com.wechatdigest.core.model.WeChatContact
 import java.io.File
 import java.io.FileNotFoundException
 
-class WeChatContactRepository(private val driver: WeChatDatabaseDriver) {
+class WeChatContactRepository(
+    private val driver: WeChatDatabaseDriver,
+    private val sessionContext: WeChatSessionContext? = null
+) {
 
     private val contactDbFile: File by lazy {
         val nested = File(driver.baseDir, "contact/contact.db")
@@ -19,11 +23,16 @@ class WeChatContactRepository(private val driver: WeChatDatabaseDriver) {
 
     /**
      * Loads a map of username -> display name for fast sender name resolution.
+     * Uses [sessionContext] cache when attached to avoid re-reading `contact.db` per room.
      */
     fun loadContactsMap(): Map<String, String> {
+        return sessionContext?.getOrLoadContactsMap { loadContactsMapDirect() } ?: loadContactsMapDirect()
+    }
+
+    private fun loadContactsMapDirect(): Map<String, String> {
         val result = mutableMapOf<String, String>()
         val sql = "SELECT username, nick_name, remark FROM contact"
-        driver.openReadOnlyConnection(contactDbFile).use { conn ->
+        driver.openReadOnlyConnection(contactDbFile, sessionContext).use { conn ->
             conn.createStatement().use { stmt ->
                 stmt.executeQuery(sql).use { rs ->
                     while (rs.next()) {
@@ -44,7 +53,7 @@ class WeChatContactRepository(private val driver: WeChatDatabaseDriver) {
      */
     fun findGroupByName(groupName: String): GroupChat? {
         val sql = "SELECT username, nick_name, remark FROM contact WHERE nick_name = ? OR remark = ? LIMIT 1"
-        driver.openReadOnlyConnection(contactDbFile).use { conn ->
+        driver.openReadOnlyConnection(contactDbFile, sessionContext).use { conn ->
             conn.prepareStatement(sql).use { stmt ->
                 stmt.setString(1, groupName)
                 stmt.setString(2, groupName)
@@ -68,7 +77,7 @@ class WeChatContactRepository(private val driver: WeChatDatabaseDriver) {
     fun listAllChatrooms(): List<GroupChat> {
         val result = mutableListOf<GroupChat>()
         val sql = "SELECT username, nick_name, remark FROM contact WHERE username LIKE '%@chatroom'"
-        driver.openReadOnlyConnection(contactDbFile).use { conn ->
+        driver.openReadOnlyConnection(contactDbFile, sessionContext).use { conn ->
             conn.createStatement().use { stmt ->
                 stmt.executeQuery(sql).use { rs ->
                     while (rs.next()) {
@@ -91,7 +100,7 @@ class WeChatContactRepository(private val driver: WeChatDatabaseDriver) {
     fun listRoomMembers(roomId: String): List<GroupMember> {
         if (roomId.isBlank()) return emptyList()
         val members = linkedMapOf<String, GroupMember>()
-        driver.openReadOnlyConnection(contactDbFile).use { conn ->
+        driver.openReadOnlyConnection(contactDbFile, sessionContext).use { conn ->
             val tables = loadExistingTables(conn)
             val hasName2Id = "name2id" in tables
             val hasContact = "contact" in tables

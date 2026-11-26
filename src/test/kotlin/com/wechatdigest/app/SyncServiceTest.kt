@@ -872,4 +872,175 @@ class SyncServiceTest {
         assertEquals(4, eventCardStore.listActive().size)
         assertEquals(4L, checkpointStore.getOrThrow(room)?.lastLocalId)
     }
+
+    @Test
+    fun `syncNow drains old shard tail and rolls over cleanly across message_0 and message_1`() = runBlocking {
+        val dir = File(tempDir, "rollover_wechat").apply { mkdirs() }
+        val msgDir = File(dir, "message").apply { mkdirs() }
+        val room = "rollover@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('$room', 'Rollover Group', '')")
+                stmt.execute("INSERT INTO contact VALUES ('teacher', 'Prof_Lin', '')")
+            }
+        }
+        val shard0 = File(msgDir, "message_0.db")
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${shard0.absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                (1..3).forEach { id ->
+                    stmt.executeUpdate("INSERT INTO $table VALUES ($id, ${1794800000 + id * 10}, 'teacher', CAST('Shard0 Msg $id notice' AS BLOB))")
+                }
+            }
+        }
+
+        val capturedBatches = mutableListOf<String>()
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            capturedBatches.add(body)
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") -> {
+                    val ids = Regex("""\[id:(\d+)]""").findAll(body).map { it.groupValues[1].toLong() }.toList()
+                    """{"chunks":[{"topic":"Rollover Notices","message_ids":[${ids.joinToString(",")}]}]}"""
+                }
+                body.contains("Rule & Substance Gatekeeper") -> {
+                    if (body.contains("\"verdicts\"") || body.contains("\\\"verdicts\\\"")) {
+                        """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}]}"""
+                    } else {
+                        """{"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true}"""
+                    }
+                }
+                else -> {
+                    val title = Regex("""Shard\d Msg \d+ \w+""").find(body)?.value ?: "Notice"
+                    """{"is_relevant":true,"events":[{"title":"$title","summary":"$title summary","category":"NOTICE","priority":"NORMAL","source_message_ids":[]}]}"""
+                }
+            }
+            val payload = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}"""
+            respond(payload, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+        }
+
+        val checkpointStore = SyncCheckpointStore(appDb)
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = checkpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) },
+            decryptedCacheDir = File(tempDir, "decrypted")
+        )
+
+        // Sync 1: reads message_0.db local_id 1..3
+        val sync1 = service.syncNow(AppSettings(wechatDataDir = dir.absolutePath, monitoredRoomIds = setOf(room), messagesPerSync = 50))
+        assertTrue(sync1 is SyncResult.Success)
+        assertEquals(3, (sync1 as SyncResult.Success).totalScannedMessages)
+        val cp1 = checkpointStore.getOrThrow(room)!!
+        assertEquals("message_0.db", cp1.lastShardName)
+        assertEquals(3L, cp1.lastLocalId)
+        assertEquals(1794800030L, cp1.lastCreateTime)
+
+        // Append tail local_id=4 to message_0.db AND roll over to message_1.db (local_id resets to 1..2)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${shard0.absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.executeUpdate("INSERT INTO $table VALUES (4, 1794800040, 'teacher', CAST('Shard0 Msg 4 tail' AS BLOB))")
+            }
+        }
+        val shard1 = File(msgDir, "message_1.db")
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${shard1.absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800050, 'teacher', CAST('Shard1 Msg 1 rollover' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800060, 'teacher', CAST('Shard1 Msg 2 rollover' AS BLOB))")
+            }
+        }
+
+        capturedBatches.clear()
+        val sync2 = service.syncNow(AppSettings(wechatDataDir = dir.absolutePath, monitoredRoomIds = setOf(room), messagesPerSync = 50))
+        assertTrue(sync2 is SyncResult.Success)
+        assertEquals(3, (sync2 as SyncResult.Success).totalScannedMessages, "Must read Shard0 Msg 4 + Shard1 Msg 1 & 2")
+        assertTrue(capturedBatches.any { it.contains("Shard0 Msg 4 tail") })
+        assertTrue(capturedBatches.any { it.contains("Shard1 Msg 1 rollover") })
+        assertTrue(capturedBatches.any { it.contains("Shard1 Msg 2 rollover") })
+
+        val cp2 = checkpointStore.getOrThrow(room)!!
+        assertEquals("message_1.db", cp2.lastShardName)
+        assertEquals(2L, cp2.lastLocalId)
+        assertEquals(1794800060L, cp2.lastCreateTime)
+    }
+
+    @Test
+    fun `getMessagesSinceCheckpoint respects batch limit across shard rollover without skipping or jumping cursor`() {
+        val dir = File(tempDir, "capped_rollover_wechat").apply { mkdirs() }
+        val msgDir = File(dir, "message").apply { mkdirs() }
+        val room = "capped@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.execute("INSERT INTO contact VALUES ('t', 'Teacher', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(msgDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1000, 't', CAST('m0-1' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1010, 't', CAST('m0-2' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1020, 't', CAST('m0-3' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (4, 1030, 't', CAST('m0-4' AS BLOB))")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(msgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1040, 't', CAST('m1-1' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1050, 't', CAST('m1-2' AS BLOB))")
+            }
+        }
+
+        val driver = WeChatDatabaseDriver(dir, cacheDir = File(tempDir, "cache"))
+        val repo = WeChatMessageRepository(driver, WeChatContactRepository(driver))
+
+        // Checkpoint at message_0.db localId=2, limit=2 -> must stay on message_0.db (m0-3, m0-4)
+        val cpStart = com.wechatdigest.core.model.SyncCheckpoint(
+            roomId = room,
+            lastLocalId = 2L,
+            lastSyncTimestamp = 1010L,
+            updatedAt = 1010L,
+            lastShardName = "message_0.db",
+            lastCreateTime = 1010L
+        )
+        val batch1 = repo.getMessagesSinceCheckpoint(room, cpStart, limit = 2)
+        assertEquals(listOf("m0-3", "m0-4"), batch1.messages.map { it.textContent })
+        assertEquals("message_0.db", batch1.latestShardName)
+        assertEquals(4L, batch1.latestLocalId)
+        assertEquals(1030L, batch1.latestCreateTime)
+
+        // Next batch (limit=2) advances into message_1.db (m1-1, m1-2)
+        val cpMid = cpStart.copy(
+            lastLocalId = batch1.latestLocalId,
+            lastShardName = batch1.latestShardName,
+            lastCreateTime = batch1.latestCreateTime
+        )
+        val batch2 = repo.getMessagesSinceCheckpoint(room, cpMid, limit = 2)
+        assertEquals(listOf("m1-1", "m1-2"), batch2.messages.map { it.textContent })
+        assertEquals("message_1.db", batch2.latestShardName)
+        assertEquals(2L, batch2.latestLocalId)
+        assertEquals(1050L, batch2.latestCreateTime)
+
+        // Cross-shard batch boundary (cp at m0-3, limit=2 -> m0-4 from shard0 + m1-1 from shard1)
+        val cpCross = cpStart.copy(lastLocalId = 3L, lastCreateTime = 1020L)
+        val crossBatch = repo.getMessagesSinceCheckpoint(room, cpCross, limit = 2)
+        assertEquals(listOf("m0-4", "m1-1"), crossBatch.messages.map { it.textContent })
+        assertEquals("message_1.db", crossBatch.latestShardName)
+        assertEquals(1L, crossBatch.latestLocalId)
+        assertEquals(1040L, crossBatch.latestCreateTime)
+
+        // Legacy v1.1 checkpoint (blank lastShardName) after rollover still drains m0-4 + m1-1..2
+        val legacyCp = com.wechatdigest.core.model.SyncCheckpoint(room, 3L, 1020L, 1020L)
+        val legacyBatch = repo.getMessagesSinceCheckpoint(room, legacyCp, limit = 10)
+        assertEquals(listOf("m0-4", "m1-1", "m1-2"), legacyBatch.messages.map { it.textContent })
+        assertEquals("message_1.db", legacyBatch.latestShardName)
+        assertEquals(2L, legacyBatch.latestLocalId)
+    }
 }

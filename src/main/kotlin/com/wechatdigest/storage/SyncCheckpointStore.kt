@@ -7,7 +7,10 @@ class SyncCheckpointStore(private val db: AppDatabase) {
 
     /** Returns the saved checkpoint for [roomId], or throws on SQLite error so sync callers fail closed. */
     fun getOrThrow(roomId: String): SyncCheckpoint? {
-        val sql = "SELECT room_id, last_local_id, last_sync_timestamp, updated_at FROM sync_checkpoints WHERE room_id = ?"
+        val sql = """
+            SELECT room_id, last_local_id, last_sync_timestamp, updated_at, last_shard_name, last_create_time
+            FROM sync_checkpoints WHERE room_id = ?
+        """.trimIndent()
         db.getConnection().use { conn ->
             conn.prepareStatement(sql).use { stmt ->
                 stmt.setString(1, roomId)
@@ -17,7 +20,9 @@ class SyncCheckpointStore(private val db: AppDatabase) {
                             roomId = rs.getString("room_id"),
                             lastLocalId = rs.getLong("last_local_id"),
                             lastSyncTimestamp = rs.getLong("last_sync_timestamp"),
-                            updatedAt = rs.getLong("updated_at")
+                            updatedAt = rs.getLong("updated_at"),
+                            lastShardName = rs.getString("last_shard_name") ?: "",
+                            lastCreateTime = rs.getLong("last_create_time")
                         )
                     }
                 }
@@ -39,7 +44,7 @@ class SyncCheckpointStore(private val db: AppDatabase) {
     }
 
     fun getAll(): Map<String, SyncCheckpoint> {
-        val sql = "SELECT room_id, last_local_id, last_sync_timestamp, updated_at FROM sync_checkpoints"
+        val sql = "SELECT room_id, last_local_id, last_sync_timestamp, updated_at, last_shard_name, last_create_time FROM sync_checkpoints"
         val result = mutableMapOf<String, SyncCheckpoint>()
         try {
             db.getConnection().use { conn ->
@@ -51,7 +56,9 @@ class SyncCheckpointStore(private val db: AppDatabase) {
                                 roomId = roomId,
                                 lastLocalId = rs.getLong("last_local_id"),
                                 lastSyncTimestamp = rs.getLong("last_sync_timestamp"),
-                                updatedAt = rs.getLong("updated_at")
+                                updatedAt = rs.getLong("updated_at"),
+                                lastShardName = rs.getString("last_shard_name") ?: "",
+                                lastCreateTime = rs.getLong("last_create_time")
                             )
                         }
                     }
@@ -66,8 +73,10 @@ class SyncCheckpointStore(private val db: AppDatabase) {
     /** Persists [checkpoint] in SQLite, throwing on error so callers avoid silent checkpoint drift. */
     fun saveOrThrow(checkpoint: SyncCheckpoint) {
         val sql = """
-            INSERT OR REPLACE INTO sync_checkpoints (room_id, last_local_id, last_sync_timestamp, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO sync_checkpoints (
+                room_id, last_local_id, last_sync_timestamp, updated_at, last_shard_name, last_create_time
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
         """.trimIndent()
         db.getConnection().use { conn ->
             conn.prepareStatement(sql).use { stmt ->
@@ -75,6 +84,8 @@ class SyncCheckpointStore(private val db: AppDatabase) {
                 stmt.setLong(2, checkpoint.lastLocalId)
                 stmt.setLong(3, checkpoint.lastSyncTimestamp)
                 stmt.setLong(4, checkpoint.updatedAt)
+                stmt.setString(5, checkpoint.lastShardName)
+                stmt.setLong(6, checkpoint.lastCreateTime)
                 stmt.executeUpdate()
             }
         }

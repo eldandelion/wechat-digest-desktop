@@ -106,4 +106,48 @@ class SyncCheckpointStoreTest {
             brokenStore.saveOrThrow(SyncCheckpoint("room@chatroom", 10L, 1000L, 1000L))
         }
     }
+
+    @Test
+    fun `AppDatabase migrates legacy 4-column sync_checkpoints and round-trips shard fields`() {
+        val legacyFile = File(tempDir, "legacy_checkpoints.db")
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${legacyFile.absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute(
+                    """
+                    CREATE TABLE sync_checkpoints (
+                        room_id TEXT PRIMARY KEY,
+                        last_local_id INTEGER NOT NULL DEFAULT 0,
+                        last_sync_timestamp INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL
+                    );
+                    """.trimIndent()
+                )
+                stmt.executeUpdate(
+                    "INSERT INTO sync_checkpoints VALUES ('legacy@chatroom', 42, 1730000000, 1730000005)"
+                )
+            }
+        }
+
+        val migratedDb = AppDatabase(legacyFile)
+        val migratedStore = SyncCheckpointStore(migratedDb)
+
+        val legacyCp = migratedStore.getOrThrow("legacy@chatroom")
+        assertNotNull(legacyCp)
+        assertEquals(42L, legacyCp.lastLocalId)
+        assertEquals("", legacyCp.lastShardName)
+        assertEquals(0L, legacyCp.lastCreateTime)
+
+        val upgraded = legacyCp.copy(
+            lastLocalId = 55L,
+            lastShardName = "message_1.db",
+            lastCreateTime = 1795000123L
+        )
+        migratedStore.saveOrThrow(upgraded)
+
+        val fetched = migratedStore.getOrThrow("legacy@chatroom")
+        assertNotNull(fetched)
+        assertEquals("message_1.db", fetched.lastShardName)
+        assertEquals(1795000123L, fetched.lastCreateTime)
+        assertEquals(fetched, migratedStore.getAll()["legacy@chatroom"])
+    }
 }
