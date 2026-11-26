@@ -16,7 +16,9 @@
     "mustContainFacts": ["201", "15:00"],
     "minTranslationRepairs": 2,
     "maxTranslationRepairs": 2,
-    "maxLlmCalls": 6,
+    "maxLlmCalls": 3,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }

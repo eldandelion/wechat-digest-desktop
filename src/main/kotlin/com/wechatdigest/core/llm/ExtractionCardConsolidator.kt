@@ -1,13 +1,16 @@
 package com.wechatdigest.core.llm
 
+import com.wechatdigest.core.calendar.TemporalNormalizer
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventDetailItemParser
+import com.wechatdigest.core.model.EventDetailKind
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.core.model.LlmExtractedEvent
 import com.wechatdigest.core.model.WeChatMessage
+import java.time.ZoneId
 import java.util.Locale
 
 /**
@@ -69,34 +72,47 @@ internal object ExtractionCardConsolidator {
         roomDisplayName: String,
         fallbackTitle: String,
         joinDistinctTitles: Boolean,
-        sourceAttachments: List<EventAttachment> = emptyList()
+        sourceAttachments: List<EventAttachment> = emptyList(),
+        zoneId: ZoneId = ZoneId.systemDefault()
     ): EventCard {
         val deduplicatedAttachments = sourceAttachments.distinctBy { it.previewKey() }
         if (extractedEvents.size == 1) {
             return buildSingleEventCard(
                 extractedEvents.first(), fallbackTitle, eventSender, roomId, roomDisplayName,
-                sourceMessagesText, eventTimestamp, deduplicatedAttachments
+                sourceMessagesText, eventTimestamp, deduplicatedAttachments, zoneId
             )
         }
 
         val (collectedSections, promotedFlatItem) = collectConsolidatedSections(extractedEvents)
+        val title = EventDetailItemParser.sanitizeSingleLine(
+            resolveConsolidatedTitle(extractedEvents, fallbackTitle, joinDistinctTitles, collectedSections.size),
+            EventDetailItemParser.MAX_CARD_TITLE_CHARS
+        )
+        val summary = EventDetailItemParser.sanitizeMultiLine(
+            resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
+            EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+        )
+        val resolvedDate = extractedEvents
+            .mapNotNull { sanitizeEventDate(it.eventDate, eventTimestamp, zoneId) }
+            .minOrNull()
+            ?: resolveFallbackDate(
+                title = title,
+                summary = summary,
+                translatedSummary = summary,
+                sections = collectedSections,
+                sourceMessagesText = sourceMessagesText,
+                eventTimestamp = eventTimestamp,
+                zoneId = zoneId
+            )
+
         return EventCard(
-            title = EventDetailItemParser.sanitizeSingleLine(
-                resolveConsolidatedTitle(extractedEvents, fallbackTitle, joinDistinctTitles, collectedSections.size),
-                EventDetailItemParser.MAX_CARD_TITLE_CHARS
-            ),
-            summary = EventDetailItemParser.sanitizeMultiLine(
-                resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
-                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
-            ),
-            translatedSummary = EventDetailItemParser.sanitizeMultiLine(
-                resolveConsolidatedSummary(extractedEvents, collectedSections.size, promotedFlatItem),
-                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
-            ),
+            title = title,
+            summary = summary,
+            translatedSummary = summary,
             sections = collectedSections,
             category = extractedEvents.map { EventCategory.fromString(it.category) }.firstOrNull { it != EventCategory.OTHER } ?: EventCategory.OTHER,
             priority = extractedEvents.minOf { EventPriority.fromString(it.priority) },
-            eventDate = extractedEvents.mapNotNull { sanitizeEventDate(it.eventDate) }.minOrNull(),
+            eventDate = resolvedDate,
             originalSender = eventSender,
             sourceRoomId = roomId,
             sourceRoomName = roomDisplayName,
@@ -114,27 +130,43 @@ internal object ExtractionCardConsolidator {
         roomDisplayName: String,
         sourceMessagesText: String,
         eventTimestamp: Long,
-        attachments: List<EventAttachment>
+        attachments: List<EventAttachment>,
+        zoneId: ZoneId
     ): EventCard {
         val preferredSummary = single.translatedSummary.ifBlank { single.summary }
         val fallbackSummary = single.summary.ifBlank { single.translatedSummary }
+        val title = EventDetailItemParser.sanitizeSingleLine(
+            single.title.ifBlank { fallbackTitle },
+            EventDetailItemParser.MAX_CARD_TITLE_CHARS
+        )
+        val cleanSummary = EventDetailItemParser.sanitizeMultiLine(
+            fallbackSummary,
+            EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+        )
+        val cleanTranslated = EventDetailItemParser.sanitizeMultiLine(
+            preferredSummary,
+            EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
+        )
+        val cleanSections = sanitizeSections(single.sections)
+        val resolvedDate = sanitizeEventDate(single.eventDate, eventTimestamp, zoneId)
+            ?: resolveFallbackDate(
+                title = title,
+                summary = cleanSummary,
+                translatedSummary = cleanTranslated,
+                sections = cleanSections,
+                sourceMessagesText = sourceMessagesText,
+                eventTimestamp = eventTimestamp,
+                zoneId = zoneId
+            )
+
         return EventCard(
-            title = EventDetailItemParser.sanitizeSingleLine(
-                single.title.ifBlank { fallbackTitle },
-                EventDetailItemParser.MAX_CARD_TITLE_CHARS
-            ),
-            summary = EventDetailItemParser.sanitizeMultiLine(
-                fallbackSummary,
-                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
-            ),
-            translatedSummary = EventDetailItemParser.sanitizeMultiLine(
-                preferredSummary,
-                EventDetailItemParser.MAX_CARD_SUMMARY_CHARS
-            ),
-            sections = sanitizeSections(single.sections),
+            title = title,
+            summary = cleanSummary,
+            translatedSummary = cleanTranslated,
+            sections = cleanSections,
             category = EventCategory.fromString(single.category),
             priority = EventPriority.fromString(single.priority),
-            eventDate = sanitizeEventDate(single.eventDate),
+            eventDate = resolvedDate,
             originalSender = eventSender,
             sourceRoomId = roomId,
             sourceRoomName = roomDisplayName,
@@ -144,9 +176,52 @@ internal object ExtractionCardConsolidator {
         )
     }
 
-    private fun sanitizeEventDate(rawDate: String?): String? {
+    private fun sanitizeEventDate(rawDate: String?, eventTimestamp: Long, zoneId: ZoneId): String? {
         val trimmed = rawDate?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        return ExtractionPrompts.sanitizeInline(trimmed, 32).takeIf { it.isNotBlank() }
+        val safe = ExtractionPrompts.sanitizeInline(trimmed, 48).takeIf { it.isNotBlank() } ?: return null
+        return TemporalNormalizer.normalizeExplicitDate(safe, eventTimestamp, zoneId)
+    }
+
+    private fun resolveFallbackDate(
+        title: String,
+        summary: String,
+        translatedSummary: String,
+        sections: List<EventSection>,
+        sourceMessagesText: String,
+        eventTimestamp: Long,
+        zoneId: ZoneId
+    ): String? {
+        val candidates = buildList {
+            for (sec in sections) {
+                for (item in sec.items) {
+                    if (item.kind == EventDetailKind.DEADLINE ||
+                        item.kind == EventDetailKind.EXAM ||
+                        item.kind == EventDetailKind.DATE ||
+                        item.kind == EventDetailKind.TIME
+                    ) {
+                        add("${item.label}: ${item.value}")
+                    }
+                }
+            }
+            for (sec in sections) {
+                for (item in sec.items) {
+                    if (item.kind != EventDetailKind.DEADLINE &&
+                        item.kind != EventDetailKind.EXAM &&
+                        item.kind != EventDetailKind.DATE &&
+                        item.kind != EventDetailKind.TIME
+                    ) {
+                        add("${item.label}: ${item.value}")
+                    }
+                }
+                addAll(sec.bullets)
+                if (sec.content.isNotBlank()) add(sec.content)
+            }
+            if (translatedSummary.isNotBlank()) add(translatedSummary)
+            if (summary.isNotBlank() && summary != translatedSummary) add(summary)
+            if (title.isNotBlank()) add(title)
+            if (sourceMessagesText.isNotBlank()) add(sourceMessagesText)
+        }
+        return TemporalNormalizer.resolveEventDate(candidates, eventTimestamp, zoneId)
     }
 
     private fun collectConsolidatedSections(extractedEvents: List<LlmExtractedEvent>): Pair<List<EventSection>, Boolean> {

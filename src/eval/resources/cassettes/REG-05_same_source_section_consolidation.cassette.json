@@ -2,19 +2,11 @@
     "version": 1,
     "scenarioId": "REG-05_same_source_section_consolidation",
     "descriptions": {
-        "11e1cc6925cbe28858bf8e44087d5a0f7c4e5a8820665e9197669ac8c7387fad": "pass1_triage",
-        "b6bb46538fbb1684cf01876ec5d495d5aa58bee159b5a9acd047208b6c6e9617": "pass3_synthesis",
-        "f20958b3240ec14d6986e6d5d65322335af52594c7a52f6d8503762524950a1e": "pass2_gatekeeper"
+        "11b82affa59254c2c0bc5d9d7064b44703fe54f53c81d350876d2d0968304b7b": "pass3_synthesis"
     },
     "entries": {
-        "11e1cc6925cbe28858bf8e44087d5a0f7c4e5a8820665e9197669ac8c7387fad": [
-            "{\"chunks\":[{\"topic\":\"2026 Defense Packet Notice\",\"message_ids\":[501],\"category\":\"DEADLINE\",\"reason\":\"Defense eligibility, documents, and venue\"}]}"
-        ],
-        "b6bb46538fbb1684cf01876ec5d495d5aa58bee159b5a9acd047208b6c6e9617": [
+        "11b82affa59254c2c0bc5d9d7064b44703fe54f53c81d350876d2d0968304b7b": [
             "{\"is_relevant\":true,\"events\":[{\"title\":\"2026 Defense Packet Notice\",\"summary\":\"Review eligibility, required documents, and Room 422-1 submission deadline.\",\"translated_summary\":\"Review eligibility, required documents, and Room 422-1 submission deadline.\",\"sections\":[{\"heading\":\"Eligibility\",\"content\":\"- All coursework credits cleared by June 1\"}],\"category\":\"DEADLINE\",\"priority\":\"NORMAL\",\"event_date\":\"2026-06-05\",\"source_message_ids\":[501]},{\"title\":\"Defense Packet Documents\",\"summary\":\"Bring three bound copies and signed advisor form.\",\"translated_summary\":\"Bring three bound copies and signed advisor form.\",\"sections\":[{\"heading\":\"Required Documents\",\"content\":\"- Three bound copies and signed advisor form\"}],\"category\":\"DEADLINE\",\"priority\":\"CRITICAL\",\"event_date\":\"2026-06-01\",\"source_message_ids\":[501]},{\"title\":\"Defense Packet Venue\",\"summary\":\"Submit to Room 422-1 Academic Affairs Office before 17:00.\",\"translated_summary\":\"Submit to Room 422-1 Academic Affairs Office before 17:00.\",\"sections\":[{\"heading\":\"Submission Venue\",\"items\":[{\"kind\":\"LOCATION\",\"label\":\"Venue\",\"value\":\"Room 422-1 Academic Affairs Office\"},{\"kind\":\"DEADLINE\",\"label\":\"Deadline\",\"value\":\"before 17:00\"}],\"content\":\"\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"event_date\":\"2026-06-03\",\"source_message_ids\":[501]}]}"
-        ],
-        "f20958b3240ec14d6986e6d5d65322335af52594c7a52f6d8503762524950a1e": [
-            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Concrete defense requirements\"}]}"
         ]
     }
 }

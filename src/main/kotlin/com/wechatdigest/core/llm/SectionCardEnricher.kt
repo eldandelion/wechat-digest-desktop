@@ -54,7 +54,11 @@ class SectionCardEnricher(private val llmClient: LlmClient) {
         var lastError: Exception? = null
         repeat(2) { attempt ->
             try {
-                val rawResponse = llmClient.chatCompletion(systemPrompt, userPrompt)
+                val rawResponse = llmClient.chatCompletion(
+                    systemPrompt,
+                    userPrompt,
+                    StageJsonSchemas.pass4SectionEnrichmentOptions()
+                )
                 val decoded = LlmJsonUtils.decodeWithRepair(rawResponse) { jsonText ->
                     LlmJsonUtils.sharedJson.decodeFromString<SectionEnrichmentPayload>(jsonText)
                 }
@@ -246,11 +250,9 @@ REQUIREMENTS:
     }
 
     private fun isRetryableError(e: Exception): Boolean {
-        if (e is kotlinx.serialization.SerializationException) return true
+        if (LlmRetryPolicy.isRetryableError(e)) return true
         val msg = e.message.orEmpty()
-        return msg.contains("Empty or missing message", ignoreCase = true) ||
-            msg.contains("returned no text", ignoreCase = true) ||
-            msg.contains("valid structured", ignoreCase = true) ||
+        return msg.contains("valid structured", ignoreCase = true) ||
             msg.contains("omitted or merged structured detail", ignoreCase = true) ||
             msg.contains("omitted structured detail", ignoreCase = true)
     }

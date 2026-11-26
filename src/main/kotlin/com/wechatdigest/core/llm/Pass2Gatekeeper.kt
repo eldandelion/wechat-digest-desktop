@@ -14,6 +14,9 @@ import kotlinx.serialization.json.jsonObject
  */
 internal object Pass2Gatekeeper {
 
+    /** Maximum preview characters per message/attachment block sent to Pass 2 Gatekeeper. */
+    const val MAX_PREVIEW_CHARS_PER_MESSAGE = 500
+
     fun splitIntoBatches(
         chunks: List<EventExtractor.NoticeChunk>,
         batchSize: Int,
@@ -28,8 +31,11 @@ internal object Pass2Gatekeeper {
 
         for (chunk in chunks) {
             val messageChars = chunk.messages.sumOf {
-                val previewChars = it.attachmentPreviews.values.sumOf { preview -> preview.length.toLong() }
-                it.textContent.length.toLong() + it.senderDisplayName.length.toLong() + previewChars + 40L
+                val previewChars = it.attachmentPreviews.values.sumOf { preview ->
+                    minOf(preview.length, MAX_PREVIEW_CHARS_PER_MESSAGE).toLong()
+                }
+                val rawEstimate = it.textContent.length.toLong() + it.senderDisplayName.length.toLong() + previewChars + 40L
+                minOf(rawEstimate, MAX_PREVIEW_CHARS_PER_MESSAGE.toLong() + 40L)
             }
             val chunkChars = minOf(chunk.topic.length, 120).toLong() + messageChars + 100L
             if (current.isNotEmpty() && (current.size >= maxItems || currentChars + chunkChars > maxChars)) {

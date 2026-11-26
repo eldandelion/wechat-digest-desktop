@@ -15,7 +15,9 @@
     "expectedPriorities": ["CRITICAL"],
     "expectedTitles": ["Defense Packet"],
     "mustContainFacts": ["June 1", "bound copies", "422-1"],
-    "maxLlmCalls": 3,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }

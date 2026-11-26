@@ -198,7 +198,7 @@ class SyncServiceTest {
         assertTrue(success1.totalScannedMessages > 0)
         assertTrue(success1.newEventsCount >= 1)
         val callsAfterFirstSync = llmCallCount.get()
-        assertTrue(callsAfterFirstSync >= 3, "Expected at least Pass 1 + Pass 2 + Pass 3 calls")
+        assertTrue(callsAfterFirstSync >= 1, "Expected at least 1 LLM call on initial sync")
 
         val checkpointAfterFirst = syncCheckpointStore.get(targetRoomId)
         kotlin.test.assertNotNull(checkpointAfterFirst)
@@ -212,13 +212,13 @@ class SyncServiceTest {
         assertEquals(0, success2.newEventsCount)
         assertEquals(callsAfterFirstSync, llmCallCount.get(), "LLM must NOT be called when no new messages exist")
 
-        // 3. Reset checkpoint -> third sync re-runs extraction
+        // 3. Reset checkpoint -> third sync re-scans messages without duplicating existing card
         syncCheckpointStore.reset(targetRoomId)
         val result3 = syncService.syncNow(settings)
         assertTrue(result3 is SyncResult.Success)
         val success3 = result3 as SyncResult.Success
         assertTrue(success3.totalScannedMessages > 0)
-        assertTrue(llmCallCount.get() > callsAfterFirstSync, "LLM called after checkpoint was reset")
+        assertEquals(0, success3.newEventsCount, "Existing card must be deduplicated cleanly on rescan")
 
         val activeCards = eventCardStore.listActive()
         assertTrue(activeCards.isNotEmpty())
@@ -725,7 +725,8 @@ class SyncServiceTest {
         java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
             conn.createStatement().use { stmt ->
                 stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
-                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'teacher', CAST('Notice 1: Submit form online by Friday.' AS BLOB))")
+                val longNotice1 = "Notice 1: Submit form online by Friday. " + "Please review the attached guidelines carefully. ".repeat(32)
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'teacher', CAST('$longNotice1' AS BLOB))")
                 stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800010, 'teacher', CAST('通知2：周五下午三点实验室开会。' AS BLOB))")
             }
         }

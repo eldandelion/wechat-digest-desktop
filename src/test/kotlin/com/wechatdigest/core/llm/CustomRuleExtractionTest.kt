@@ -85,7 +85,7 @@ class CustomRuleExtractionTest {
         }
 
         val client = KtorLlmClient(LlmConfig(apiKey = "key"), engine = mockEngine)
-        val extractor = EventExtractor(client)
+        val extractor = EventExtractor(client, enableFastPath = false)
 
         val messages = listOf(
             WeChatMessage(
@@ -153,7 +153,7 @@ class CustomRuleExtractionTest {
         }
 
         val client = KtorLlmClient(LlmConfig(apiKey = "key"), engine = mockEngine)
-        val extractor = EventExtractor(client)
+        val extractor = EventExtractor(client, enableFastPath = false)
         val studentQuestion = WeChatMessage(
             localId = 10L,
             timestampSeconds = 1794815000L,

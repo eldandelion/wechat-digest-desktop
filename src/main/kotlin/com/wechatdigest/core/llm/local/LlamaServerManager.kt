@@ -112,6 +112,8 @@ class LlamaServerManager(
             add("1")
             add("--n-gpu-layers")
             add(ngl)
+            add("--flash-attn")
+            add(if (arch.supportsMetal) "on" else "auto")
             add("--jinja")
             if (model.disableThinkingWithBudgetZero) {
                 add("--reasoning-budget")

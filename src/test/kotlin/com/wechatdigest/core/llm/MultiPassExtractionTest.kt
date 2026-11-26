@@ -209,7 +209,7 @@ class MultiPassExtractionTest {
 
         val customRule = "ignore personal student issues; parse only information posted by a teacher"
         val client = KtorLlmClient(LlmConfig(apiKey = "test-key"), mockEngine)
-        val extractor = EventExtractor(client)
+        val extractor = EventExtractor(client, enableFastPath = false)
         val res = extractor.extractEventsResult(
             messages = listOf(teacherMsg, pingMsg),
             roomId = "cse@chatroom",
@@ -459,8 +459,162 @@ class MultiPassExtractionTest {
             }
         )
         val msgs = (1..3).map { i -> WeChatMessage(i.toLong(), 1794800000L + i, "u", "Teacher", "Official Notice $i details for Friday exam.", "Official Notice $i details for Friday exam.", false) }
-        val failResult = EventExtractor(failClient, maxConcurrency = 3).extractEventsResult(msgs, "room@chatroom")
+        val failResult = EventExtractor(failClient, maxConcurrency = 3, enableFastPath = false).extractEventsResult(msgs, "room@chatroom")
         assertTrue(failResult.isFailure, "Concurrent Pass 3 HTTP 500 must fail fast and propagate failure")
         failClient.close()
+    }
+
+    @Test
+    fun `adaptive fast-path uses 1 LLM call for short transcripts, skips verbatim recent cards, and falls back above 3 messages`() = runBlocking {
+        val stagesCalled = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val fastPathEngine = MockEngine { request ->
+            val body = (request.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val stage = when {
+                body.contains("Semantic Filter & Topic Chunker") -> "pass1"
+                body.contains("Rule & Substance Gatekeeper") -> "pass2"
+                else -> "pass3"
+            }
+            stagesCalled.add(stage)
+            val contentJson = """{"is_relevant":true,"events":[{"title":"Midterm Room Update","summary":"Midterm moved to Hall 101 on June 15 at 09:00.","category":"EXAM","priority":"IMPORTANT","source_message_ids":[10]}]}"""
+            val payload = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), contentJson)}}}]}"""
+            respond(payload, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val client = KtorLlmClient(LlmConfig(apiKey = "test-key"), fastPathEngine)
+        val extractor = EventExtractor(client, zoneId = java.time.ZoneOffset.UTC)
+        val msg = WeChatMessage(10L, 1779012000L, "prof", "Prof_Lin", "Midterm moved to Hall 101 on June 15 at 09:00.", "Midterm moved to Hall 101 on June 15 at 09:00.", false)
+
+        val cards = extractor.extractEventsResult(listOf(msg), "room@chatroom").getOrThrow()
+        assertEquals(listOf("pass3"), stagesCalled, "Fast-path must issue exactly 1 Pass 3 call and skip Pass 1/2")
+        assertEquals(1, cards.size)
+        assertEquals("2026-06-15T09:00:00", cards.single().eventDate)
+
+        // Verbatim recentRoomCards dedupe triggers 0 LLM calls
+        stagesCalled.clear()
+        val dedupedCards = extractor.extractEventsResult(
+            messages = listOf(msg),
+            roomId = "room@chatroom",
+            recentRoomCards = cards
+        ).getOrThrow()
+        assertTrue(dedupedCards.isEmpty())
+        assertTrue(stagesCalled.isEmpty(), "Verbatim covered message must trigger 0 LLM calls in fast-path")
+        client.close()
+    }
+
+    @Test
+    fun `Pass 1 and Pass 2 retry once on empty choices or SerializationException`() = runBlocking {
+        var pass1Attempts = 0
+        var pass2Attempts = 0
+        val retryEngine = MockEngine { request ->
+            val body = (request.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            when {
+                body.contains("Semantic Filter & Topic Chunker") -> {
+                    pass1Attempts++
+                    if (pass1Attempts == 1) {
+                        respond("""{"choices":[]}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+                    } else {
+                        val content = """{"chunks":[{"topic":"Safety Drill","message_ids":[1],"category":"NOTICE"}]}"""
+                        respond("""{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+                    }
+                }
+                body.contains("Rule & Substance Gatekeeper") -> {
+                    pass2Attempts++
+                    val content = if (pass2Attempts == 1) "not valid json" else """{"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Valid"}"""
+                    respond("""{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+                }
+                else -> {
+                    val content = """{"is_relevant":true,"events":[{"title":"Safety Drill","summary":"Safety drill tomorrow at 10:00 in Hall A.","category":"NOTICE","priority":"NORMAL","source_message_ids":[1]}]}"""
+                    respond("""{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+                }
+            }
+        }
+
+        val client = KtorLlmClient(LlmConfig(apiKey = "test-key"), retryEngine)
+        val extractor = EventExtractor(client, enableFastPath = false)
+        val msg = WeChatMessage(1L, 1779012000L, "u1", "Admin", "Safety drill tomorrow at 10:00 in Hall A.", "Safety drill tomorrow at 10:00 in Hall A.", false)
+        val cards = extractor.extractEventsResult(listOf(msg), "room@chatroom").getOrThrow()
+
+        assertEquals(2, pass1Attempts)
+        assertEquals(2, pass2Attempts)
+        assertEquals(1, cards.size)
+        client.close()
+    }
+
+    @Test
+    fun `Pass 2 truncates message preview around 500 chars while Pass 3 receives full text, and local concurrency 1 phases Pass 3 before CardTranslator`() = runBlocking {
+        val longTailMarker = "TAIL_MARKER_ONLY_IN_PASS3"
+        val longText = "Announcement: " + "detail ".repeat(110) + longTailMarker
+        val msg1 = WeChatMessage(1L, 1779012000L, "t1", "Teacher", longText, longText, false)
+        val msg2 = WeChatMessage(2L, 1779012060L, "t2", "Teacher", "Second notice: submit paper copy on May 22.", "Second notice: submit paper copy on May 22.", false)
+
+        val callSequence = java.util.Collections.synchronizedList(mutableListOf<String>())
+        var pass2SawTail = false
+        var pass3SawTail = false
+        val streamedTitles = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+        val localEngine = MockEngine { request ->
+            val body = (request.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                body.contains("Semantic Filter & Topic Chunker") -> {
+                    callSequence.add("pass1")
+                    """{"chunks":[{"topic":"Notice One","message_ids":[1],"category":"NOTICE"},{"topic":"Notice Two","message_ids":[2],"category":"DEADLINE"}]}"""
+                }
+                body.contains("Rule & Substance Gatekeeper") -> {
+                    callSequence.add("pass2")
+                    pass2SawTail = body.contains(longTailMarker)
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"ok"},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"ok"}]}"""
+                }
+                body.contains("Structured Event Card Translator") -> {
+                    callSequence.add("translate")
+                    """{"title":"Translated Notice One","summary":"Translated notice details.","sections":[]}"""
+                }
+                body.contains("[id:1]") -> {
+                    callSequence.add("pass3_1")
+                    pass3SawTail = body.contains(longTailMarker)
+                    // Return Chinese so chunk 0 requires CardTranslator in Phase 2
+                    """{"is_relevant":true,"events":[{"title":"关于通知一的详细说明","summary":"请查看详细通知要求并按时参加活动。","category":"NOTICE","priority":"NORMAL","source_message_ids":[1]}]}"""
+                }
+                else -> {
+                    callSequence.add("pass3_2")
+                    """{"is_relevant":true,"events":[{"title":"Paper Copy Submission","summary":"Submit paper copy on May 22.","category":"DEADLINE","priority":"IMPORTANT","source_message_ids":[2]}]}"""
+                }
+            }
+            val payload = """{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}"""
+            respond(payload, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val ollamaClient = KtorLlmClient(LlmConfig(providerType = LlmProviderType.OLLAMA, endpointUrl = "http://localhost:11434", modelName = "qwen3"), localEngine)
+        val extractor = EventExtractor(ollamaClient, enableFastPath = false)
+        val cards = extractor.extractEventsResult(
+            messages = listOf(msg1, msg2),
+            roomId = "room@chatroom",
+            onCardReady = { streamedTitles.add(it.title) }
+        ).getOrThrow()
+
+        assertFalse(pass2SawTail, "Pass 2 preview must truncate messages > 500 chars")
+        assertTrue(pass3SawTail, "Pass 3 must receive full message text")
+        assertEquals(listOf("pass1", "pass2", "pass3_1", "pass3_2", "translate"), callSequence)
+        assertEquals(listOf("Paper Copy Submission", "Translated Notice One"), streamedTitles, "Compliant card 2 must stream immediately during Phase 1 before Phase 2 translation")
+        assertEquals(listOf("Translated Notice One", "Paper Copy Submission"), cards.map { it.title }, "Returned cards must preserve chronological chunk order")
+        ollamaClient.close()
+    }
+
+    @Test
+    fun `ExtractionPrompts places static instructions before dynamic rules and persona for LCP KV-cache`() {
+        val triage = ExtractionPrompts.buildTriageSystemPrompt(
+            userPersona = "UNIQUE_PERSONA_MARKER",
+            targetLanguage = "English",
+            customRules = "UNIQUE_RULE_MARKER"
+        )
+        assertTrue(triage.indexOf("OUTPUT SCHEMA") < triage.indexOf("UNIQUE_RULE_MARKER"))
+        assertTrue(triage.indexOf("UNIQUE_RULE_MARKER") < triage.indexOf("UNIQUE_PERSONA_MARKER"))
+
+        val synthesis = ExtractionPrompts.buildSystemPrompt(
+            userPersona = "UNIQUE_PERSONA_MARKER",
+            targetLanguage = "en",
+            customRules = "UNIQUE_RULE_MARKER"
+        )
+        assertTrue(synthesis.indexOf("OUTPUT SCHEMA") < synthesis.indexOf("UNIQUE_RULE_MARKER"))
+        assertTrue(synthesis.indexOf("UNIQUE_RULE_MARKER") < synthesis.indexOf("UNIQUE_PERSONA_MARKER"))
     }
 }

@@ -39,7 +39,11 @@ class CardTranslator(private val llmClient: LlmClient) {
         var lastError: Exception? = null
         repeat(2) { attempt ->
             try {
-                val rawResponse = llmClient.chatCompletion(systemPrompt, userPrompt)
+                val rawResponse = llmClient.chatCompletion(
+                    systemPrompt,
+                    userPrompt,
+                    StageJsonSchemas.cardTranslationOptions()
+                )
                 val decoded = LlmJsonUtils.decodeWithRepair(
                     raw = rawResponse,
                     onRepaired = { onJsonRepaired?.invoke() }
@@ -134,11 +138,8 @@ class CardTranslator(private val llmClient: LlmClient) {
         }
     }
 
-    private fun isRetryableFormatOrEmptyError(e: Exception): Boolean {
-        val msg = e.message.orEmpty()
-        return msg.contains("Empty or missing message", ignoreCase = true) ||
-            e is kotlinx.serialization.SerializationException
-    }
+    private fun isRetryableFormatOrEmptyError(e: Exception): Boolean =
+        LlmRetryPolicy.isRetryableError(e)
 
     internal fun buildSystemPrompt(
         targetLangName: String,

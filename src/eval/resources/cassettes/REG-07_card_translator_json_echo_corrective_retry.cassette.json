@@ -4,9 +4,7 @@
     "descriptions": {
         "233dad85c4699ae498d814c5c204e10589caee642a26471df4c7506f8e2102b8": "card_translator",
         "3184bcb927897a1f61db03ba43b44e6432d595348ce64a547d449cf50f2c5c35": "card_translator",
-        "5073c9f2c10ef095f52e1f9b75668b41dd599be580620a286002f1035b2a0c56": "pass3_synthesis",
-        "bc6ac839f5303531fd3f455b140d0a4cbec13bc0a6760a21cbe13dd4454236be": "pass2_gatekeeper",
-        "d2ece61bb52f70c12fd9883a31755f3974bfd9797d316d274792aa59271c2f92": "pass1_triage"
+        "df7db0cefcfa253d201b9d5c903191c5064561cf07353ef2a606b95fd3d302bb": "pass3_synthesis"
     },
     "entries": {
         "233dad85c4699ae498d814c5c204e10589caee642a26471df4c7506f8e2102b8": [
@@ -15,14 +13,8 @@
         "3184bcb927897a1f61db03ba43b44e6432d595348ce64a547d449cf50f2c5c35": [
             "{\"title\":\"Diploma Cover & Clearance Form Pickup\",\"summary\":\"Master students must collect diploma covers and clearance forms at Academic Affairs Room 201 on Thursday at 15:00.\",\"sections\":[{\"heading\":\"Pickup Schedule\",\"content\":\"- Visit Academic Affairs Room 201 on Thursday at 15:00\"}]}"
         ],
-        "5073c9f2c10ef095f52e1f9b75668b41dd599be580620a286002f1035b2a0c56": [
+        "df7db0cefcfa253d201b9d5c903191c5064561cf07353ef2a606b95fd3d302bb": [
             "{\"is_relevant\":true,\"events\":[{\"title\":\"毕业证封皮及离校手续单领取通知\",\"summary\":\"请全体硕士生于本周四15:00前往教务处201室领取毕业证封皮及离校手续单。\",\"translated_summary\":\"请全体硕士生于本周四15:00前往教务处201室领取毕业证封皮及离校手续单。\",\"sections\":[{\"heading\":\"领取安排\",\"content\":\"- 本周四15:00前往教务处201室领取\"}],\"category\":\"NOTICE\",\"priority\":\"NORMAL\",\"source_message_ids\":[701]}]}"
-        ],
-        "bc6ac839f5303531fd3f455b140d0a4cbec13bc0a6760a21cbe13dd4454236be": [
-            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official pickup schedule\"}]}"
-        ],
-        "d2ece61bb52f70c12fd9883a31755f3974bfd9797d316d274792aa59271c2f92": [
-            "{\"chunks\":[{\"topic\":\"毕业证封皮及离校手续单领取\",\"message_ids\":[701],\"category\":\"NOTICE\",\"reason\":\"明确领取时间与地点\"}]}"
         ]
     }
 }

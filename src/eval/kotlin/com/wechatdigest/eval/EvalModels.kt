@@ -6,6 +6,7 @@ import com.wechatdigest.core.llm.LanguageComplianceResult
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.WeChatMessage
 import com.wechatdigest.core.sanitizer.PrefilterConfig
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /** Separates release-blocking regression scenarios from open-ended capability benchmarks. */
@@ -37,6 +38,14 @@ data class EvalMessageInput(
     )
 }
 
+/** Per-card source grounding expectation tying a card title to its own source & content substrings. */
+@Serializable
+data class CardGroundingExpectation(
+    val titleSubstring: String,
+    val requiredSourceSubstrings: List<String> = emptyList(),
+    val requiredContentSubstrings: List<String> = emptyList()
+)
+
 /** Deterministic grader thresholds and expected invariants for an [EvalScenario]. */
 @Serializable
 data class ScenarioExpectations(
@@ -59,7 +68,10 @@ data class ScenarioExpectations(
     val maxTranslationRepairs: Int? = null,
     val minJsonRepairs: Int = 0,
     val requireZeroJsonParseFailures: Boolean = false,
-    val minSectionsOnFirstCard: Int = 0
+    val minSectionsOnFirstCard: Int = 0,
+    val requireValidEventDates: Boolean = false,
+    val minDatedCards: Int = 0,
+    val expectedPerCardGrounding: List<CardGroundingExpectation> = emptyList()
 )
 
 /** Self-contained golden test scenario runnable offline (via cassette) or against a live model. */
@@ -93,7 +105,10 @@ data class LlmCallRecord(
     val latencyMs: Long,
     val success: Boolean,
     val responseChars: Int = 0,
-    val errorSummary: String? = null
+    val errorSummary: String? = null,
+    val promptTokens: Int? = null,
+    val completionTokens: Int? = null,
+    val finishReason: String? = null
 )
 
 /** Trace record of Pass 1 triage window execution. */
@@ -225,6 +240,8 @@ data class ScenarioSummary(
     val avgLlmCalls: Double,
     val avgJsonRepairs: Double,
     val avgTranslationRepairs: Double,
+    val avgPromptTokens: Double = 0.0,
+    val avgCompletionTokens: Double = 0.0,
     val baselineWarnings: List<String> = emptyList(),
     val trialResults: List<ScenarioTrialResult>
 )
@@ -256,5 +273,5 @@ data class EvalBaselineEntry(
 @Serializable
 data class EvalBaseline(
     val version: Int = 1,
-    val entries: Map<String, EvalBaselineEntry> = emptyMap()
+    @SerialName("scenarios") val entries: Map<String, EvalBaselineEntry> = emptyMap()
 )

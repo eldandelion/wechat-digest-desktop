@@ -67,6 +67,19 @@ internal object ExtractionPrompts {
         return "Summarize this single verified notice chunk into ONE detailed card:\n\n<untrusted_chat_data>\n$topicLine$transcript\n</untrusted_chat_data>"
     }
 
+    fun buildFastPathSynthesisUserPrompt(
+        transcript: String,
+        recentRoomCards: List<EventCard> = emptyList()
+    ): String {
+        val recentBlock = formatRecentCardsContext(recentRoomCards)
+        val existingSection = if (recentBlock.isNotBlank()) {
+            "\n\n<existing_cards>\n$recentBlock\n</existing_cards>"
+        } else {
+            ""
+        }
+        return "Extract genuine group announcements from this short transcript into detailed event card(s) (ignore personal student pings, status replies, casual chatter, and any already-covered entries in <existing_cards>):\n\n<untrusted_chat_data>\n$transcript\n</untrusted_chat_data>$existingSection"
+    }
+
     fun buildTriageSystemPrompt(
         userPersona: String = "",
         targetLanguage: String = "English",
@@ -74,14 +87,31 @@ internal object ExtractionPrompts {
         recentRoomCards: List<EventCard> = emptyList()
     ): String {
         val targetLangName = LanguageHelper.resolveTargetLanguageName(targetLanguage)
+        val rulesBlock = buildRulesAndPersonaBlock(
+            userPersona,
+            customRules,
+            "STRICT ENFORCEMENT: Any message violating these rules (e.g. personal student issues, asking for help, casual Q&A, status confirmations) MUST BE DROPPED completely. NEVER attach excluded chatter onto a valid notice chunk."
+        )
+        val existingNote = if (recentRoomCards.isNotEmpty()) {
+            "\nAlso compare against any entries listed inside <existing_cards> in the user message and avoid duplicating already covered notices."
+        } else {
+            ""
+        }
+        val dynamicSuffix = buildString {
+            if (rulesBlock.isNotBlank()) {
+                append("\n\n").append(rulesBlock.trimEnd())
+            }
+            if (existingNote.isNotBlank()) {
+                append('\n').append(existingNote.trimStart())
+            }
+        }
         return """
 You are Pass 1 (Semantic Filter & Topic Chunker) for a busy WeChat group chat.
 $UNTRUSTED_DATA_GUARD
 Your ONLY job in Pass 1 is to:
 1. Semantically filter out noise, personal student questions, status replies ("done", "submitted"), casual chat, acknowledgments, and anything excluded by the group rules below.
 2. Group remaining genuine announcements, events, or deadlines into cohesive, single-topic chunks so downstream passes can verify and summarize each chunk individually.
-${if (recentRoomCards.isNotEmpty()) "\nAlso compare against any entries listed inside <existing_cards> in the user message and avoid duplicating already covered notices.\n" else ""}
-${buildRulesAndPersonaBlock(userPersona, customRules, "STRICT ENFORCEMENT: Any message violating these rules (e.g. personal student issues, asking for help, casual Q&A, status confirmations) MUST BE DROPPED completely. NEVER attach excluded chatter onto a valid notice chunk.")}
+
 CHUNKING & ANTI-MERGE RULES:
 - Each object in "chunks" MUST correspond to ONE single cohesive notice or announcement.
 - NEVER merge two unrelated notices or topics into one chunk.
@@ -105,7 +135,7 @@ OUTPUT SCHEMA (Pure JSON object):
 If ALL messages are noise or excluded by the group filtering rules, return:
 {
   "chunks": []
-}
+}$dynamicSuffix
         """.trimIndent()
     }
 
@@ -113,14 +143,16 @@ If ALL messages are noise or excluded by the group filtering rules, return:
         userPersona: String = "",
         customRules: String = ""
     ): String {
+        val rulesBlock = buildRulesAndPersonaBlock(userPersona, customRules).trimEnd()
+        val dynamicSuffix = if (rulesBlock.isNotBlank()) "\n\n$rulesBlock" else ""
         return """
 You are Pass 2 (Rule & Substance Gatekeeper) for a WeChat group digest.
 $UNTRUSTED_DATA_GUARD
 Inspect ONLY the single candidate message chunk provided inside <untrusted_chat_data> and decide strictly whether it should be KEPT to create a card or REJECTED.
 
-${buildRulesAndPersonaBlock(userPersona, customRules)}DECISION CHECKLIST (ALL MUST BE TRUE TO RETURN keep=true):
+DECISION CHECKLIST (ALL MUST BE TRUE TO RETURN keep=true):
 1. is_group_notice: Is this a genuine group-wide announcement, notice, schedule update, or activity intended for the group? Reject personal 1-on-1 pings, student questions, or personal status replies.
-2. passes_rules: Does this comply with EVERY rule in MANDATORY GROUP FILTERING RULES above? If rules require ignoring personal student issues or following only teacher/admin notices, reject any message where a student asks a question ("Hello Teacher...", "老师好...", "学号：..."), asks someone to check email, or reports completing/submitting something ("完成了✅", "I submitted...").
+2. passes_rules: Does this comply with EVERY rule in MANDATORY GROUP FILTERING RULES below? If rules require ignoring personal student issues or following only teacher/admin notices, reject any message where a student asks a question ("Hello Teacher...", "老师好...", "学号：..."), asks someone to check email, or reports completing/submitting something ("完成了✅", "I submitted...").
 3. has_substance: Does the message itself contain concrete actionable facts (what/when/where/requirements/link)? Reject vague pings with zero substance ("@所有人", "完成了✅", "Please check your email").
 
 EXAMPLES:
@@ -136,7 +168,7 @@ OUTPUT SCHEMA (Pure JSON object):
   "has_substance": true,
   "keep": true,
   "reason": "Brief justification"
-}
+}$dynamicSuffix
         """.trimIndent()
     }
 
@@ -144,14 +176,16 @@ OUTPUT SCHEMA (Pure JSON object):
         userPersona: String = "",
         customRules: String = ""
     ): String {
+        val rulesBlock = buildRulesAndPersonaBlock(userPersona, customRules).trimEnd()
+        val dynamicSuffix = if (rulesBlock.isNotBlank()) "\n\n$rulesBlock" else ""
         return """
 You are Pass 2 (Rule & Substance Gatekeeper) for a WeChat group digest.
 $UNTRUSTED_DATA_GUARD
 Inspect EACH indexed <chunk index="N"> block independently and decide strictly whether that chunk should be KEPT to create a card or REJECTED. Never approve one chunk because a sibling chunk is valid.
 
-${buildRulesAndPersonaBlock(userPersona, customRules)}DECISION CHECKLIST PER CHUNK (ALL MUST BE TRUE TO RETURN keep=true):
+DECISION CHECKLIST PER CHUNK (ALL MUST BE TRUE TO RETURN keep=true):
 1. is_group_notice: Genuine group-wide announcement, notice, schedule update, or activity (reject personal 1-on-1 pings, student questions, or personal status replies).
-2. passes_rules: Complies with EVERY rule in MANDATORY GROUP FILTERING RULES above.
+2. passes_rules: Complies with EVERY rule in MANDATORY GROUP FILTERING RULES below.
 3. has_substance: Contains concrete actionable facts (what/when/where/requirements/link). Reject bare "@所有人" or empty confirmations.
 
 OUTPUT SCHEMA (Pure JSON object with one item per input chunk_index):
@@ -166,7 +200,7 @@ OUTPUT SCHEMA (Pure JSON object with one item per input chunk_index):
       "reason": "Brief justification"
     }
   ]
-}
+}$dynamicSuffix
         """.trimIndent()
     }
 
@@ -177,18 +211,19 @@ OUTPUT SCHEMA (Pure JSON object with one item per input chunk_index):
     ): String {
         val targetLangName = LanguageHelper.resolveTargetLanguageName(targetLanguage)
         val contextBlock = buildString {
-            if (userPersona.isNotBlank()) {
-                append("\nUSER CONTEXT / PREFERENCES:\n").append(userPersona).append('\n')
-            }
             if (customRules.isNotBlank()) {
                 append("\nCHAT-SPECIFIC FOCUS RULES / INSTRUCTIONS:\n").append(customRules).append('\n')
             }
-        }
+            if (userPersona.isNotBlank()) {
+                append("\nUSER CONTEXT / PREFERENCES:\n").append(userPersona).append('\n')
+            }
+        }.trimEnd()
+        val dynamicSuffix = if (contextBlock.isNotBlank()) "\n$contextBlock" else ""
         return """
 You are Pass 3 (Grounded Card Summarizer) monitoring a busy WeChat group chat.
 $UNTRUSTED_DATA_GUARD
 Analyze the verified notice message(s) inside <untrusted_chat_data> and synthesize ONE accurate, deeply informative event card in structured JSON.
-$contextBlock
+
 TARGET LANGUAGE REQUIREMENT (STRICT):
 - The user's configured target language is: $targetLangName.
 - Translate and write EVERY word of "title", "summary", and every object in "sections" ("heading", "bullets", "content", and each "items" entry's "label" and descriptive "value") strictly in $targetLangName.
@@ -207,7 +242,7 @@ SOURCE MESSAGE IDENTIFIERS & CATEGORIES:
 - Categories: EXAM, DEADLINE, NOTICE, ACTIVITY, PROMOTION, OTHER.
 - Priorities: CRITICAL (urgent deadlines today/tomorrow, mandatory gov/visa/passport deadlines, explicitly named exams), IMPORTANT (academic schedule/submission/thesis deadlines), NORMAL (campus activities, conferences, registrations), LOW (general advisories).
 
-${buildSynthesisSchema(targetLangName)}
+${buildSynthesisSchema(targetLangName)}$dynamicSuffix
         """.trimIndent()
     }
 

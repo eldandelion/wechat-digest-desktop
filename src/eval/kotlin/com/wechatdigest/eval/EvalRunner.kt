@@ -251,6 +251,8 @@ object EvalRunner {
             val avgCalls = trials.map { it.trace.llmCalls.size }.average()
             val avgJsonRepairs = trials.map { it.trace.jsonRepairCount }.average()
             val avgTransRepairs = trials.map { it.trace.translationRepairCallCount }.average()
+            val avgPromptTokens = trials.map { t -> t.trace.llmCalls.sumOf { it.promptTokens ?: 0 } }.average()
+            val avgCompletionTokens = trials.map { t -> t.trace.llmCalls.sumOf { it.completionTokens ?: 0 } }.average()
 
             val provisional = ScenarioSummary(
                 scenarioId = scenario.id,
@@ -265,6 +267,8 @@ object EvalRunner {
                 avgLlmCalls = avgCalls,
                 avgJsonRepairs = avgJsonRepairs,
                 avgTranslationRepairs = avgTransRepairs,
+                avgPromptTokens = avgPromptTokens,
+                avgCompletionTokens = avgCompletionTokens,
                 trialResults = trials
             )
             val driftWarnings = EvalGraders.checkBaselineDrift(provisional, baseline.entries[scenario.id])

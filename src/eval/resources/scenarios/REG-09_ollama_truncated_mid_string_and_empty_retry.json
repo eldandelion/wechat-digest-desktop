@@ -15,7 +15,9 @@
     "expectedTitles": ["Physics Lab Midterm"],
     "mustContainFacts": ["Room 105", "09:00", "AI declaration"],
     "minJsonRepairs": 1,
-    "maxLlmCalls": 4,
+    "maxLlmCalls": 2,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true
   }
 }

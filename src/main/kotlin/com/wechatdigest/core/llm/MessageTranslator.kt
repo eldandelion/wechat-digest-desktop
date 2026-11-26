@@ -40,19 +40,30 @@ $safeSource
 </untrusted_chat_data>
         """.trimIndent()
 
-        return try {
-            val rawResponse = llmClient.chatCompletion(systemPrompt, userPrompt)
-            val parsed = parseTranslationOutput(rawResponse)
-            if (parsed.isBlank()) {
-                Result.failure(IllegalStateException("LLM returned an empty translation."))
-            } else {
-                Result.success(parsed)
+        var lastError: Exception? = null
+        repeat(2) { attempt ->
+            try {
+                val rawResponse = llmClient.chatCompletion(
+                    systemPrompt,
+                    userPrompt,
+                    StageJsonSchemas.messageTranslationOptions()
+                )
+                val parsed = parseTranslationOutput(rawResponse)
+                if (parsed.isBlank()) {
+                    throw IllegalStateException("LLM returned no text for translation.")
+                }
+                return Result.success(parsed)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(e)
+                if (!retryable) {
+                    return Result.failure(e)
+                }
             }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Result.failure(e)
         }
+        return Result.failure(lastError ?: IllegalStateException("MessageTranslator failed unexpectedly"))
     }
 
     internal fun buildSystemPrompt(targetLangName: String): String {

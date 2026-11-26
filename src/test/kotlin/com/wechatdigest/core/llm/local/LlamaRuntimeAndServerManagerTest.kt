@@ -258,8 +258,14 @@ class LlamaRuntimeAndServerManagerTest {
         assertEquals(fakeServerBin.absolutePath, cmd[0])
         assertTrue("--host" in cmd && "127.0.0.1" in cmd)
         assertTrue("--n-gpu-layers" in cmd && "99" in cmd)
+        assertTrue("--flash-attn" in cmd)
+        assertEquals("on", cmd[cmd.indexOf("--flash-attn") + 1])
         assertTrue("--reasoning-budget" in cmd && "0" in cmd)
         assertTrue(serverManager.serverState.value is LocalServerState.Running)
+
+        val x64Cmd = serverManager.buildCommand(fakeServerBin, resolvedModel, 18999, 8192, MacArchitecture.X64)
+        assertEquals("0", x64Cmd[x64Cmd.indexOf("--n-gpu-layers") + 1])
+        assertEquals("auto", x64Cmd[x64Cmd.indexOf("--flash-attn") + 1])
 
         serverManager.stopBlocking()
         assertTrue(spawnedProcesses.single().destroyed)
@@ -372,13 +378,18 @@ class LlamaRuntimeAndServerManagerTest {
             localModelId = curated.id,
             apiKey = "stale-secret-key"
         )
+        var factoryCreations = 0
         val client = ManagedLocalLlmClient(config, store, serverManager) { cfg ->
+            factoryCreations++
             com.wechatdigest.core.llm.KtorLlmClient(cfg, engine = completionMock)
         }
 
         assertEquals(1, client.recommendedConcurrency)
         val reply = client.chatCompletion("sys", "user")
+        val reply2 = client.chatCompletion("sys", "user2")
         assertEquals("{\"ok\":true}", reply)
+        assertEquals("{\"ok\":true}", reply2)
+        assertEquals(1, factoryCreations, "ManagedLocalLlmClient must cache KtorLlmClient across calls")
         assertEquals("http://127.0.0.1:19001/v1/chat/completions", seenUrl)
         assertEquals(null, seenAuthHeader)
 

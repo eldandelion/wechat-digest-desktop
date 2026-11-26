@@ -2,8 +2,10 @@ package com.wechatdigest.eval
 
 import com.wechatdigest.core.llm.ConcurrencyAwareLlmClient
 import com.wechatdigest.core.llm.EventExtractor
-import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
+import com.wechatdigest.core.llm.LlmCompletionOptions
+import com.wechatdigest.core.llm.LlmTelemetryElement
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -67,13 +69,24 @@ class TracingLlmClient(
     private val callCounter = AtomicInteger(0)
     private val recordedCalls = Collections.synchronizedList(mutableListOf<LlmCallRecord>())
 
-    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String {
+    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String =
+        chatCompletion(systemPrompt, userPrompt, LlmCompletionOptions())
+
+    override suspend fun chatCompletion(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String {
         val index = callCounter.incrementAndGet()
         val stage = CassetteKeyer.detectStage(systemPrompt)
         val hash = CassetteKeyer.hashPrompts(stage, systemPrompt, userPrompt)
         val startMs = System.currentTimeMillis()
+        val telemetryElement = LlmTelemetryElement()
         return try {
-            val response = delegate.chatCompletion(systemPrompt, userPrompt)
+            val response = withContext(telemetryElement) {
+                delegate.chatCompletion(systemPrompt, userPrompt, options)
+            }
+            val telemetry = telemetryElement.latest
             recordedCalls.add(
                 LlmCallRecord(
                     callIndex = index,
@@ -81,11 +94,15 @@ class TracingLlmClient(
                     promptHash = hash,
                     latencyMs = System.currentTimeMillis() - startMs,
                     success = true,
-                    responseChars = response.length
+                    responseChars = response.length,
+                    promptTokens = telemetry?.promptTokens,
+                    completionTokens = telemetry?.completionTokens,
+                    finishReason = telemetry?.finishReason
                 )
             )
             response
         } catch (e: Exception) {
+            val telemetry = telemetryElement.latest
             recordedCalls.add(
                 LlmCallRecord(
                     callIndex = index,
@@ -93,7 +110,10 @@ class TracingLlmClient(
                     promptHash = hash,
                     latencyMs = System.currentTimeMillis() - startMs,
                     success = false,
-                    errorSummary = e.message?.take(180)
+                    errorSummary = e.message?.take(180),
+                    promptTokens = telemetry?.promptTokens,
+                    completionTokens = telemetry?.completionTokens,
+                    finishReason = telemetry?.finishReason
                 )
             )
             throw e
@@ -124,13 +144,20 @@ class RecordingLlmClient(
     private val entries = ConcurrentHashMap<String, MutableList<String>>()
     private val descriptions = ConcurrentHashMap<String, String>()
 
-    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String {
+    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String =
+        chatCompletion(systemPrompt, userPrompt, LlmCompletionOptions())
+
+    override suspend fun chatCompletion(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String {
         val stage = CassetteKeyer.detectStage(systemPrompt)
         val hash = CassetteKeyer.hashPrompts(stage, systemPrompt, userPrompt)
         descriptions.putIfAbsent(hash, stage)
         val bucket = entries.computeIfAbsent(hash) { Collections.synchronizedList(mutableListOf()) }
         return try {
-            val response = delegate.chatCompletion(systemPrompt, userPrompt)
+            val response = delegate.chatCompletion(systemPrompt, userPrompt, options)
             bucket.add(response)
             response
         } catch (e: Exception) {
@@ -175,7 +202,14 @@ class ReplayLlmClient(
 
     private val counters = ConcurrentHashMap<String, AtomicInteger>()
 
-    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String {
+    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String =
+        chatCompletion(systemPrompt, userPrompt, LlmCompletionOptions())
+
+    override suspend fun chatCompletion(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String {
         val stage = CassetteKeyer.detectStage(systemPrompt)
         val hash = CassetteKeyer.hashPrompts(stage, systemPrompt, userPrompt)
         val list = cassette.entries[hash]

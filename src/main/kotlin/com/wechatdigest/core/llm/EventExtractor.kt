@@ -39,8 +39,9 @@ class EventExtractor(
     maxConcurrency: Int = resolveDefaultConcurrency(llmClient),
     gatekeeperBatchSize: Int = DEFAULT_GATEKEEPER_BATCH_SIZE,
     gatekeeperBatchMaxChars: Int = DEFAULT_GATEKEEPER_BATCH_MAX_CHARS,
-    zoneId: ZoneId = ZoneId.systemDefault(),
-    private val observer: ExtractionObserver = ExtractionObserver.NoOp
+    private val zoneId: ZoneId = ZoneId.systemDefault(),
+    private val observer: ExtractionObserver = ExtractionObserver.NoOp,
+    private val enableFastPath: Boolean = true
 ) {
 
     companion object {
@@ -67,6 +68,12 @@ class EventExtractor(
 
         /** Default character budget per batched Pass 2 Gatekeeper prompt. */
         const val DEFAULT_GATEKEEPER_BATCH_MAX_CHARS = 6_000
+
+        /** Maximum substantive messages eligible for 1-call fused fast-path synthesis. */
+        const val FAST_PATH_MAX_MESSAGES = 3
+
+        /** Maximum formatted prompt character count eligible for 1-call fused fast-path synthesis. */
+        const val FAST_PATH_MAX_CHARS = 1_500
 
         private const val TIGHT_BURST_GAP_SECONDS = 300L
 
@@ -188,6 +195,24 @@ class EventExtractor(
         if (substantive.isEmpty()) return Result.success(emptyList())
 
         val semaphore = Semaphore(effectiveMaxConcurrency)
+        if (enableFastPath &&
+            substantive.size <= FAST_PATH_MAX_MESSAGES &&
+            formatTranscriptForPrompt(substantive).length < FAST_PATH_MAX_CHARS
+        ) {
+            return extractSingleFastPath(
+                substantive = substantive,
+                roomId = roomId,
+                roomDisplayName = roomDisplayName,
+                userPersona = userPersona,
+                targetLanguage = targetLanguage,
+                customRules = customRules,
+                recentRoomCards = recentRoomCards,
+                semaphore = semaphore,
+                onCardReady = onCardReady,
+                onProgress = onProgress
+            )
+        }
+
         notifyProgress(onProgress, "Triaging messages...", 0, substantive.size)
             .getOrElse { return Result.failure(it) }
         val discovered = runPass1Triage(substantive, userPersona, targetLanguage, customRules, recentRoomCards, semaphore)
@@ -266,6 +291,156 @@ class EventExtractor(
         block(item).getOrElse { throw StageFailureException(it) }
     }
 
+    private suspend fun extractSingleFastPath(
+        substantive: List<WeChatMessage>,
+        roomId: String,
+        roomDisplayName: String,
+        userPersona: String,
+        targetLanguage: String,
+        customRules: String,
+        recentRoomCards: List<EventCard>,
+        semaphore: Semaphore,
+        onCardReady: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
+    ): Result<List<EventCard>> {
+        val existingSourceSet = buildExistingSourceSet(recentRoomCards)
+        val remaining = substantive.filterNot { msg ->
+            normalizeSourceText(formatSourceMessages(listOf(msg))) in existingSourceSet
+        }
+        if (remaining.isEmpty()) return Result.success(emptyList())
+        if (normalizeSourceText(formatSourceMessages(remaining)) in existingSourceSet) {
+            return Result.success(emptyList())
+        }
+
+        notifyProgress(onProgress, "Extracting ${remaining.size} message(s)...", 0, 1)
+            .getOrElse { return Result.failure(it) }
+
+        val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules)
+        val userPrompt = ExtractionPrompts.buildFastPathSynthesisUserPrompt(
+            transcript = formatTranscriptForPrompt(remaining),
+            recentRoomCards = recentRoomCards
+        )
+
+        val startMs = System.currentTimeMillis()
+        val initialCards = runFastPathSynthesisWithRetry(
+            systemPrompt = systemPrompt,
+            userPrompt = userPrompt,
+            remaining = remaining,
+            roomId = roomId,
+            roomDisplayName = roomDisplayName,
+            semaphore = semaphore,
+            startMs = startMs
+        ).getOrElse { return Result.failure(it) }
+        if (initialCards.isEmpty()) {
+            notifyProgress(onProgress, "Extracting notices (1/1)...", 1, 1)
+                .getOrElse { return Result.failure(it) }
+            return Result.success(emptyList())
+        }
+
+        val translator = CardTranslator(llmClient)
+        val completedCount = AtomicInteger(0)
+        val progressMutex = Mutex()
+        val slots = arrayOfNulls<EventCard>(initialCards.size)
+        val pendingTranslations = mutableListOf<Triple<Int, EventCard, LanguageComplianceResult>>()
+
+        for ((idx, card) in initialCards.withIndex()) {
+            val initialCompliance = LanguageHelper.checkCardCompliance(card, targetLanguage)
+            if (initialCompliance.isCompliant) {
+                if (observer !== ExtractionObserver.NoOp) {
+                    observer.onLanguageGateResult(card.title, initialCompliance, repairAttempts = 0, jsonRepairedCount = 0, finalCompliant = true)
+                }
+                slots[idx] = card
+                if (onCardReady != null) {
+                    try {
+                        onCardReady.invoke(card)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        return Result.failure(e)
+                    }
+                }
+                reportPass3Progress(progressMutex, onProgress, completedCount, initialCards.size, incrementCompleted = true, translating = false)
+                    .getOrElse { return Result.failure(it) }
+            } else {
+                pendingTranslations.add(Triple(idx, card, initialCompliance))
+            }
+        }
+
+        for ((idx, card, initialCompliance) in pendingTranslations) {
+            reportPass3Progress(progressMutex, onProgress, completedCount, initialCards.size, incrementCompleted = false, translating = true)
+                .getOrElse { return Result.failure(it) }
+            val repaired = repairSingleCard(translator, card, initialCompliance, targetLanguage, semaphore)
+                .getOrElse { return Result.failure(it) }
+            slots[idx] = repaired
+            if (onCardReady != null) {
+                try {
+                    onCardReady.invoke(repaired)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    return Result.failure(e)
+                }
+            }
+            reportPass3Progress(progressMutex, onProgress, completedCount, initialCards.size, incrementCompleted = true, translating = false)
+                .getOrElse { return Result.failure(it) }
+        }
+
+        return Result.success(slots.filterNotNull())
+    }
+
+    private suspend fun runFastPathSynthesisWithRetry(
+        systemPrompt: String,
+        userPrompt: String,
+        remaining: List<WeChatMessage>,
+        roomId: String,
+        roomDisplayName: String,
+        semaphore: Semaphore,
+        startMs: Long
+    ): Result<List<EventCard>> {
+        var lastResult: Result<List<EventCard>> = Result.failure(IllegalStateException("Fast-path Pass 3 did not execute"))
+        var attemptsUsed = 0
+        var anyRepaired = false
+
+        repeat(2) { attempt ->
+            attemptsUsed = attempt + 1
+            val rawResponse = semaphore.withPermit {
+                queryLlm("Fast-path Pass 3 synthesis", systemPrompt, userPrompt, StageJsonSchemas.pass3SynthesisOptions())
+            }.getOrElse { err ->
+                lastResult = Result.failure(err)
+                val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(err)
+                if (!retryable) return lastResult
+                return@repeat
+            }
+
+            var jsonRepaired = false
+            val parsed = parseExtractionResponseResult(
+                rawJson = rawResponse,
+                substantiveMessages = remaining,
+                roomId = roomId,
+                roomDisplayName = roomDisplayName,
+                singleMessageFallback = remaining.size == 1,
+                onRepaired = { jsonRepaired = true }
+            )
+            if (jsonRepaired) anyRepaired = true
+            if (parsed.isSuccess) {
+                if (observer !== ExtractionObserver.NoOp) {
+                    observer.onPass3ChunkResult(
+                        chunkTopic = "Fast-path synthesis",
+                        chunkMessageIds = remaining.map { it.localId },
+                        attempts = attemptsUsed,
+                        jsonRepaired = anyRepaired,
+                        cardProduced = parsed.getOrThrow().isNotEmpty(),
+                        latencyMs = System.currentTimeMillis() - startMs
+                    )
+                }
+                return parsed
+            }
+            lastResult = parsed
+            val parseErr = parsed.exceptionOrNull()
+            val retryableParse = attempt == 0 && parseErr != null && LlmRetryPolicy.isRetryableError(parseErr)
+            if (!retryableParse) return lastResult
+        }
+        return lastResult
+    }
+
     private suspend fun runPass1Triage(
         substantiveMessages: List<WeChatMessage>,
         userPersona: String,
@@ -279,26 +454,46 @@ class EventExtractor(
         return mapConcurrent(windows, semaphore) { window ->
             val startMs = System.currentTimeMillis()
             val userPrompt = ExtractionPrompts.buildTriageUserPrompt(formatTranscriptForPrompt(window), recentRoomCards)
-            val rawJson = queryLlm("Pass 1 triage", systemPrompt, userPrompt)
-                .getOrElse { return@mapConcurrent Result.failure(it) }
-            var jsonRepaired = false
-            var usedLegacyFallback = false
-            val parsed = parseTriageResponseDetailed(
-                rawJson = rawJson,
-                windowMessages = window,
-                onRepaired = { jsonRepaired = true },
-                onLegacyFallback = { usedLegacyFallback = true }
-            )
-            if (observer !== ExtractionObserver.NoOp) {
-                observer.onPass1WindowResult(
-                    windowMessageIds = window.map { it.localId },
-                    discoveredChunkCount = parsed.getOrNull()?.size ?: 0,
-                    jsonRepaired = jsonRepaired,
-                    usedLegacyFallback = usedLegacyFallback,
-                    latencyMs = System.currentTimeMillis() - startMs
+            var lastResult: Result<List<NoticeChunk>> = Result.failure(IllegalStateException("Pass 1 triage did not execute"))
+            var anyRepaired = false
+            var anyLegacyFallback = false
+
+            repeat(2) { attempt ->
+                val rawJson = queryLlm("Pass 1 triage", systemPrompt, userPrompt, StageJsonSchemas.pass1TriageOptions())
+                    .getOrElse { err ->
+                        lastResult = Result.failure(err)
+                        val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(err)
+                        if (!retryable) return@mapConcurrent lastResult
+                        return@repeat
+                    }
+                var jsonRepaired = false
+                var usedLegacyFallback = false
+                val parsed = parseTriageResponseDetailed(
+                    rawJson = rawJson,
+                    windowMessages = window,
+                    onRepaired = { jsonRepaired = true },
+                    onLegacyFallback = { usedLegacyFallback = true }
                 )
+                if (jsonRepaired) anyRepaired = true
+                if (usedLegacyFallback) anyLegacyFallback = true
+                if (parsed.isSuccess) {
+                    if (observer !== ExtractionObserver.NoOp) {
+                        observer.onPass1WindowResult(
+                            windowMessageIds = window.map { it.localId },
+                            discoveredChunkCount = parsed.getOrNull()?.size ?: 0,
+                            jsonRepaired = anyRepaired,
+                            usedLegacyFallback = anyLegacyFallback,
+                            latencyMs = System.currentTimeMillis() - startMs
+                        )
+                    }
+                    return@mapConcurrent parsed
+                }
+                lastResult = parsed
+                val parseErr = parsed.exceptionOrNull()
+                val retryableParse = attempt == 0 && parseErr != null && LlmRetryPolicy.isRetryableError(parseErr)
+                if (!retryableParse) return@mapConcurrent lastResult
             }
-            parsed
+            lastResult
         }.map { perWindow -> perWindow.flatten() }
     }
 
@@ -315,18 +510,39 @@ class EventExtractor(
         return mapConcurrent(batches, semaphore) { batch ->
             val startMs = System.currentTimeMillis()
             val (systemPrompt, userPrompt) = buildGatekeeperPrompts(batch, singlePrompt, batchedPrompt)
-            val rawJson = queryLlm("Pass 2 gatekeeper", systemPrompt, userPrompt)
-                .getOrElse { return@mapConcurrent Result.failure(it) }
-            val evaluation = Pass2Gatekeeper.evaluateBatchVerdictDetailed(batch, rawJson)
-            if (observer !== ExtractionObserver.NoOp && evaluation.isSuccess) {
-                val detail = evaluation.getOrThrow()
-                observer.onPass2BatchResult(
-                    verdicts = detail.traces,
-                    jsonRepaired = detail.jsonRepaired,
-                    latencyMs = System.currentTimeMillis() - startMs
-                )
+            val options = if (batch.size == 1) {
+                StageJsonSchemas.pass2GatekeeperSingleOptions()
+            } else {
+                StageJsonSchemas.pass2GatekeeperBatchedOptions()
             }
-            evaluation.map { it.approvedChunks }
+
+            var lastResult: Result<List<NoticeChunk>> = Result.failure(IllegalStateException("Pass 2 gatekeeper did not execute"))
+            repeat(2) { attempt ->
+                val rawJson = queryLlm("Pass 2 gatekeeper", systemPrompt, userPrompt, options)
+                    .getOrElse { err ->
+                        lastResult = Result.failure(err)
+                        val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(err)
+                        if (!retryable) return@mapConcurrent lastResult
+                        return@repeat
+                    }
+                val evaluation = Pass2Gatekeeper.evaluateBatchVerdictDetailed(batch, rawJson)
+                if (evaluation.isSuccess) {
+                    val detail = evaluation.getOrThrow()
+                    if (observer !== ExtractionObserver.NoOp) {
+                        observer.onPass2BatchResult(
+                            verdicts = detail.traces,
+                            jsonRepaired = detail.jsonRepaired,
+                            latencyMs = System.currentTimeMillis() - startMs
+                        )
+                    }
+                    return@mapConcurrent Result.success(detail.approvedChunks)
+                }
+                val evalErr = evaluation.exceptionOrNull()
+                lastResult = Result.failure(evalErr ?: IllegalStateException("Pass 2 evaluation failed"))
+                val retryableParse = attempt == 0 && evalErr != null && LlmRetryPolicy.isRetryableError(evalErr)
+                if (!retryableParse) return@mapConcurrent lastResult
+            }
+            lastResult
         }.map { approvedBatches -> approvedBatches.flatten() }
     }
 
@@ -339,11 +555,11 @@ class EventExtractor(
             val single = batch.single()
             return singlePrompt to ExtractionPrompts.buildGatekeeperUserPrompt(
                 chunkTopic = single.topic,
-                transcript = formatSourceMessagesForPrompt(single.messages)
+                transcript = formatGatekeeperMessagesForPrompt(single.messages)
             )
         }
         val indexed = batch.mapIndexed { idx, chunk ->
-            Triple(idx, chunk.topic, formatSourceMessagesForPrompt(chunk.messages))
+            Triple(idx, chunk.topic, formatGatekeeperMessagesForPrompt(chunk.messages))
         }
         return batchedPrompt to ExtractionPrompts.buildBatchedGatekeeperUserPrompt(indexed)
     }
@@ -364,6 +580,21 @@ class EventExtractor(
         val translator = CardTranslator(llmClient)
         val completedCount = AtomicInteger(0)
         val progressMutex = Mutex()
+        if (effectiveMaxConcurrency <= 1 && chunks.size > 1) {
+            return runPass3PhasedLocal(
+                chunks = chunks,
+                systemPrompt = systemPrompt,
+                roomId = roomId,
+                roomDisplayName = roomDisplayName,
+                targetLanguage = targetLanguage,
+                translator = translator,
+                semaphore = semaphore,
+                completedCount = completedCount,
+                progressMutex = progressMutex,
+                onCardReady = onCardReady,
+                onProgress = onProgress
+            )
+        }
         val runner: suspend (NoticeChunk) -> Result<EventCard?> = { chunk ->
             processChunkPass3AndTranslate(
                 chunk = chunk,
@@ -384,6 +615,84 @@ class EventExtractor(
             return runPass3Sequential(chunks, runner)
         }
         return runPass3Concurrent(chunks, runner)
+    }
+
+    /**
+     * For serial local inference (`concurrency == 1`), runs all Pass 3 synthesis calls before any
+     * [CardTranslator] repair calls so the KV-cache prefix stays hot across chunks, while still
+     * streaming already-compliant cards via [onCardReady] immediately.
+     */
+    private suspend fun runPass3PhasedLocal(
+        chunks: List<NoticeChunk>,
+        systemPrompt: String,
+        roomId: String,
+        roomDisplayName: String,
+        targetLanguage: String,
+        translator: CardTranslator,
+        semaphore: Semaphore,
+        completedCount: AtomicInteger,
+        progressMutex: Mutex,
+        onCardReady: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
+    ): Result<List<EventCard>> {
+        val slots = arrayOfNulls<EventCard>(chunks.size)
+        val pendingTranslations = mutableListOf<Triple<Int, EventCard, LanguageComplianceResult>>()
+
+        for ((index, chunk) in chunks.withIndex()) {
+            val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages))
+            val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, semaphore)
+                .getOrElse { err ->
+                    if (err is CancellationException) throw err
+                    return Result.failure(err)
+                }
+            if (synthesized == null) {
+                reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = true, translating = false)
+                    .getOrElse { return Result.failure(it) }
+                continue
+            }
+            val initialCompliance = LanguageHelper.checkCardCompliance(synthesized, targetLanguage)
+            if (initialCompliance.isCompliant) {
+                if (observer !== ExtractionObserver.NoOp) {
+                    observer.onLanguageGateResult(synthesized.title, initialCompliance, repairAttempts = 0, jsonRepairedCount = 0, finalCompliant = true)
+                }
+                slots[index] = synthesized
+                if (onCardReady != null) {
+                    try {
+                        onCardReady.invoke(synthesized)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        return Result.failure(e)
+                    }
+                }
+                reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = true, translating = false)
+                    .getOrElse { return Result.failure(it) }
+            } else {
+                pendingTranslations.add(Triple(index, synthesized, initialCompliance))
+            }
+        }
+
+        for ((index, card, initialCompliance) in pendingTranslations) {
+            reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = false, translating = true)
+                .getOrElse { return Result.failure(it) }
+            val repaired = repairSingleCard(translator, card, initialCompliance, targetLanguage, semaphore)
+                .getOrElse { err ->
+                    if (err is CancellationException) throw err
+                    return Result.failure(err)
+                }
+            slots[index] = repaired
+            if (onCardReady != null) {
+                try {
+                    onCardReady.invoke(repaired)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    return Result.failure(e)
+                }
+            }
+            reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = true, translating = false)
+                .getOrElse { return Result.failure(it) }
+        }
+
+        return Result.success(slots.filterNotNull())
     }
 
     private suspend fun runPass3Sequential(
@@ -523,10 +832,10 @@ class EventExtractor(
         repeat(2) { attempt ->
             attemptsUsed = attempt + 1
             val rawResponse = semaphore.withPermit {
-                queryLlm("Pass 3 chunk synthesis", systemPrompt, userPrompt)
+                queryLlm("Pass 3 chunk synthesis", systemPrompt, userPrompt, StageJsonSchemas.pass3SynthesisOptions())
             }.getOrElse { err ->
                 lastResult = Result.failure(err)
-                val retryable = attempt == 0 && err.message.orEmpty().contains("Empty or missing message", ignoreCase = true)
+                val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(err)
                 if (!retryable) return lastResult
                 return@repeat
             }
@@ -548,7 +857,7 @@ class EventExtractor(
             }
             lastResult = parsed
             val parseErr = parsed.exceptionOrNull()
-            val retryableParse = attempt == 0 && parseErr is kotlinx.serialization.SerializationException
+            val retryableParse = attempt == 0 && parseErr != null && LlmRetryPolicy.isRetryableError(parseErr)
             if (!retryableParse) return lastResult
         }
         return lastResult
@@ -616,9 +925,14 @@ class EventExtractor(
         return best
     }
 
-    private suspend fun queryLlm(stage: String, systemPrompt: String, userPrompt: String): Result<String> {
+    private suspend fun queryLlm(
+        stage: String,
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions = LlmCompletionOptions()
+    ): Result<String> {
         return try {
-            Result.success(llmClient.chatCompletion(systemPrompt, userPrompt))
+            Result.success(llmClient.chatCompletion(systemPrompt, userPrompt, options))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -675,6 +989,19 @@ class EventExtractor(
         return formatMessages(messages, includeIds = true, sanitizeForPrompt = true, includeAttachmentPreviews = true)
     }
 
+    private fun formatGatekeeperMessagesForPrompt(messages: List<WeChatMessage>): String {
+        return PromptMessageFormatter.formatMessages(
+            messages = messages,
+            timeFormatter = timeFormatter,
+            maxSingleMessageChars = Pass2Gatekeeper.MAX_PREVIEW_CHARS_PER_MESSAGE,
+            includeIds = false,
+            sanitizeForPrompt = true,
+            includeAttachmentPreviews = true,
+            truncateWithEllipsis = true,
+            maxTotalEntryChars = Pass2Gatekeeper.MAX_PREVIEW_CHARS_PER_MESSAGE
+        )
+    }
+
     private fun formatSourceMessagesForPrompt(messages: List<WeChatMessage>): String {
         return formatMessages(messages, includeIds = false, sanitizeForPrompt = true, includeAttachmentPreviews = true)
     }
@@ -682,6 +1009,13 @@ class EventExtractor(
     private fun formatSourceMessages(messages: List<WeChatMessage>): String {
         return formatMessages(messages, includeIds = false, sanitizeForPrompt = false, includeAttachmentPreviews = false)
     }
+
+    private fun normalizeSourceText(raw: String): String = raw.trim().replace(Regex("\\s+"), " ")
+
+    private fun buildExistingSourceSet(recentRoomCards: List<EventCard>): Set<String> =
+        recentRoomCards
+            .mapNotNull { card -> card.sourceMessages.trim().takeIf(String::isNotBlank)?.let(::normalizeSourceText) }
+            .toSet()
 
     private fun formatMessages(
         messages: List<WeChatMessage>,
@@ -803,9 +1137,7 @@ class EventExtractor(
         messageIndexById: Map<Long, Int>
     ): List<NoticeChunk> {
         if (chunks.isEmpty()) return emptyList()
-        val existingSourceSet = recentRoomCards
-            .mapNotNull { card -> card.sourceMessages.trim().takeIf(String::isNotBlank)?.replace(Regex("\\s+"), " ") }
-            .toSet()
+        val existingSourceSet = buildExistingSourceSet(recentRoomCards)
 
         val seenIdSets = mutableSetOf<List<Long>>()
         val result = mutableListOf<NoticeChunk>()
@@ -814,7 +1146,7 @@ class EventExtractor(
             if (orderedMessages.isEmpty()) continue
             if (!seenIdSets.add(orderedMessages.map { it.localId })) continue
 
-            val normalizedSource = formatSourceMessages(orderedMessages).trim().replace(Regex("\\s+"), " ")
+            val normalizedSource = normalizeSourceText(formatSourceMessages(orderedMessages))
             if (normalizedSource in existingSourceSet) continue
             result.add(chunk.copy(messages = orderedMessages))
         }
@@ -851,7 +1183,8 @@ class EventExtractor(
             roomDisplayName = roomDisplayName,
             fallbackTitle = fallbackTitle,
             joinDistinctTitles = false,
-            sourceAttachments = chunk.messages.flatMap { it.attachments }
+            sourceAttachments = chunk.messages.flatMap { it.attachments },
+            zoneId = zoneId
         )
         return Result.success(card)
     }
@@ -867,10 +1200,15 @@ class EventExtractor(
         rawJson: String,
         substantiveMessages: List<WeChatMessage>,
         roomId: String,
-        roomDisplayName: String = ""
+        roomDisplayName: String = "",
+        singleMessageFallback: Boolean = false,
+        onRepaired: (() -> Unit)? = null
     ): Result<List<EventCard>> {
         val response = try {
-            LlmJsonUtils.decodeWithRepair(rawJson) { jsonText ->
+            LlmJsonUtils.decodeWithRepair(
+                raw = rawJson,
+                onRepaired = { onRepaired?.invoke() }
+            ) { jsonText ->
                 LlmJsonUtils.sharedJson.decodeFromString<LlmExtractionResponse>(jsonText)
             }
         } catch (e: Exception) {
@@ -885,7 +1223,12 @@ class EventExtractor(
         val messageIndexById = substantiveMessages.withIndex().associate { it.value.localId to it.index }
 
         val resolved = response.events.map { extracted ->
-            val matchedMessages = resolveMatchedMessages(extracted.sourceMessageIds, messagesById, messageIndexById)
+            val rawMatched = resolveMatchedMessages(extracted.sourceMessageIds, messagesById, messageIndexById)
+            val matchedMessages = if (rawMatched.isEmpty() && singleMessageFallback && substantiveMessages.size == 1) {
+                substantiveMessages
+            } else {
+                rawMatched
+            }
             ExtractionCardConsolidator.ResolvedExtraction(
                 extracted = extracted,
                 matchedMessages = matchedMessages,
@@ -904,8 +1247,9 @@ class EventExtractor(
                 roomId = roomId,
                 roomDisplayName = roomDisplayName,
                 fallbackTitle = "Group Notice",
-                joinDistinctTitles = true,
-                sourceAttachments = allMatched.flatMap { it.attachments }
+                joinDistinctTitles = false,
+                sourceAttachments = allMatched.flatMap { it.attachments },
+                zoneId = zoneId
             )
         }
         return Result.success(cards)

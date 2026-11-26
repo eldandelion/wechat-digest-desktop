@@ -18,7 +18,9 @@
     "forbiddenTitleSubstrings": ["draft thesis email"],
     "forbiddenContentSubstrings": ["Did you receive"],
     "forbiddenSourceSubstrings": ["Student_A"],
-    "maxLlmCalls": 3,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }

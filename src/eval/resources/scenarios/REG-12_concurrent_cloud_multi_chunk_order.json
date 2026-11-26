@@ -18,6 +18,14 @@
     "mustContainFacts": ["Hall 101", "23:30", "Room 202", "Safety Portal"],
     "allowSlashMergedTitles": false,
     "maxLlmCalls": 6,
+    "requireValidEventDates": true,
+    "minDatedCards": 4,
+    "expectedPerCardGrounding": [
+      { "titleSubstring": "Algorithms", "requiredSourceSubstrings": ["Hall 101", "June 15"], "requiredContentSubstrings": ["Hall 101"] },
+      { "titleSubstring": "Library", "requiredSourceSubstrings": ["23:30", "June 1 to June 20"], "requiredContentSubstrings": ["23:30"] },
+      { "titleSubstring": "Career Fair", "requiredSourceSubstrings": ["Room 202", "May 28"], "requiredContentSubstrings": ["Room 202"] },
+      { "titleSubstring": "Lab Safety Quiz", "requiredSourceSubstrings": ["Safety Portal", "May 29"], "requiredContentSubstrings": ["Safety Portal"] }
+    ],
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }

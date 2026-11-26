@@ -203,4 +203,62 @@ class OfflineRegressionEvalTest {
         assertEquals(1, cards.size)
         assertEquals(listOf(attachment), cards.single().attachments)
     }
+
+    @Test
+    fun `EvalBaseline loads scenarios map and EvalGraders catches per-card source swaps and invalid ICS dates`() = runBlocking {
+        val baseline = EvalRunner.loadBaseline(File("src/eval/resources/baseline.json"))
+        assertTrue(baseline.entries.size >= 12, "Expected >= 12 baseline entries loaded from 'scenarios' key, got ${baseline.entries.size}")
+
+        val scenarios = EvalRunner.loadScenarios(File("src/eval/resources/scenarios"), idFilter = "REG-12_concurrent_cloud_multi_chunk_order")
+        val reg12 = scenarios.single()
+        val swappedCards = listOf(
+            com.wechatdigest.core.model.EventCard(
+                id = "c1",
+                title = "Library Extended Hours",
+                summary = "Main Reading Room stays open until 23:30.",
+                translatedSummary = "Main Reading Room stays open until 23:30.",
+                category = com.wechatdigest.core.model.EventCategory.NOTICE,
+                priority = com.wechatdigest.core.model.EventPriority.NORMAL,
+                eventDate = "TBD",
+                originalSender = "Teacher_Si",
+                sourceRoomId = reg12.roomId,
+                sourceMessages = "[2026-05-17 10:00:00] Teacher_Si: Final Exam Schedule: Algorithms written exam on June 15 at 09:00 in Hall 101.",
+                timestampSeconds = 1779012000L
+            ),
+            com.wechatdigest.core.model.EventCard(
+                id = "c2",
+                title = "Algorithms Final Exam Schedule",
+                summary = "Algorithms written exam on June 15 at 09:00 in Hall 101.",
+                translatedSummary = "Algorithms written exam on June 15 at 09:00 in Hall 101.",
+                category = com.wechatdigest.core.model.EventCategory.EXAM,
+                priority = com.wechatdigest.core.model.EventPriority.IMPORTANT,
+                eventDate = "2026-06-15T09:00:00",
+                originalSender = "Library_Desk",
+                sourceRoomId = reg12.roomId,
+                sourceMessages = "[2026-05-17 10:01:00] Library_Desk: Library Extended Hours: Main Reading Room stays open until 23:30 from June 1 to June 20.",
+                timestampSeconds = 1779012060L
+            )
+        )
+        val dummyTrace = StageTrace(4, 4, 4, listOf(1201, 1202), emptyList(), 2, 2, emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), 0, 0, 10)
+        val findings = EvalGraders.gradeAll(reg12, Result.success(swappedCards), dummyTrace)
+        assertTrue(findings.any { it.grader == "per_card_source_grounding" && !it.passed }, "Swapped card titles and sources must fail per_card_source_grounding")
+        assertTrue(findings.any { it.grader == "event_date_ics_validity" && !it.passed }, "Invalid 'TBD' eventDate must fail event_date_ics_validity")
+
+        // Verify TracingLlmClient records promptTokens, completionTokens, and finishReason from KtorLlmClient
+        val telemetryEngine = MockEngine {
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"{\"ok\":true}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":111,"completion_tokens":22}}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val base = KtorLlmClient(LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, apiKey = "k"), telemetryEngine)
+        val tracer = TracingLlmClient(base)
+        tracer.chatCompletion("sys", "usr")
+        val record = tracer.snapshotCalls().single()
+        assertEquals(111, record.promptTokens)
+        assertEquals(22, record.completionTokens)
+        assertEquals("stop", record.finishReason)
+        tracer.close()
+    }
 }
