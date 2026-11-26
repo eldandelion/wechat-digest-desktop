@@ -121,4 +121,42 @@ class TemporalNormalizerTest {
         )
         assertEquals("2026-06-15T09:00:00", TemporalNormalizer.resolveEventDate(candidates, sundayAnchor, utc))
     }
+
+    @Test
+    fun `resolveEventDate handles cross-month Chinese ranges, evening relative times, colon-less offsets, priority preservation, and long noise`() {
+        val novAnchor = Instant.parse("2026-11-26T08:00:00Z").epochSecond
+        assertEquals(
+            "2026-12-05",
+            TemporalNormalizer.resolveEventDate(listOf("请于11月28日至12月5日前提交材料"), novAnchor, utc)
+        )
+
+        val mondayAnchor = Instant.parse("2026-05-18T08:00:00Z").epochSecond
+        assertEquals(
+            "2026-05-18T20:00:00",
+            TemporalNormalizer.resolveEventDate(listOf("今晚8点提交"), mondayAnchor, utc)
+        )
+        assertEquals(
+            "2026-05-19T21:30:00",
+            TemporalNormalizer.resolveEventDate(listOf("明晚9点半开会"), mondayAnchor, utc)
+        )
+
+        assertEquals(
+            "2026-06-15T01:00:00",
+            TemporalNormalizer.normalizeExplicitDate("2026-06-15T09:00:00+0800", sundayAnchor, utc)
+        )
+
+        // Lower-priority timed candidate on a different date must not overwrite higher-priority DATE candidate
+        assertEquals(
+            "2026-06-15",
+            TemporalNormalizer.resolveEventDate(
+                listOf("Date: 2026-06-15", "Posted May 10 08:00 announcement summary"),
+                sundayAnchor,
+                utc
+            )
+        )
+
+        // Long uninterrupted alphanumeric/email-like runs without '@' must fail fast cleanly
+        val longNoise = "a".repeat(8_000) + ".example"
+        assertNull(TemporalNormalizer.resolveEventDate(listOf(longNoise), sundayAnchor, utc))
+    }
 }

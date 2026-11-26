@@ -25,9 +25,11 @@ class CollectingExtractionObserver(
     private val languageGates = Collections.synchronizedList(mutableListOf<LanguageGateTraceRecord>())
 
     private val afterPrefilterCount = AtomicInteger(0)
+    @Volatile
     private var survivingPrefilterIds: List<Long> = emptyList()
     private val pass1RawChunkCount = AtomicInteger(0)
     private val pass1ConsolidatedChunkCount = AtomicInteger(0)
+    @Volatile
     private var pass1Topics: List<String> = emptyList()
     private val jsonRepairCount = AtomicInteger(0)
     private val translationRepairCalls = AtomicInteger(0)

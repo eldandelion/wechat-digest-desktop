@@ -34,7 +34,7 @@ class OfflineRegressionEvalTest {
         val baselineFile = File("src/eval/resources/baseline.json")
 
         val scenarios = EvalRunner.loadScenarios(scenariosDir)
-        assertTrue(scenarios.size >= 12, "Expected at least 12 golden scenarios in ${scenariosDir.path}, found ${scenarios.size}")
+        assertTrue(scenarios.size >= 13, "Expected at least 13 golden scenarios in ${scenariosDir.path}, found ${scenarios.size}")
 
         val baseline = EvalRunner.loadBaseline(baselineFile)
         val report = EvalRunner.runSuite(
@@ -101,18 +101,20 @@ class OfflineRegressionEvalTest {
     @Test
     fun `OPENAI_COMPATIBLE and OLLAMA provider transport paths maintain strict card contract parity`() = runBlocking {
         val scenariosDir = File("src/eval/resources/scenarios")
-        val scenario = EvalRunner.loadScenarios(scenariosDir, idFilter = "REG-03_pass2_student_ping_veto").single()
+        val scenario = EvalRunner.loadScenarios(scenariosDir, idFilter = "REG-13_multipass_json_repair_and_gatekeeper_veto").single()
 
         fun buildMockClient(providerType: LlmProviderType): KtorLlmClient {
             val engine = MockEngine { req ->
                 val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
                 val contentJson = when {
                     body.contains("Semantic Filter & Topic Chunker") ->
-                        """{"chunks":[{"topic":"Hard Copy Submission","message_ids":[301],"category":"DEADLINE"},{"topic":"Student Email","message_ids":[302],"category":"NOTICE"}]}"""
+                        "```json\n{\"chunks\":[{\"topic\":\"Thesis Defense Briefing\",\"message_ids\":[1301],\"category\":\"EVENT\"},{\"topic\":\"Department Scholarship Application\",\"message_ids\":[1302],\"category\":\"DEADLINE\"},{\"topic\":\"Student Umbrella And Coffee Chatter\",\"message_ids\":[1303,1304],\"category\":\"NOTICE\"},]}\n```"
                     body.contains("Rule & Substance Gatekeeper") ->
-                        """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Official submission deadline"},{"chunk_index":1,"is_group_notice":false,"passes_rules":false,"has_substance":false,"keep":false,"reason":"Personal student email request"}]}"""
+                        """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Official defense briefing"},{"chunk_index":1,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Official scholarship deadline"},{"chunk_index":2,"is_group_notice":false,"passes_rules":false,"has_substance":false,"keep":false,"reason":"Casual chatter and prompt injection attempt"}]}"""
+                    body.contains("Thesis Defense Briefing") ->
+                        """{"is_relevant":true,"events":[{"title":"Thesis Defense Briefing","summary":"Thesis Defense Briefing is tomorrow at 10:00 in Building A Room 305. Bring your signed advisor form.","translated_summary":"Thesis Defense Briefing is tomorrow at 10:00 in Building A Room 305. Bring your signed advisor form.","sections":[{"heading":"Details","content":"- Tomorrow at 10:00 in Building A Room 305\n- Bring signed advisor form"}],"category":"EVENT","priority":"IMPORTANT","source_message_ids":[1301],}]}"""
                     else ->
-                        """{"is_relevant":true,"events":[{"title":"Thesis Hard Copy Submission Deadline","summary":"All thesis applicants must submit printed copies on Nov 26 at 10:00 in Room 422-1.","category":"DEADLINE","priority":"IMPORTANT","source_message_ids":[301]}]}"""
+                        """{"is_relevant":true,"events":[{"title":"Department Scholarship Application","summary":"Department Scholarship Application closes June 18 at 17:00 via Academic Portal. Late submissions are not accepted.","translated_summary":"Department Scholarship Application closes June 18 at 17:00 via Academic Portal. Late submissions are not accepted.","sections":[{"heading":"Deadline","content":"- Closes June 18 at 17:00 via Academic Portal"}],"category":"DEADLINE","priority":"IMPORTANT","event_date":"2026-06-18T17:00:00","source_message_ids":[1302]}]}"""
                 }
                 val encodedContent = Json.encodeToString(contentJson)
                 val responsePayload = if (providerType == LlmProviderType.OLLAMA) {
@@ -135,11 +137,15 @@ class OfflineRegressionEvalTest {
 
         assertTrue(openAiResult.passed, "OpenAI path failed parity graders: ${openAiResult.findings}")
         assertTrue(ollamaResult.passed, "Ollama path failed parity graders: ${ollamaResult.findings}")
+        assertEquals(2, openAiResult.cards.size)
         assertEquals(openAiResult.cards.size, ollamaResult.cards.size)
-        assertEquals(openAiResult.cards.single().title, ollamaResult.cards.single().title)
-        assertEquals(openAiResult.cards.single().translatedSummary, ollamaResult.cards.single().translatedSummary)
-        assertEquals(openAiResult.cards.single().category, ollamaResult.cards.single().category)
-        assertEquals(openAiResult.cards.single().priority, ollamaResult.cards.single().priority)
+        assertTrue(openAiResult.trace.pass1RawChunkCount >= 2 && ollamaResult.trace.pass1RawChunkCount >= 2)
+        assertTrue(openAiResult.trace.pass2Verdicts.isNotEmpty() && ollamaResult.trace.pass2Verdicts.isNotEmpty())
+        assertEquals(openAiResult.cards.map { it.title }, ollamaResult.cards.map { it.title })
+        assertEquals(openAiResult.cards.map { it.translatedSummary }, ollamaResult.cards.map { it.translatedSummary })
+        assertEquals(openAiResult.cards.map { it.category }, ollamaResult.cards.map { it.category })
+        assertEquals(openAiResult.cards.map { it.priority }, ollamaResult.cards.map { it.priority })
+        assertEquals(openAiResult.cards.map { it.eventDate }, ollamaResult.cards.map { it.eventDate })
     }
 
     @Test
@@ -207,7 +213,7 @@ class OfflineRegressionEvalTest {
     @Test
     fun `EvalBaseline loads scenarios map and EvalGraders catches per-card source swaps and invalid ICS dates`() = runBlocking {
         val baseline = EvalRunner.loadBaseline(File("src/eval/resources/baseline.json"))
-        assertTrue(baseline.entries.size >= 12, "Expected >= 12 baseline entries loaded from 'scenarios' key, got ${baseline.entries.size}")
+        assertTrue(baseline.entries.size >= 13, "Expected >= 13 baseline entries loaded from 'scenarios' key, got ${baseline.entries.size}")
 
         val scenarios = EvalRunner.loadScenarios(File("src/eval/resources/scenarios"), idFilter = "REG-12_concurrent_cloud_multi_chunk_order")
         val reg12 = scenarios.single()

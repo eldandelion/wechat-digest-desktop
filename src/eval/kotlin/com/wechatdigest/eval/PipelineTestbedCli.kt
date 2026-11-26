@@ -139,9 +139,11 @@ object PipelineTestbedCli {
         require(dataDir.exists() && dataDir.isDirectory) { "Invalid wechatDir: $wechatDirStr" }
 
         val driver = WeChatDatabaseDriver(baseDir = dataDir)
-        val contactRepo = WeChatContactRepository(driver)
-        val messageRepo = WeChatMessageRepository(driver, contactRepo)
-        val rawMessages = messageRepo.getRecentMessages(roomId, limit = limit)
+        val rawMessages = com.wechatdigest.core.db.WeChatSessionContext(driver).use { session ->
+            val contactRepo = WeChatContactRepository(driver, session)
+            val messageRepo = WeChatMessageRepository(driver, contactRepo, sessionContext = session)
+            messageRepo.getRecentMessages(roomId, limit = limit)
+        }
         println("[Snapshot] Loaded ${rawMessages.size} message(s) from room '$roomId' (read-only)")
 
         val filtered = if (allowSenders.isNotEmpty()) {
@@ -203,7 +205,7 @@ object PipelineTestbedCli {
                 println("      summary: ${c.translatedSummary}")
             }
         }.onFailure { err ->
-            System.err.println("\n[Snapshot] Extraction failed: ${err.message}")
+            System.err.println("\n[Snapshot] Extraction failed: ${com.wechatdigest.core.llm.LlmJsonUtils.sanitizeLogMessage(err.message)}")
         }
 
         val exportOut = System.getProperty("eval.exportOut")?.takeIf { it.isNotBlank() }

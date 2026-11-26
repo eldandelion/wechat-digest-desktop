@@ -293,7 +293,7 @@ internal object ExtractionCardConsolidator {
         }
     }
 
-    private fun sanitizeSections(rawSections: List<EventSection>): List<EventSection> {
+    internal fun sanitizeSections(rawSections: List<EventSection>): List<EventSection> {
         return rawSections.mapNotNull { section ->
             val heading = EventDetailItemParser.sanitizeSingleLine(
                 section.heading,

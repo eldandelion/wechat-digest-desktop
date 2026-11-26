@@ -5,6 +5,7 @@ import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmCompletionOptions
 import com.wechatdigest.core.llm.LlmTelemetryElement
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -101,6 +102,8 @@ class TracingLlmClient(
                 )
             )
             response
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             val telemetry = telemetryElement.latest
             recordedCalls.add(
@@ -160,6 +163,8 @@ class RecordingLlmClient(
             val response = delegate.chatCompletion(systemPrompt, userPrompt, options)
             bucket.add(response)
             response
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             bucket.add("${CassetteKeyer.ERROR_SENTINEL_PREFIX}${e.message ?: e::class.simpleName}")
             throw e

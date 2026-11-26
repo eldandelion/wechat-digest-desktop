@@ -13,6 +13,9 @@ internal object LlmJsonUtils {
 
     private val urlWithQueryOrCredentialsRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
     private val localFilesystemPathRegex = Regex("/(?:Users|Volumes|tmp|var|private|home)/[^\\s\"':,)<>]+")
+    private val bearerTokenRegex = Regex("""(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}""")
+    private val secretKeyPrefixRegex = Regex("""\bsk-[A-Za-z0-9_-]{8,}\b""")
+    private val hexKey64Regex = Regex("""\b[0-9a-fA-F]{64}\b""")
     private val controlOrAnsiRegex = Regex("[\\u0000-\\u001F\\u007F]")
     private val trailingCommaRegex = Regex(",(\\s*[}\\]])")
     private val incompleteTrailingObjectKeyRegex = Regex(",\\s*\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"\\s*$")
@@ -211,7 +214,11 @@ internal object LlmJsonUtils {
             if (host.isNullOrBlank()) "[redacted-url]" else "https://$host/..."
         }
         val pathRedacted = urlRedacted.replace(localFilesystemPathRegex, "[redacted-path]")
-        return pathRedacted.replace(controlOrAnsiRegex, " ")
+        val secretsRedacted = pathRedacted
+            .replace(bearerTokenRegex, "Bearer [redacted-token]")
+            .replace(secretKeyPrefixRegex, "[redacted-api-key]")
+            .replace(hexKey64Regex, "[redacted-hex-key]")
+        return secretsRedacted.replace(controlOrAnsiRegex, " ")
             .replace(Regex(" {2,}"), " ")
             .trim()
             .take(MAX_LOG_MESSAGE_CHARS)

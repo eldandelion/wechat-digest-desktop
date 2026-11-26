@@ -114,7 +114,9 @@ class EventExtractor(
             ) {
                 return true
             }
-            if (host.startsWith("127.") || ipv4ShorthandOrIntRegex.matches(host) && !ipv4LiteralRegex.matches(host)) {
+            if ((ipv4LiteralRegex.matches(host) && host.startsWith("127.")) ||
+                (ipv4ShorthandOrIntRegex.matches(host) && !ipv4LiteralRegex.matches(host))
+            ) {
                 return true
             }
             return isLocalOrPrivateIpLiteral(host)
@@ -196,6 +198,7 @@ class EventExtractor(
 
         val semaphore = Semaphore(effectiveMaxConcurrency)
         if (enableFastPath &&
+            customRules.isBlank() &&
             substantive.size <= FAST_PATH_MAX_MESSAGES &&
             formatTranscriptForPrompt(substantive).length < FAST_PATH_MAX_CHARS
         ) {
@@ -337,13 +340,34 @@ class EventExtractor(
             return Result.success(emptyList())
         }
 
-        val translator = CardTranslator(llmClient)
-        val completedCount = AtomicInteger(0)
-        val progressMutex = Mutex()
-        val slots = arrayOfNulls<EventCard>(initialCards.size)
+        return translateAndEmitPhased(
+            slotItems = initialCards.mapIndexed { idx, card -> idx to card },
+            totalSlots = initialCards.size,
+            targetLanguage = targetLanguage,
+            translator = CardTranslator(llmClient),
+            semaphore = semaphore,
+            completedCount = AtomicInteger(0),
+            progressMutex = Mutex(),
+            onCardReady = onCardReady,
+            onProgress = onProgress
+        )
+    }
+
+    private suspend fun translateAndEmitPhased(
+        slotItems: List<Pair<Int, EventCard>>,
+        totalSlots: Int,
+        targetLanguage: String,
+        translator: CardTranslator,
+        semaphore: Semaphore,
+        completedCount: AtomicInteger,
+        progressMutex: Mutex,
+        onCardReady: (suspend (EventCard) -> Unit)?,
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
+    ): Result<List<EventCard>> {
+        val slots = arrayOfNulls<EventCard>(totalSlots)
         val pendingTranslations = mutableListOf<Triple<Int, EventCard, LanguageComplianceResult>>()
 
-        for ((idx, card) in initialCards.withIndex()) {
+        for ((idx, card) in slotItems) {
             val initialCompliance = LanguageHelper.checkCardCompliance(card, targetLanguage)
             if (initialCompliance.isCompliant) {
                 if (observer !== ExtractionObserver.NoOp) {
@@ -358,7 +382,7 @@ class EventExtractor(
                         return Result.failure(e)
                     }
                 }
-                reportPass3Progress(progressMutex, onProgress, completedCount, initialCards.size, incrementCompleted = true, translating = false)
+                reportPass3Progress(progressMutex, onProgress, completedCount, totalSlots, incrementCompleted = true, translating = false)
                     .getOrElse { return Result.failure(it) }
             } else {
                 pendingTranslations.add(Triple(idx, card, initialCompliance))
@@ -366,10 +390,13 @@ class EventExtractor(
         }
 
         for ((idx, card, initialCompliance) in pendingTranslations) {
-            reportPass3Progress(progressMutex, onProgress, completedCount, initialCards.size, incrementCompleted = false, translating = true)
+            reportPass3Progress(progressMutex, onProgress, completedCount, totalSlots, incrementCompleted = false, translating = true)
                 .getOrElse { return Result.failure(it) }
             val repaired = repairSingleCard(translator, card, initialCompliance, targetLanguage, semaphore)
-                .getOrElse { return Result.failure(it) }
+                .getOrElse { err ->
+                    if (err is CancellationException) throw err
+                    return Result.failure(err)
+                }
             slots[idx] = repaired
             if (onCardReady != null) {
                 try {
@@ -379,7 +406,7 @@ class EventExtractor(
                     return Result.failure(e)
                 }
             }
-            reportPass3Progress(progressMutex, onProgress, completedCount, initialCards.size, incrementCompleted = true, translating = false)
+            reportPass3Progress(progressMutex, onProgress, completedCount, totalSlots, incrementCompleted = true, translating = false)
                 .getOrElse { return Result.failure(it) }
         }
 
@@ -635,9 +662,7 @@ class EventExtractor(
         onCardReady: (suspend (EventCard) -> Unit)?,
         onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
     ): Result<List<EventCard>> {
-        val slots = arrayOfNulls<EventCard>(chunks.size)
-        val pendingTranslations = mutableListOf<Triple<Int, EventCard, LanguageComplianceResult>>()
-
+        val synthesizedSlots = mutableListOf<Pair<Int, EventCard>>()
         for ((index, chunk) in chunks.withIndex()) {
             val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages))
             val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, semaphore)
@@ -650,49 +675,20 @@ class EventExtractor(
                     .getOrElse { return Result.failure(it) }
                 continue
             }
-            val initialCompliance = LanguageHelper.checkCardCompliance(synthesized, targetLanguage)
-            if (initialCompliance.isCompliant) {
-                if (observer !== ExtractionObserver.NoOp) {
-                    observer.onLanguageGateResult(synthesized.title, initialCompliance, repairAttempts = 0, jsonRepairedCount = 0, finalCompliant = true)
-                }
-                slots[index] = synthesized
-                if (onCardReady != null) {
-                    try {
-                        onCardReady.invoke(synthesized)
-                    } catch (e: Exception) {
-                        if (e is CancellationException) throw e
-                        return Result.failure(e)
-                    }
-                }
-                reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = true, translating = false)
-                    .getOrElse { return Result.failure(it) }
-            } else {
-                pendingTranslations.add(Triple(index, synthesized, initialCompliance))
-            }
+            synthesizedSlots.add(index to synthesized)
         }
 
-        for ((index, card, initialCompliance) in pendingTranslations) {
-            reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = false, translating = true)
-                .getOrElse { return Result.failure(it) }
-            val repaired = repairSingleCard(translator, card, initialCompliance, targetLanguage, semaphore)
-                .getOrElse { err ->
-                    if (err is CancellationException) throw err
-                    return Result.failure(err)
-                }
-            slots[index] = repaired
-            if (onCardReady != null) {
-                try {
-                    onCardReady.invoke(repaired)
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    return Result.failure(e)
-                }
-            }
-            reportPass3Progress(progressMutex, onProgress, completedCount, chunks.size, incrementCompleted = true, translating = false)
-                .getOrElse { return Result.failure(it) }
-        }
-
-        return Result.success(slots.filterNotNull())
+        return translateAndEmitPhased(
+            slotItems = synthesizedSlots,
+            totalSlots = chunks.size,
+            targetLanguage = targetLanguage,
+            translator = translator,
+            semaphore = semaphore,
+            completedCount = completedCount,
+            progressMutex = progressMutex,
+            onCardReady = onCardReady,
+            onProgress = onProgress
+        )
     }
 
     private suspend fun runPass3Sequential(
@@ -1194,7 +1190,13 @@ class EventExtractor(
         substantiveMessages: List<WeChatMessage>,
         roomId: String,
         roomDisplayName: String = ""
-    ): List<EventCard> = parseExtractionResponseResult(rawJson, substantiveMessages, roomId, roomDisplayName).getOrElse { emptyList() }
+    ): List<EventCard> = parseExtractionResponseResult(
+        rawJson = rawJson,
+        substantiveMessages = substantiveMessages,
+        roomId = roomId,
+        roomDisplayName = roomDisplayName,
+        singleMessageFallback = substantiveMessages.size == 1
+    ).getOrElse { emptyList() }
 
     internal fun parseExtractionResponseResult(
         rawJson: String,
@@ -1236,12 +1238,13 @@ class EventExtractor(
             )
         }
 
-        val cards = ExtractionCardConsolidator.groupOverlappingExtractions(resolved).map { group ->
+        val cards = ExtractionCardConsolidator.groupOverlappingExtractions(resolved).mapNotNull { group ->
             val allMatched = group.flatMap { it.matchedMessages }.distinctBy { it.localId }
                 .sortedBy { messageIndexById[it.localId] ?: Int.MAX_VALUE }
+            if (allMatched.isEmpty()) return@mapNotNull null
             ExtractionCardConsolidator.buildConsolidatedCard(
                 extractedEvents = group.map { it.extracted },
-                sourceMessagesText = if (allMatched.isNotEmpty()) formatSourceMessages(allMatched) else "",
+                sourceMessagesText = formatSourceMessages(allMatched),
                 eventTimestamp = allMatched.maxOfOrNull { it.timestampSeconds } ?: fallbackTimestamp,
                 eventSender = allMatched.lastOrNull()?.senderDisplayName ?: fallbackSender,
                 roomId = roomId,

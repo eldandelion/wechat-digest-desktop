@@ -15,6 +15,7 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -164,6 +165,7 @@ class KtorLlmClient(
     }
 
     private val client = HttpClient(resolvedEngine) {
+        followRedirects = false
         expectSuccess = true
         install(ContentNegotiation) {
             json(json)
@@ -372,12 +374,22 @@ class KtorLlmClient(
         isOllama: Boolean
     ): Boolean {
         if (options.responseSchema == null || !options.allowSchemaFallback) return false
-        if (error.response.status != HttpStatusCode.BadRequest) return false
-        val bodyText = runCatching { error.response.bodyAsText() }.getOrDefault("")
-        val matchesOpenAi = bodyText.contains("response_format", ignoreCase = true) ||
+        val status = error.response.status
+        if (status != HttpStatusCode.BadRequest && status != HttpStatusCode.UnprocessableEntity) return false
+        val bodyText = try {
+            error.response.bodyAsText()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            ""
+        }
+        val matchesSchemaError = bodyText.contains("response_format", ignoreCase = true) ||
             bodyText.contains("json_schema", ignoreCase = true) ||
+            bodyText.contains("schema", ignoreCase = true) ||
+            bodyText.contains("grammar", ignoreCase = true) ||
+            bodyText.contains("structured", ignoreCase = true) ||
             bodyText.contains("unsupported", ignoreCase = true)
-        return matchesOpenAi || (isOllama && bodyText.contains("format", ignoreCase = true))
+        return matchesSchemaError || (isOllama && bodyText.contains("format", ignoreCase = true))
     }
 
     private suspend fun emitTelemetry(telemetry: LlmHttpTelemetry) {
@@ -386,29 +398,38 @@ class KtorLlmClient(
     }
 
     private fun validateTransportSecurity(baseUrl: String) {
-        val parsed = runCatching { URI(baseUrl) }.getOrNull()
-        val scheme = parsed?.scheme?.lowercase(Locale.ROOT)
-        require(scheme == "https" || (scheme == "http" && EventExtractor.isLocalEndpoint(baseUrl))) {
-            "Remote LLM endpoints must use https:// (cleartext http:// is permitted only for local loopback endpoints)."
-        }
-    }
-
-    private fun isStrictLoopbackHttpUrl(baseUrl: String): Boolean {
-        val parsed = runCatching { URI(baseUrl) }.getOrNull() ?: return false
-        val scheme = parsed.scheme?.lowercase(Locale.ROOT) ?: return false
-        if (scheme != "http") return false
-        val rawHost = parsed.host?.trimEnd('.')?.removePrefix("[")?.removeSuffix("]")?.lowercase(Locale.ROOT)
-            ?: return false
-        if (rawHost == "localhost" || rawHost == "127.0.0.1" || rawHost == "::1") return true
-        val looksLikeIpLiteral = rawHost.matches(Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")) || ':' in rawHost
-        if (!looksLikeIpLiteral) return false
-        return runCatching { InetAddress.getByName(rawHost).isLoopbackAddress }.getOrDefault(false)
+        validateEndpointTransportSecurity(baseUrl)
     }
 
     override fun close() {
         client.close()
         if (ownsEngine) {
             runCatching { resolvedEngine.close() }
+        }
+    }
+
+    companion object {
+        internal fun validateEndpointTransportSecurity(baseUrl: String) {
+            val parsed = runCatching { URI(baseUrl.trim()) }.getOrNull()
+            val scheme = parsed?.scheme?.lowercase(Locale.ROOT)
+            val hasUserInfo = !parsed?.userInfo.isNullOrBlank()
+            require(!hasUserInfo && (scheme == "https" || (scheme == "http" && isStrictLoopbackHttpUrl(baseUrl)))) {
+                "Remote LLM endpoints must use https:// (cleartext http:// is permitted only for local loopback endpoints)."
+            }
+        }
+
+        internal fun isStrictLoopbackHttpUrl(baseUrl: String): Boolean {
+            val parsed = runCatching { URI(baseUrl.trim()) }.getOrNull() ?: return false
+            val scheme = parsed.scheme?.lowercase(Locale.ROOT) ?: return false
+            if (scheme != "http" || !parsed.userInfo.isNullOrBlank()) return false
+            val rawHost = parsed.host?.trimEnd('.')?.removePrefix("[")?.removeSuffix("]")?.substringBefore('%')?.lowercase(Locale.ROOT)
+                ?: return false
+            if (rawHost == "localhost" || rawHost.endsWith(".localhost") || rawHost == "127.0.0.1" || rawHost == "::1") {
+                return true
+            }
+            val looksLikeIpLiteral = rawHost.matches(Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$")) || ':' in rawHost
+            if (!looksLikeIpLiteral) return false
+            return runCatching { InetAddress.getByName(rawHost).isLoopbackAddress }.getOrDefault(false)
         }
     }
 }

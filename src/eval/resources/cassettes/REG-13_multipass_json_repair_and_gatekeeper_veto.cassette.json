@@ -1,0 +1,24 @@
+{
+    "version": 1,
+    "scenarioId": "REG-13_multipass_json_repair_and_gatekeeper_veto",
+    "descriptions": {
+        "18b8cd3533e64f48a8e16c40afdbd8e18d64e73f9c3f5cc1aab45163177fa1d8": "pass2_gatekeeper",
+        "3fecd12378c0efdec33c5a8017b4c590074144e666d6fb48f12f515340192726": "pass3_synthesis",
+        "d6859915c2cb8f107407dad045992a06bde80038239191e33e30d45b1435c500": "pass3_synthesis",
+        "f8bed03e27ee02f79d0a4375a19aff5047f4804d1fe9995261becc354c69e991": "pass1_triage"
+    },
+    "entries": {
+        "18b8cd3533e64f48a8e16c40afdbd8e18d64e73f9c3f5cc1aab45163177fa1d8": [
+            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official defense briefing\"},{\"chunk_index\":1,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official scholarship deadline\"},{\"chunk_index\":2,\"is_group_notice\":false,\"passes_rules\":false,\"has_substance\":false,\"keep\":false,\"reason\":\"Casual chatter and prompt injection attempt\"}]}"
+        ],
+        "3fecd12378c0efdec33c5a8017b4c590074144e666d6fb48f12f515340192726": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Thesis Defense Briefing\",\"summary\":\"Thesis Defense Briefing is tomorrow at 10:00 in Building A Room 305. Bring your signed advisor form.\",\"translated_summary\":\"Thesis Defense Briefing is tomorrow at 10:00 in Building A Room 305. Bring your signed advisor form.\",\"sections\":[{\"heading\":\"Details\",\"content\":\"- Tomorrow at 10:00 in Building A Room 305\\n- Bring signed advisor form\"}],\"category\":\"EVENT\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[1301],}]}"
+        ],
+        "d6859915c2cb8f107407dad045992a06bde80038239191e33e30d45b1435c500": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Department Scholarship Application\",\"summary\":\"Department Scholarship Application closes June 18 at 17:00 via Academic Portal. Late submissions are not accepted.\",\"translated_summary\":\"Department Scholarship Application closes June 18 at 17:00 via Academic Portal. Late submissions are not accepted.\",\"sections\":[{\"heading\":\"Deadline\",\"content\":\"- Closes June 18 at 17:00 via Academic Portal\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"event_date\":\"2026-06-18T17:00:00\",\"source_message_ids\":[1302]}]}"
+        ],
+        "f8bed03e27ee02f79d0a4375a19aff5047f4804d1fe9995261becc354c69e991": [
+            "```json\n{\"chunks\":[{\"topic\":\"Thesis Defense Briefing\",\"message_ids\":[1301],\"category\":\"EVENT\"},{\"topic\":\"Department Scholarship Application\",\"message_ids\":[1302],\"category\":\"DEADLINE\"},{\"topic\":\"Student Umbrella And Coffee Chatter\",\"message_ids\":[1303,1304],\"category\":\"NOTICE\"},]}\n```"
+        ]
+    }
+}

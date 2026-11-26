@@ -1043,5 +1043,217 @@ class SyncServiceTest {
         assertEquals(listOf("m0-4", "m1-1", "m1-2"), legacyBatch.messages.map { it.textContent })
         assertEquals("message_1.db", legacyBatch.latestShardName)
         assertEquals(2L, legacyBatch.latestLocalId)
+
+        // Legacy v1.1 checkpoint when newer shard also has maxLocalId >= checkpoint.lastLocalId still drains earlier shard tail
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(msgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1060, 't', CAST('m1-3' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (4, 1070, 't', CAST('m1-4' AS BLOB))")
+            }
+        }
+        val legacyHighNewest = com.wechatdigest.core.model.SyncCheckpoint(room, 3L, 1025L, 1025L)
+        val legacyHighBatch = repo.getMessagesSinceCheckpoint(room, legacyHighNewest, limit = 10)
+        assertEquals(listOf("m0-4", "m1-1", "m1-2", "m1-3", "m1-4"), legacyHighBatch.messages.map { it.textContent })
+        assertEquals("message_1.db", legacyHighBatch.latestShardName)
+        assertEquals(4L, legacyHighBatch.latestLocalId)
+
+        // Cross-shard rollover with duplicate filling limit=2 on message_1.db + unread m2-1 on message_2.db must NOT skip m1-2..4
+        val dupMsgDir = File(dir, "dup_msg/message").apply { mkdirs() }
+        val dupDriver = WeChatDatabaseDriver(dupMsgDir.parentFile, cacheDir = File(tempDir, "cache_dup"))
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${dupMsgDir.parentFile.resolve("contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('t', 'Prof', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dupMsgDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1000, 't', CAST('tail-dup' AS BLOB))")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dupMsgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1000, 't', CAST('tail-dup' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1010, 't', CAST('m1-real' AS BLOB))")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dupMsgDir, "message_2.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1020, 't', CAST('m2-real' AS BLOB))")
+            }
+        }
+        val dupRepo = WeChatMessageRepository(dupDriver, WeChatContactRepository(dupDriver))
+        val dupCp = com.wechatdigest.core.model.SyncCheckpoint(room, 0L, 900L, 900L, lastShardName = "message_0.db", lastCreateTime = 900L)
+        // Checkpoint 0 -> reads m0(tail-dup), continues to m1(skips tail-dup, gets m1-real) without jumping over m1-real!
+        val step1 = dupRepo.getMessagesSinceCheckpoint(room, dupCp.copy(lastLocalId = 0L), limit = 2)
+        // With start localId=0 getMessagesSinceCheckpoint calls getRecentMessages; test from startShard=message_0 localId=0 using sinceLocalId=1 after adding row 0->1:
+        // Insert row 2 on message_0 matching row 1 on message_1
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dupMsgDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1000, 't', CAST('tail-dup' AS BLOB))")
+            }
+        }
+        val dupStart = com.wechatdigest.core.model.SyncCheckpoint(room, 1L, 900L, 900L, lastShardName = "message_0.db", lastCreateTime = 990L)
+        val crossDupBatch = dupRepo.getMessagesSinceCheckpoint(room, dupStart, limit = 2)
+        assertEquals(listOf("tail-dup", "m1-real"), crossDupBatch.messages.map { it.textContent })
+        assertEquals("message_1.db", crossDupBatch.latestShardName)
+        assertEquals(2L, crossDupBatch.latestLocalId)
+        assertEquals(listOf("m2-real"), dupRepo.getMessagesSinceCheckpoint(room, dupStart.copy(lastLocalId = crossDupBatch.latestLocalId, lastShardName = crossDupBatch.latestShardName, lastCreateTime = crossDupBatch.latestCreateTime), limit = 2).messages.map { it.textContent })
+        assertTrue(step1.messages.isNotEmpty())
+    }
+
+    @Test
+    fun `getMessagesSinceCheckpoint recovers when lastShardName was deleted and on legacy rollover without lastSyncTimestamp`() {
+        val room = "deleted_shard@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+
+        // Part A: lastShardName="message_0.db" deleted while message_1.db & message_2.db remain (lastCreateTime > 0)
+        val deletedDir = File(tempDir, "deleted_shard_repo").apply { mkdirs() }
+        val deletedMsgDir = File(deletedDir, "message").apply { mkdirs() }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(deletedDir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('t', 'Prof', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(deletedMsgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1000, 't', CAST('old-seen' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1000, 't', CAST('tie-unread' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1010, 't', CAST('shard1-next' AS BLOB))")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(deletedMsgDir, "message_2.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                // Duplicate tail of shard 1 at boundary + new message in shard 2
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1010, 't', CAST('shard1-next' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1020, 't', CAST('shard2-final' AS BLOB))")
+            }
+        }
+
+        val deletedDriver = WeChatDatabaseDriver(deletedDir, cacheDir = File(tempDir, "cache_deleted_shard"))
+        val deletedRepo = WeChatMessageRepository(deletedDriver, WeChatContactRepository(deletedDriver))
+
+        val cpDeletedWithTs = com.wechatdigest.core.model.SyncCheckpoint(
+            roomId = room,
+            lastLocalId = 1L,
+            lastSyncTimestamp = 1000L,
+            updatedAt = 1000L,
+            lastShardName = "message_0.db",
+            lastCreateTime = 1000L
+        )
+        val deletedPage1 = deletedRepo.getMessagesSinceCheckpoint(room, cpDeletedWithTs, limit = 2)
+        // Because message_0.db was deleted and remaining shards have independent local_id sequences,
+        // fallback starts at (create_time == 1000, local_id > 0) for safe at-least-once recovery.
+        assertEquals(listOf("old-seen", "tie-unread"), deletedPage1.messages.map { it.textContent })
+        assertEquals("message_1.db", deletedPage1.latestShardName)
+        assertEquals(2L, deletedPage1.latestLocalId)
+
+        val deletedPage2 = deletedRepo.getMessagesSinceCheckpoint(
+            room,
+            cpDeletedWithTs.copy(
+                lastLocalId = deletedPage1.latestLocalId,
+                lastShardName = deletedPage1.latestShardName,
+                lastCreateTime = deletedPage1.latestCreateTime
+            ),
+            limit = 2
+        )
+        assertEquals(listOf("shard1-next", "shard2-final"), deletedPage2.messages.map { it.textContent })
+        assertEquals("message_2.db", deletedPage2.latestShardName)
+        assertEquals(2L, deletedPage2.latestLocalId)
+
+        // Part B: Deleted lastShardName with lastCreateTime == 0 scans remaining non-empty shards chronologically
+        val cpDeletedZeroTs = com.wechatdigest.core.model.SyncCheckpoint(
+            roomId = room,
+            lastLocalId = 1L,
+            lastSyncTimestamp = 0L,
+            updatedAt = 0L,
+            lastShardName = "message_0.db",
+            lastCreateTime = 0L
+        )
+        val allRemaining = deletedRepo.getMessagesSinceCheckpoint(room, cpDeletedZeroTs, limit = 10)
+        assertEquals(listOf("old-seen", "tie-unread", "shard1-next", "shard2-final"), allRemaining.messages.map { it.textContent })
+
+        // Part C: Legacy v1.1 checkpoint with blank lastShardName AND lastSyncTimestamp <= 0L rolls over across shards
+        val legacyZeroDir = File(tempDir, "legacy_zero_ts").apply { mkdirs() }
+        val legacyZeroMsgDir = File(legacyZeroDir, "message").apply { mkdirs() }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(legacyZeroDir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('t', 'Prof', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(legacyZeroMsgDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1000, 't', CAST('z0-seen' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1010, 't', CAST('z0-unread' AS BLOB))")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(legacyZeroMsgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1020, 't', CAST('z1-new' AS BLOB))")
+            }
+        }
+        val legacyZeroDriver = WeChatDatabaseDriver(legacyZeroDir, cacheDir = File(tempDir, "cache_legacy_zero"))
+        val legacyZeroRepo = WeChatMessageRepository(legacyZeroDriver, WeChatContactRepository(legacyZeroDriver))
+        val legacyZeroCp = com.wechatdigest.core.model.SyncCheckpoint(
+            roomId = room,
+            lastLocalId = 1L,
+            lastSyncTimestamp = 0L,
+            updatedAt = 0L,
+            lastShardName = "",
+            lastCreateTime = 0L
+        )
+        val legacyZeroBatch = legacyZeroRepo.getMessagesSinceCheckpoint(room, legacyZeroCp, limit = 10)
+        assertEquals(listOf("z0-unread", "z1-new"), legacyZeroBatch.messages.map { it.textContent })
+        assertEquals("message_1.db", legacyZeroBatch.latestShardName)
+        assertEquals(1L, legacyZeroBatch.latestLocalId)
+
+        // Part D: Legacy v1.1 checkpoint with lastSyncTimestamp > 0 where new shard rolled over after syncTs
+        // AND already accumulated maxLocalId >= checkpoint.lastLocalId must still start from local_id = 0
+        val legacyPostTsDir = File(tempDir, "legacy_post_ts_rollover").apply { mkdirs() }
+        val legacyPostMsgDir = File(legacyPostTsDir, "message").apply { mkdirs() }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(legacyPostTsDir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('t', 'Prof', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(legacyPostMsgDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 900, 't', CAST('old-1' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1000, 't', CAST('old-2' AS BLOB))")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(legacyPostMsgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1010, 't', CAST('new-1' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1020, 't', CAST('new-2' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1030, 't', CAST('new-3' AS BLOB))")
+            }
+        }
+        val legacyPostDriver = WeChatDatabaseDriver(legacyPostTsDir, cacheDir = File(tempDir, "cache_legacy_post"))
+        val legacyPostRepo = WeChatMessageRepository(legacyPostDriver, WeChatContactRepository(legacyPostDriver))
+        val legacyPostCp = com.wechatdigest.core.model.SyncCheckpoint(
+            roomId = room,
+            lastLocalId = 2L,
+            lastSyncTimestamp = 1000L,
+            updatedAt = 1000L,
+            lastShardName = "",
+            lastCreateTime = 0L
+        )
+        val legacyPostBatch = legacyPostRepo.getMessagesSinceCheckpoint(room, legacyPostCp, limit = 10)
+        assertEquals(listOf("new-1", "new-2", "new-3"), legacyPostBatch.messages.map { it.textContent })
+        assertEquals("message_1.db", legacyPostBatch.latestShardName)
+        assertEquals(3L, legacyPostBatch.latestLocalId)
     }
 }

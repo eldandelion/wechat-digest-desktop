@@ -88,7 +88,9 @@ REQUIREMENTS:
         if (raw.length > LlmJsonUtils.MAX_RAW_JSON_CHARS) {
             throw IllegalStateException("Translation response exceeded maximum allowed size")
         }
-        var unwrapped = raw.trim()
+        val trimmedRaw = raw.trim()
+        val hasJsonFence = trimmedRaw.startsWith("```")
+        var unwrapped = trimmedRaw
         if (unwrapped.startsWith("```json")) {
             unwrapped = unwrapped.removePrefix("```json")
         } else if (unwrapped.startsWith("```")) {
@@ -101,9 +103,9 @@ REQUIREMENTS:
         if (unwrapped.isBlank()) return ""
 
         val startIdx = unwrapped.indexOf('{')
-        val endIdx = unwrapped.lastIndexOf('}')
-        if (startIdx != -1 && endIdx > startIdx) {
-            val jsonCandidate = unwrapped.substring(startIdx, endIdx + 1)
+        if (startIdx != -1) {
+            val explicitJsonEnvelope = hasJsonFence || startIdx == 0
+            val jsonCandidate = LlmJsonUtils.cleanJsonObject(raw)
             val decoded = runCatching {
                 json.decodeFromString<TranslationResponse>(jsonCandidate)
             }.getOrNull()
@@ -111,11 +113,11 @@ REQUIREMENTS:
                 return decoded.translatedText.trim()
             }
             val repaired = LlmJsonUtils.repairMalformedJson(jsonCandidate)
-            val decodedRepaired = runCatching {
-                json.decodeFromString<TranslationResponse>(repaired)
-            }.getOrNull()
-            if (decodedRepaired != null) {
-                return decodedRepaired.translatedText.trim()
+            return try {
+                json.decodeFromString<TranslationResponse>(repaired).translatedText.trim()
+            } catch (e: kotlinx.serialization.SerializationException) {
+                if (explicitJsonEnvelope) throw e
+                unwrapped
             }
         }
 

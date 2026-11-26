@@ -76,6 +76,7 @@ class OllamaService(
 ) : AutoCloseable {
 
     private val client = HttpClient(engine) {
+        followRedirects = false
         install(ContentNegotiation) {
             json(Json {
                 ignoreUnknownKeys = true
@@ -99,6 +100,7 @@ class OllamaService(
 
     suspend fun listModels(endpointUrl: String): List<LocalOllamaModel> {
         val normalized = normalizeBaseUrl(endpointUrl)
+        KtorLlmClient.validateEndpointTransportSecurity(normalized)
         val response = client.get("$normalized/api/tags")
         if (response.status != HttpStatusCode.OK) {
             throw IllegalStateException("Ollama returned status ${response.status}")

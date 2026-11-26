@@ -16,6 +16,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -616,5 +617,88 @@ class MultiPassExtractionTest {
         )
         assertTrue(synthesis.indexOf("OUTPUT SCHEMA") < synthesis.indexOf("UNIQUE_RULE_MARKER"))
         assertTrue(synthesis.indexOf("UNIQUE_RULE_MARKER") < synthesis.indexOf("UNIQUE_PERSONA_MARKER"))
+    }
+
+    @Test
+    fun `fast-path bypasses when customRules set, rejects 127 attacker host, drops empty source_message_ids on multi-msg batch, and falls back on HTTP 422`() = runBlocking {
+        assertFalse(EventExtractor.isLocalEndpoint("http://127.attacker.com/v1"))
+        assertFailsWith<IllegalArgumentException> {
+            KtorLlmClient.validateEndpointTransportSecurity("http://192.168.1.50:8080/v1")
+        }
+        assertFailsWith<IllegalArgumentException> {
+            KtorLlmClient.validateEndpointTransportSecurity("http://user:pass@localhost:11434")
+        }
+
+        // HTTP 422 schema error triggers automatic json_object fallback
+        var sawFallback = false
+        val fallbackEngine = MockEngine { request ->
+            val body = (request.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString().orEmpty()
+            if (body.contains("\"json_schema\"")) {
+                respond("""{"error":"json_schema grammar not supported"}""", HttpStatusCode.UnprocessableEntity, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+            } else {
+                sawFallback = true
+                respond("""{"choices":[{"message":{"role":"assistant","content":"{\"is_relevant\":false,\"events\":[]}"},"finish_reason":"stop"}]}""", HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+            }
+        }
+        val fallbackClient = KtorLlmClient(LlmConfig(apiKey = "test-key"), fallbackEngine)
+        val fallbackResp = fallbackClient.chatCompletion("sys", "user", StageJsonSchemas.pass3SynthesisOptions())
+        assertTrue(sawFallback)
+        assertTrue(fallbackResp.contains("\"is_relevant\""))
+        fallbackClient.close()
+
+        // 2-message fast-path returning source_message_ids: [] drops ungrounded card instead of emitting empty sourceMessages
+        val ungroundedEngine = MockEngine {
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"{\"is_relevant\":true,\"events\":[{\"title\":\"Hallucinated Event\",\"summary\":\"Fake notice\",\"category\":\"NOTICE\",\"priority\":\"LOW\",\"source_message_ids\":[]}]}"},"finish_reason":"stop"}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val ungroundedClient = KtorLlmClient(LlmConfig(apiKey = "test-key"), ungroundedEngine)
+        val ungroundedExtractor = EventExtractor(ungroundedClient, enableFastPath = true)
+        val cards = ungroundedExtractor.extractEventsResult(
+            messages = listOf(
+                WeChatMessage(1, 1700000000, "a", "Alice", "Hello notice", "Hello notice", false),
+                WeChatMessage(2, 1700000060, "b", "Bob", "Meeting at 3pm", "Meeting at 3pm", false)
+            ),
+            roomId = "r@chatroom"
+        ).getOrThrow()
+        assertTrue(cards.isEmpty(), "Cards with ungrounded empty source_message_ids in multi-message batch must be dropped")
+        ungroundedClient.close()
+
+        // customRules bypasses fast-path onto Pass 1 -> Pass 2 -> Pass 3
+        val seenStages = mutableListOf<String>()
+        val rulesEngine = MockEngine { request ->
+            val body = (request.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString().orEmpty()
+            val jsonResp = when {
+                body.contains("Semantic Filter & Topic Chunker") -> {
+                    seenStages.add("pass1")
+                    """{"chunks":[{"topic":"Thesis Notice","message_ids":[1],"category":"NOTICE","reason":"Valid"}]}"""
+                }
+                body.contains("Rule & Substance Gatekeeper") -> {
+                    seenStages.add("pass2")
+                    """{"verdicts":[{"chunk_index":0,"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Valid"}]}"""
+                }
+                else -> {
+                    seenStages.add("pass3")
+                    """{"is_relevant":true,"events":[{"title":"Thesis Notice","summary":"Submit form today.","category":"NOTICE","priority":"NORMAL","source_message_ids":[1]}]}"""
+                }
+            }
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), jsonResp)}}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val rulesClient = KtorLlmClient(LlmConfig(apiKey = "test-key"), rulesEngine)
+        val rulesExtractor = EventExtractor(rulesClient, enableFastPath = true)
+        val ruleCards = rulesExtractor.extractEventsResult(
+            messages = listOf(WeChatMessage(1, 1700000000, "a", "Prof", "Mandatory thesis form due today.", "Mandatory thesis form due today.", false)),
+            roomId = "r@chatroom",
+            customRules = "Ignore student chatter"
+        ).getOrThrow()
+        assertEquals(1, ruleCards.size)
+        assertEquals(listOf("pass1", "pass2", "pass3"), seenStages)
+        rulesClient.close()
     }
 }

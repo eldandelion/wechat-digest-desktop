@@ -1,6 +1,7 @@
 package com.wechatdigest.core.db
 
 import com.wechatdigest.core.llm.LlmJsonUtils
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
@@ -16,11 +17,14 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object WcdbDecryptor {
+
+    private val decryptLocks = ConcurrentHashMap<String, Any>()
 
     const val PAGE_SIZE = 4096
     const val KEY_SIZE = 32
@@ -33,6 +37,8 @@ object WcdbDecryptor {
     const val WAL_MAGIC_LE = 0x377F0682
     const val WAL_MAGIC_BE = 0x377F0683
     const val WAL_FORMAT = 3007000
+    const val MAX_WAL_BYTES = 512L * 1024 * 1024
+    const val MAX_WAL_PAGES = 16_777_216L
 
     val SQLITE_HEADER = "SQLite format 3\u0000".toByteArray(Charsets.ISO_8859_1)
 
@@ -77,14 +83,22 @@ object WcdbDecryptor {
                     if (!encKeyHex.isNullOrBlank()) {
                         val keyBytes = hexToBytes(encKeyHex)
                         require(keyBytes.size == KEY_SIZE) { "Unexpected key byte length: ${keyBytes.size}" }
+                        val normalizedPath = path.replace('\\', '/')
                         result[path] = keyBytes
-                        result[path.replace('\\', '/')] = keyBytes
-                        val fileName = File(path).name
-                        result[fileName] = keyBytes
+                        result[normalizedPath] = keyBytes
+                        val fileName = File(normalizedPath).name
+                        // Prefer full/relative paths when multiple accounts reuse the same filename.
+                        result.putIfAbsent(fileName, keyBytes)
                     }
                 }
             }
             result
+        } catch (_: SerializationException) {
+            System.err.println("[WcdbDecryptor] Failed to parse keys file ${keysFile.name}: Invalid JSON syntax")
+            emptyMap()
+        } catch (_: IllegalArgumentException) {
+            System.err.println("[WcdbDecryptor] Failed to parse keys file ${keysFile.name}: Invalid key entry format")
+            emptyMap()
         } catch (e: Exception) {
             System.err.println(
                 "[WcdbDecryptor] Failed to parse keys file ${keysFile.name}: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
@@ -94,8 +108,12 @@ object WcdbDecryptor {
     }
 
     fun findKeysFile(customKeysFile: File? = null, baseDir: File? = null): File? {
-        if (customKeysFile != null && customKeysFile.exists() && customKeysFile.isFile) {
-            return customKeysFile
+        if (customKeysFile != null) {
+            return if (customKeysFile.exists() && customKeysFile.isFile && !Files.isSymbolicLink(customKeysFile.toPath())) {
+                customKeysFile
+            } else {
+                null
+            }
         }
         val candidates = mutableListOf<File>()
         if (baseDir != null) {
@@ -115,7 +133,7 @@ object WcdbDecryptor {
         candidates.add(File(userHome, ".wcdb-key-tool/all_keys.json"))
         candidates.add(File(userHome, "Library/Application Support/WeChatDigest/all_keys.json"))
 
-        return candidates.firstOrNull { it.exists() && it.isFile }
+        return candidates.firstOrNull { it.exists() && it.isFile && !Files.isSymbolicLink(it.toPath()) }
     }
 
     fun decryptPage(cipher: Cipher, keySpec: SecretKeySpec, pageData: ByteArray, pgno: Int): ByteArray {
@@ -146,7 +164,10 @@ object WcdbDecryptor {
         val totalPages = (fileSize / PAGE_SIZE).toInt()
         if (totalPages == 0) return false
 
-        outputFile.parentFile?.mkdirs()
+        outputFile.parentFile?.let { parent ->
+            parent.mkdirs()
+            setOwnerOnlyPermissions(parent, isDirectory = true)
+        }
 
         val cipher = Cipher.getInstance("AES/CBC/NoPadding")
         val keySpec = SecretKeySpec(encKey, "AES")
@@ -165,6 +186,7 @@ object WcdbDecryptor {
                 }
             }
         }
+        setOwnerOnlyPermissions(outputFile, isDirectory = false)
         return true
     }
 
@@ -175,12 +197,25 @@ object WcdbDecryptor {
         sourceRoot: File? = null
     ): File {
         if (!sourceFile.exists()) return sourceFile
+        require(!Files.isSymbolicLink(sourceFile.toPath())) {
+            "Refusing to read symlinked database: ${sourceFile.name}"
+        }
         if (!isEncrypted(sourceFile)) {
             return sourceFile
         }
 
+        val canonicalSourcePath = sourceFile.canonicalPath.replace('\\', '/')
         val relativePath = sourceFile.parentFile?.name + "/" + sourceFile.name
-        val key = keys[relativePath]
+        val rootRelativePath = sourceRoot?.let { root ->
+            runCatching { root.canonicalFile.toPath().relativize(sourceFile.canonicalFile.toPath()).toString().replace('\\', '/') }.getOrNull()
+        }
+        val key = keys[canonicalSourcePath]
+            ?: rootRelativePath?.let { keys[it] }
+            ?: keys[relativePath]
+            ?: keys.entries.firstOrNull { (k, _) ->
+                val norm = k.replace('\\', '/')
+                canonicalSourcePath.endsWith("/$norm") || norm.endsWith("/$relativePath")
+            }?.value
             ?: keys[sourceFile.name]
             ?: throw IllegalStateException("Database is encrypted (SQLCipher4), but no key found for: $relativePath (${sourceFile.name})")
 
@@ -199,75 +234,75 @@ object WcdbDecryptor {
         require(canonicalTarget.toPath().startsWith(canonicalCacheRoot.toPath())) {
             "Refusing to write decrypted cache file outside cacheDir: ${sourceFile.name}"
         }
+        requireNoSymlinkBetween(cacheDir, targetDir)
         require(
-            !Files.isSymbolicLink(cacheDir.toPath()) &&
-                !Files.isSymbolicLink(accountRootDir.toPath()) &&
-                !Files.isSymbolicLink(targetDir.toPath()) &&
-                !Files.isSymbolicLink(targetFile.toPath()) &&
+            !Files.isSymbolicLink(targetFile.toPath()) &&
                 !Files.isSymbolicLink(walStateFile.toPath())
         ) {
             "Refusing to write decrypted cache through a symbolic link: ${sourceFile.name}"
         }
 
         val walFile = File(sourceFile.parentFile, "${sourceFile.name}-wal")
-        val hasValidWalFile = walFile.exists() && walFile.isFile && !Files.isSymbolicLink(walFile.toPath())
-        val sourceMtime = sourceFile.lastModified()
-        val sourceLen = sourceFile.length()
-        val walMtime = if (hasValidWalFile) walFile.lastModified() else 0L
-        val walSize = if (hasValidWalFile) walFile.length() else 0L
-        val effectiveSourceMtime = maxOf(sourceMtime, walMtime)
-        val expectedState = "$sourceMtime|$sourceLen|$walMtime|$walSize"
+        val lock = decryptLocks.computeIfAbsent(targetFile.canonicalPath) { Any() }
+        return synchronized(lock) {
+            val hasValidWalFile = walFile.exists() && walFile.isFile && !Files.isSymbolicLink(walFile.toPath())
+            val sourceMtime = sourceFile.lastModified()
+            val sourceLen = sourceFile.length()
+            val walMtime = if (hasValidWalFile) walFile.lastModified() else 0L
+            val walSize = if (hasValidWalFile) walFile.length() else 0L
+            val effectiveSourceMtime = maxOf(sourceMtime, walMtime)
+            val expectedState = "$sourceMtime|$sourceLen|$walMtime|$walSize"
 
-        val stateMatches = walStateFile.exists() &&
-            !Files.isSymbolicLink(walStateFile.toPath()) &&
-            runCatching { walStateFile.readText().trim() == expectedState }.getOrDefault(false)
+            val stateMatches = walStateFile.exists() &&
+                !Files.isSymbolicLink(walStateFile.toPath()) &&
+                runCatching { walStateFile.readText().trim() == expectedState }.getOrDefault(false)
 
-        if (targetFile.exists() &&
-            targetFile.length() > 0 &&
-            targetFile.lastModified() >= effectiveSourceMtime &&
-            stateMatches
-        ) {
-            setOwnerOnlyPermissions(targetFile, isDirectory = false)
-            return targetFile
-        }
+            if (targetFile.exists() &&
+                targetFile.length() > 0 &&
+                targetFile.lastModified() >= effectiveSourceMtime &&
+                stateMatches
+            ) {
+                setOwnerOnlyPermissions(targetFile, isDirectory = false)
+                return@synchronized targetFile
+            }
 
-        cacheDir.mkdirs()
-        setOwnerOnlyPermissions(cacheDir, isDirectory = true)
-        accountRootDir.mkdirs()
-        setOwnerOnlyPermissions(accountRootDir, isDirectory = true)
-        targetDir.mkdirs()
-        setOwnerOnlyPermissions(targetDir, isDirectory = true)
+            ensureOwnerOnlyDirectoryTree(cacheDir, targetDir)
 
-        val tempFile = createOwnerOnlyTempFile(targetDir)
-        try {
-            val success = decryptDatabase(sourceFile, tempFile, key)
-            if (!success) {
-                throw IllegalStateException("Failed to decrypt database: ${sourceFile.name}")
+            val tempFile = createOwnerOnlyTempFile(targetDir)
+            try {
+                val success = decryptDatabase(sourceFile, tempFile, key)
+                if (!success) {
+                    throw IllegalStateException("Failed to decrypt database: ${sourceFile.name}")
+                }
+                val walAppliedOrUnneeded = if (hasValidWalFile && walSize > WAL_HEADER_SIZE) {
+                    replayEncryptedWalIfValid(tempFile, walFile, key)
+                } else {
+                    true
+                }
+                setOwnerOnlyPermissions(tempFile, isDirectory = false)
+                moveAtomicallyWithFallback(tempFile, targetFile)
+                setOwnerOnlyPermissions(targetFile, isDirectory = false)
+                // Only stamp .wal_state with walMtime|walSize when WAL replay succeeded (or no live WAL frames existed);
+                // if WAL replay skipped/failed on a volatile or torn WAL, avoid caching the stale WAL marker.
+                if (walAppliedOrUnneeded) {
+                    runCatching {
+                        writeOwnerOnlyTextAtomically(walStateFile, expectedState)
+                    }
+                } else {
+                    runCatching { walStateFile.delete() }
+                }
+                targetFile
+            } finally {
+                runCatching { if (tempFile.exists()) tempFile.delete() }
             }
-            if (hasValidWalFile && walSize > WAL_HEADER_SIZE) {
-                replayEncryptedWalIfValid(tempFile, walFile, key)
-            }
-            setOwnerOnlyPermissions(tempFile, isDirectory = false)
-            runCatching {
-                Files.move(tempFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-            }.getOrElse {
-                Files.move(tempFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            }
-            setOwnerOnlyPermissions(targetFile, isDirectory = false)
-            runCatching {
-                walStateFile.writeText(expectedState)
-                setOwnerOnlyPermissions(walStateFile, isDirectory = false)
-            }
-            return targetFile
-        } finally {
-            runCatching { if (tempFile.exists()) tempFile.delete() }
         }
     }
 
     /**
-     * Validates and replays committed SQLCipher 4 WAL frames from [walFile] onto [mainDecryptedFile].
-     * Stops cleanly on any checksum, salt, or truncation boundary and falls back safely to
-     * [mainDecryptedFile]-only if the WAL header is unrecognized or an anomaly occurs.
+     * Validates and replays committed SQLCipher 4 WAL frames from [walFile] onto [mainDecryptedFile]
+     * using single-page streaming I/O, cumulative SQLite WAL checksums, salt matching, shrink-safe
+     * commit-frame pruning, and upper size bounds. Falls back cleanly to [mainDecryptedFile]-only
+     * on any unrecognized header, checksum failure, or out-of-range size.
      */
     internal fun replayEncryptedWalIfValid(
         mainDecryptedFile: File,
@@ -276,13 +311,22 @@ object WcdbDecryptor {
     ): Boolean {
         return runCatching {
             if (!walFile.exists() || !walFile.isFile || Files.isSymbolicLink(walFile.toPath())) return@runCatching false
-            if (walFile.length() <= WAL_HEADER_SIZE) return@runCatching false
+            val walLen = walFile.length()
+            if (walLen <= WAL_HEADER_SIZE || walLen > MAX_WAL_BYTES) return@runCatching false
 
+            val mainDbPages = mainDecryptedFile.length() / PAGE_SIZE
             val header = ByteArray(WAL_HEADER_SIZE)
-            val allValidFrames = mutableListOf<Pair<Int, ByteArray>>()
-            var lastCommitCount = 0
+            val committedOffsets = LinkedHashMap<Int, Long>()
+            val pendingOffsets = LinkedHashMap<Int, Long>()
             var lastCommitDbSize = 0L
+            var committedFrameTotal = 0L
 
+            val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+            val keySpec = SecretKeySpec(key, "AES")
+            val encScratch = ByteArray(PAGE_SIZE)
+
+            // Hold ONE open descriptor across Pass 1 (validation) and Pass 2 (page reads) and stage writes
+            // onto a sibling temp copy so any mid-loop I/O error never corrupts mainDecryptedFile.
             RandomAccessFile(walFile, "r").use { walRaf ->
                 if (readFully(walRaf, header) < WAL_HEADER_SIZE) return@runCatching false
                 val hdrBuf = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN)
@@ -308,9 +352,11 @@ object WcdbDecryptor {
                 var s2 = calcH2
                 val frameHdr = ByteArray(WAL_FRAME_HEADER_SIZE)
                 val framePage = ByteArray(PAGE_SIZE)
+                var validFramesSeen = 0L
 
                 while (true) {
                     if (readFully(walRaf, frameHdr) < WAL_FRAME_HEADER_SIZE) break
+                    val pageDataOffset = walRaf.filePointer
                     if (readFully(walRaf, framePage) < PAGE_SIZE) break
 
                     val fBuf = ByteBuffer.wrap(frameHdr).order(ByteOrder.BIG_ENDIAN)
@@ -321,7 +367,7 @@ object WcdbDecryptor {
                     val fCksum1 = fBuf.getInt(16)
                     val fCksum2 = fBuf.getInt(20)
 
-                    if (pgno <= 0) break
+                    if (pgno <= 0 || pgno.toLong() > MAX_WAL_PAGES) break
                     if (fSalt1 != headerSalt1 || fSalt2 != headerSalt2) break
 
                     val (afterHdr1, afterHdr2) = computeWalChecksum(frameHdr, 0, 8, wordOrder, s1, s2)
@@ -330,38 +376,46 @@ object WcdbDecryptor {
 
                     s1 = calcF1
                     s2 = calcF2
-                    allValidFrames.add(pgno to framePage.copyOf())
+                    validFramesSeen++
+                    pendingOffsets[pgno] = pageDataOffset
                     if (dbSizeAfterCommit > 0L) {
-                        lastCommitCount = allValidFrames.size
+                        val maxBound = minOf(MAX_WAL_PAGES, mainDbPages + validFramesSeen + 16L)
+                        if (dbSizeAfterCommit > maxBound) return@runCatching false
+                        committedOffsets.putAll(pendingOffsets)
+                        pendingOffsets.clear()
+                        committedOffsets.entries.removeIf { it.key.toLong() > dbSizeAfterCommit }
                         lastCommitDbSize = dbSizeAfterCommit
+                        committedFrameTotal = validFramesSeen
                     }
                 }
-            }
 
-            if (lastCommitCount == 0 || lastCommitDbSize <= 0L) return@runCatching false
-
-            val latestCommittedPages = LinkedHashMap<Int, ByteArray>()
-            for (i in 0 until lastCommitCount) {
-                val (pgno, encPage) = allValidFrames[i]
-                if (pgno.toLong() <= lastCommitDbSize) {
-                    latestCommittedPages[pgno] = encPage
+                if (committedFrameTotal == 0L || lastCommitDbSize <= 0L || committedOffsets.isEmpty()) {
+                    return@runCatching false
                 }
-            }
-            if (latestCommittedPages.isEmpty()) return@runCatching false
 
-            val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-            val keySpec = SecretKeySpec(key, "AES")
-            val decryptedPages = LinkedHashMap<Int, ByteArray>(latestCommittedPages.size)
-            for ((pgno, encPage) in latestCommittedPages) {
-                decryptedPages[pgno] = decryptPage(cipher, keySpec, encPage, pgno)
-            }
-
-            RandomAccessFile(mainDecryptedFile, "rw").use { raf ->
-                for ((pgno, plainPage) in decryptedPages) {
-                    raf.seek((pgno - 1L) * PAGE_SIZE.toLong())
-                    raf.write(plainPage)
+                val targetDir = mainDecryptedFile.canonicalFile.parentFile ?: error("Missing decrypted parent directory")
+                val stagedFile = createOwnerOnlyTempFile(targetDir)
+                try {
+                    Files.copy(mainDecryptedFile.toPath(), stagedFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                    setOwnerOnlyPermissions(stagedFile, isDirectory = false)
+                    RandomAccessFile(stagedFile, "rw").use { outRaf ->
+                        for ((pgno, pageOffset) in committedOffsets) {
+                            walRaf.seek(pageOffset)
+                            if (readFully(walRaf, encScratch) < PAGE_SIZE) {
+                                return@runCatching false
+                            }
+                            val plainPage = decryptPage(cipher, keySpec, encScratch, pgno)
+                            outRaf.seek((pgno - 1L) * PAGE_SIZE.toLong())
+                            outRaf.write(plainPage)
+                        }
+                        outRaf.setLength(lastCommitDbSize * PAGE_SIZE.toLong())
+                    }
+                    setOwnerOnlyPermissions(stagedFile, isDirectory = false)
+                    moveAtomicallyWithFallback(stagedFile, mainDecryptedFile)
+                    setOwnerOnlyPermissions(mainDecryptedFile, isDirectory = false)
+                } finally {
+                    runCatching { if (stagedFile.exists()) stagedFile.delete() }
                 }
-                raf.setLength(lastCommitDbSize * PAGE_SIZE.toLong())
             }
             true
         }.getOrElse { e ->
@@ -445,6 +499,66 @@ object WcdbDecryptor {
             Files.createTempFile(directory.toPath(), ".decrypt_", ".tmp").toFile().also { file ->
                 setOwnerOnlyPermissions(file, isDirectory = false)
             }
+        }
+    }
+
+    internal fun requireNoSymlinkBetween(root: File, leaf: File) {
+        require(!Files.isSymbolicLink(root.toPath())) {
+            "Refusing to write through symbolic link directory: ${root.name}"
+        }
+        val rootCanonical = runCatching { root.canonicalPath }.getOrElse { root.absolutePath }
+        var cursor: File? = leaf
+        while (cursor != null) {
+            require(!Files.isSymbolicLink(cursor.toPath())) {
+                "Refusing to write through symbolic link directory: ${cursor?.name}"
+            }
+            val cursorCanonical = runCatching { cursor.canonicalPath }.getOrNull()
+            if (cursor == root || cursorCanonical == rootCanonical) break
+            cursor = cursor.parentFile
+        }
+    }
+
+    internal fun ensureOwnerOnlyDirectoryTree(root: File, leaf: File) {
+        val chain = mutableListOf<File>()
+        val rootCanonical = runCatching { root.canonicalPath }.getOrElse { root.absolutePath }
+        var cursor: File? = leaf
+        while (cursor != null) {
+            chain.add(cursor)
+            val cursorCanonical = runCatching { cursor.canonicalPath }.getOrNull()
+            if (cursor == root || cursorCanonical == rootCanonical) break
+            cursor = cursor.parentFile
+        }
+        root.parentFile?.let { parent ->
+            if (!parent.exists() && parent.mkdirs()) {
+                setOwnerOnlyPermissions(parent, isDirectory = true)
+            }
+        }
+        for (dir in chain.asReversed()) {
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+            setOwnerOnlyPermissions(dir, isDirectory = true)
+        }
+    }
+
+    internal fun moveAtomicallyWithFallback(src: File, dst: File) {
+        runCatching {
+            Files.move(src.toPath(), dst.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        }.getOrElse {
+            Files.move(src.toPath(), dst.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    internal fun writeOwnerOnlyTextAtomically(targetFile: File, text: String) {
+        val parent = targetFile.parentFile ?: return
+        val tmp = createOwnerOnlyTempFile(parent)
+        try {
+            tmp.writeText(text)
+            setOwnerOnlyPermissions(tmp, isDirectory = false)
+            moveAtomicallyWithFallback(tmp, targetFile)
+            setOwnerOnlyPermissions(targetFile, isDirectory = false)
+        } finally {
+            runCatching { if (tmp.exists()) tmp.delete() }
         }
     }
 

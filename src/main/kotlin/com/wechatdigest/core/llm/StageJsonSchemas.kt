@@ -18,7 +18,7 @@ internal object StageJsonSchemas {
     const val MAX_TOKENS_PASS3_SYNTHESIS = 2048
     const val MAX_TOKENS_CARD_TRANSLATION = 2048
     const val MAX_TOKENS_PASS4_ENRICHMENT = 2048
-    const val MAX_TOKENS_MESSAGE_TRANSLATION = 1536
+    const val MAX_TOKENS_MESSAGE_TRANSLATION = 4096
 
     private val eventCategories = listOf("NOTICE", "EXAM", "DEADLINE", "ACTIVITY", "PROMOTION", "OTHER")
     private val eventPriorities = listOf("CRITICAL", "IMPORTANT", "NORMAL", "LOW")

@@ -186,23 +186,7 @@ REQUIREMENTS:
         translated: List<EventSection>
     ): Result<List<EventSection>> {
         if (original.isEmpty()) return Result.success(emptyList())
-        val sanitizedTranslated = translated.mapNotNull { sec ->
-            val heading = EventDetailItemParser.sanitizeSingleLine(
-                sec.heading,
-                EventDetailItemParser.MAX_SECTION_HEADING_CHARS
-            )
-            val content = EventDetailItemParser.sanitizeMultiLine(
-                sec.content,
-                EventDetailItemParser.MAX_SECTION_CONTENT_CHARS
-            )
-            val items = EventDetailItemParser.sanitizeItems(sec.items)
-            val bullets = EventDetailItemParser.sanitizeBullets(sec.bullets)
-            if (content.isBlank() && items.isEmpty() && bullets.isEmpty()) {
-                null
-            } else {
-                EventSection(heading = heading, content = content, items = items, bullets = bullets)
-            }
-        }
+        val sanitizedTranslated = ExtractionCardConsolidator.sanitizeSections(translated)
         if (sanitizedTranslated.size != original.size) {
             return Result.failure(
                 IllegalStateException(

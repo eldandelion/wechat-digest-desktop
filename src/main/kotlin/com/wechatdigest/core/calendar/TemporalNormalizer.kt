@@ -27,15 +27,15 @@ object TemporalNormalizer {
         "not specified", "unspecified", "待定", "无", "暂无", "未知"
     )
 
-    private val urlRegex = Regex("""https?://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
-    private val emailRegex = Regex("""[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}""")
+    private val urlRegex = Regex("""https?://[^\s"'<>]{1,2048}""", RegexOption.IGNORE_CASE)
+    private val emailRegex = Regex("""(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,}""")
     private val chatLogPrefixRegex = Regex("""(?m)^(?:\[id:\d+\]\s*)?\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*[^:\n]{1,64}:\s*""")
 
     private val strictIsoDateRegex = Regex("""^\d{4}-\d{2}-\d{2}$""")
     private val strictIsoDateTimeRegex = Regex("""^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$""")
 
     private val explicitYmdRegex = Regex("""(?<![\d.])(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?![\d.])""")
-    private val zhDateRegex = Regex("""(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})(?:\s*[-–—~至到]\s*(?:(?:\d{1,2})\s*月\s*)?(\d{1,2}))?\s*[日号]""")
+    private val zhDateRegex = Regex("""(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?(?:\s*[-–—~至到]\s*(?:(\d{1,2})\s*月\s*)?(\d{1,2}))?\s*[日号]""")
     private val enMonthDayRegex = Regex(
         """\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*[-–—~]\s*(\d{1,2})(?:st|nd|rd|th)?)?(?:,?\s*(\d{4}))?\b""",
         RegexOption.IGNORE_CASE
@@ -64,11 +64,13 @@ object TemporalNormalizer {
     private val clauseBreakRegex = Regex("""[;；\n。]""")
 
     private val deadlineCueRegex = Regex("""(?:before|by|closes?|deadline|due|until|截至|截止|前)\s*$""", RegexOption.IGNORE_CASE)
+    private val postRangeDeadlineCueRegex = Regex("""^\s*(?:前|之前|以前|截止|截至|为止)""")
 
     private data class DateCandidate(
         val startIndex: Int,
         val endIndex: Int,
-        val date: LocalDate
+        val date: LocalDate,
+        val trailingPeriodHint: String = ""
     )
 
     /**
@@ -116,8 +118,13 @@ object TemporalNormalizer {
 
             val resolved = resolveSingleText(sanitized, anchorDate)
             if (resolved != null) {
-                if ('T' in resolved) return resolved
-                if (dateOnlyFallback == null) {
+                if ('T' in resolved) {
+                    val resolvedDate = runCatching { LocalDate.parse(resolved.substringBefore('T')) }.getOrNull()
+                    if (dateOnlyFallback == null || resolvedDate == dateOnlyFallback) {
+                        return resolved
+                    }
+                    // Skip attaching a time that was explicitly paired with a different date
+                } else if (dateOnlyFallback == null) {
                     dateOnlyFallback = runCatching { LocalDate.parse(resolved) }.getOrNull()
                 }
             } else if (standaloneTimeFallback == null) {
@@ -151,7 +158,7 @@ object TemporalNormalizer {
     }
 
     private fun stripNonTemporalNoise(raw: String): String {
-        return raw
+        return raw.take(8_192)
             .replace(chatLogPrefixRegex, "")
             .replace(urlRegex, " ")
             .replace(emailRegex, " ")
@@ -162,9 +169,12 @@ object TemporalNormalizer {
         val normalized = cleaned.replace(' ', 'T')
         return runCatching {
             when {
-                normalized.endsWith("Z", ignoreCase = true) ||
-                    Regex("""[+-]\d{2}:?\d{2}$""").containsMatchIn(normalized) ->
+                normalized.endsWith("Z", ignoreCase = true) ->
                     OffsetDateTime.parse(normalized).atZoneSameInstant(zoneId).toLocalDateTime()
+                Regex("""[+-]\d{2}:?\d{2}$""").containsMatchIn(normalized) -> {
+                    val withColonOffset = normalized.replace(Regex("""([+-]\d{2})(\d{2})$"""), "$1:$2")
+                    OffsetDateTime.parse(withColonOffset).atZoneSameInstant(zoneId).toLocalDateTime()
+                }
                 normalized.length == 16 -> LocalDateTime.parse("$normalized:00")
                 '.' in normalized -> LocalDateTime.parse(normalized.substringBefore('.'))
                 else -> LocalDateTime.parse(normalized)
@@ -185,11 +195,15 @@ object TemporalNormalizer {
 
         for (m in zhDateRegex.findAll(text)) {
             val y = m.groupValues[1].toIntOrNull()
-            val mo = m.groupValues[2].toIntOrNull() ?: continue
+            val startMonth = m.groupValues[2].toIntOrNull() ?: continue
             val startDay = m.groupValues[3].toIntOrNull() ?: continue
-            val endDay = m.groupValues[4].toIntOrNull()
-            val chosenDay = if (endDay != null && hasDeadlineCueBefore(text, m.range.first)) endDay else startDay
-            val date = resolveMonthDay(y, mo, chosenDay, anchorDate) ?: continue
+            val endMonth = m.groupValues[4].toIntOrNull()
+            val endDay = m.groupValues[5].toIntOrNull()
+            val useEnd = endDay != null &&
+                (hasDeadlineCueBefore(text, m.range.first) || hasDeadlineCueAfter(text, m.range.last + 1))
+            val chosenMonth = if (useEnd) (endMonth ?: startMonth) else startMonth
+            val chosenDay = if (useEnd) endDay!! else startDay
+            val date = resolveMonthDay(y, chosenMonth, chosenDay, anchorDate) ?: continue
             found.add(DateCandidate(m.range.first, m.range.last + 1, date))
         }
 
@@ -198,7 +212,9 @@ object TemporalNormalizer {
             val startDay = m.groupValues[2].toIntOrNull() ?: continue
             val endDay = m.groupValues[3].toIntOrNull()
             val y = m.groupValues[4].toIntOrNull()
-            val chosenDay = if (endDay != null && hasDeadlineCueBefore(text, m.range.first)) endDay else startDay
+            val useEnd = endDay != null &&
+                (hasDeadlineCueBefore(text, m.range.first) || hasDeadlineCueAfter(text, m.range.last + 1))
+            val chosenDay = if (useEnd) endDay!! else startDay
             val date = resolveMonthDay(y, mo, chosenDay, anchorDate) ?: continue
             found.add(DateCandidate(m.range.first, m.range.last + 1, date))
         }
@@ -212,14 +228,20 @@ object TemporalNormalizer {
         }
 
         for (m in zhRelativeDayRegex.findAll(text)) {
-            val offset = when (m.groupValues[1]) {
+            val token = m.groupValues[1]
+            val offset = when (token) {
                 "今天", "今日", "今晚" -> 0L
                 "明天", "明日", "明早", "明晚" -> 1L
                 "后天" -> 2L
                 "大后天" -> 3L
                 else -> continue
             }
-            found.add(DateCandidate(m.range.first, m.range.last + 1, anchorDate.plusDays(offset)))
+            val hint = when (token) {
+                "今晚", "明晚" -> token
+                "明早" -> token
+                else -> ""
+            }
+            found.add(DateCandidate(m.range.first, m.range.last + 1, anchorDate.plusDays(offset), trailingPeriodHint = hint))
         }
 
         for (m in zhWeekdayRegex.findAll(text)) {
@@ -230,12 +252,14 @@ object TemporalNormalizer {
         }
 
         for (m in enRelativeDayRegex.findAll(text)) {
-            val offset = when (m.groupValues[1].lowercase(Locale.ROOT)) {
+            val token = m.groupValues[1].lowercase(Locale.ROOT)
+            val offset = when (token) {
                 "today", "tonight" -> 0L
                 "tomorrow" -> 1L
                 else -> continue
             }
-            found.add(DateCandidate(m.range.first, m.range.last + 1, anchorDate.plusDays(offset)))
+            val hint = if (token == "tonight") "今晚" else ""
+            found.add(DateCandidate(m.range.first, m.range.last + 1, anchorDate.plusDays(offset), trailingPeriodHint = hint))
         }
 
         for (m in enWeekdayFullRegex.findAll(text)) {
@@ -266,13 +290,20 @@ object TemporalNormalizer {
 
     private fun chooseBestDateCandidate(text: String, candidates: List<DateCandidate>): DateCandidate {
         if (candidates.size == 1) return candidates.first()
-        val deadlineMatch = candidates.firstOrNull { c -> hasDeadlineCueBefore(text, c.startIndex) }
+        val deadlineMatch = candidates.firstOrNull { c ->
+            hasDeadlineCueBefore(text, c.startIndex) || hasDeadlineCueAfter(text, c.endIndex)
+        }
         return deadlineMatch ?: candidates.first()
     }
 
     private fun hasDeadlineCueBefore(text: String, index: Int): Boolean {
         val prefix = text.substring((index - 24).coerceAtLeast(0), index)
         return deadlineCueRegex.containsMatchIn(prefix)
+    }
+
+    private fun hasDeadlineCueAfter(text: String, index: Int): Boolean {
+        val suffix = text.substring(index, (index + 8).coerceAtMost(text.length))
+        return postRangeDeadlineCueRegex.containsMatchIn(suffix)
     }
 
     private fun extractTimeNearCandidate(
@@ -288,7 +319,9 @@ object TemporalNormalizer {
         val rawAfterSlice = text.substring(chosen.endIndex, afterWindowEnd)
         val afterBreak = clauseBreakRegex.find(rawAfterSlice)?.range?.first
         val afterSlice = if (afterBreak != null) rawAfterSlice.substring(0, afterBreak) else rawAfterSlice
-        extractFirstTime(afterSlice)?.let { return it }
+        extractFirstTime(afterSlice)?.let { time ->
+            return applyTrailingPeriodHint(time, afterSlice, chosen.trailingPeriodHint)
+        }
 
         val prevCandidateEnd = allCandidates
             .filter { it.endIndex <= chosen.startIndex }
@@ -420,18 +453,23 @@ object TemporalNormalizer {
         }
     }
 
+    private fun applyTrailingPeriodHint(time: LocalTime, slice: String, periodHint: String): LocalTime {
+        if (periodHint.isBlank() || time.hour !in 1..11) return time
+        val hasExplicitMarker = zhTimeWithPeriodRegex.containsMatchIn(slice) ||
+            Regex("""[ap]\.?m\.?""", RegexOption.IGNORE_CASE).containsMatchIn(slice)
+        if (hasExplicitMarker) return time
+        return if (periodHint == "今晚" || periodHint == "明晚") {
+            time.plusHours(12)
+        } else {
+            time
+        }
+    }
+
     private fun resolveEnglishWeekday(anchorDate: LocalDate, targetDow: DayOfWeek, modifier: String): LocalDate {
         return when (modifier) {
             "next" -> {
                 val nextMonday = anchorDate.with(TemporalAdjusters.next(DayOfWeek.MONDAY))
                 nextMonday.plusDays((targetDow.value - 1).toLong())
-            }
-            "this" -> {
-                if (anchorDate.dayOfWeek == DayOfWeek.SUNDAY) {
-                    anchorDate.with(TemporalAdjusters.nextOrSame(targetDow))
-                } else {
-                    anchorDate.with(TemporalAdjusters.nextOrSame(targetDow))
-                }
             }
             else -> anchorDate.with(TemporalAdjusters.nextOrSame(targetDow))
         }

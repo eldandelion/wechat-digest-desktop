@@ -1516,9 +1516,79 @@ class SanitizationAndLlmTest {
         assertEquals("Hello", translated)
         assertEquals(2, ollamaBodies.size)
         assertTrue(ollamaBodies[0].contains("\"num_ctx\":16384"))
-        assertTrue(ollamaBodies[0].contains("\"num_predict\":1536"))
+        assertTrue(ollamaBodies[0].contains("\"num_predict\":4096"))
         assertTrue(ollamaBodies[0].contains("\"translated_text\""))
         assertTrue(ollamaBodies[1].contains("\"format\":\"json\""))
         ollamaClient.close()
+
+        // Truncated JSON object without closing brace is repaired instead of returning raw JSON envelope
+        val truncatedEngine = MockEngine {
+            val encoded = kotlinx.serialization.json.Json.encodeToString(
+                kotlinx.serialization.serializer<String>(),
+                """{"translated_text":"Repaired translation"""
+            )
+            respond(
+                content = """{"choices":[{"message":{"role":"assistant","content":$encoded}}]}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val truncClient = KtorLlmClient(LlmConfig(apiKey = "k"), truncatedEngine)
+        val truncTranslated = MessageTranslator(truncClient).translateMessages("原文", "en").getOrThrow()
+        assertEquals("Repaired translation", truncTranslated)
+        truncClient.close()
+
+        // sanitizeLogMessage redacts Bearer tokens, sk-* secrets, and 64-hex DB keys
+        val redacted = com.wechatdigest.core.llm.LlmJsonUtils.sanitizeLogMessage(
+            "Auth failed Bearer eyJhbGciOiJIUzI1NiJ9.token sk-test1234567890 key=${"ab".repeat(32)}"
+        )
+        assertFalse(redacted.contains("eyJhbGciOiJIUzI1NiJ9"))
+        assertFalse(redacted.contains("sk-test1234567890"))
+        assertFalse(redacted.contains("ab".repeat(32)))
+
+        // Plain-text fallback containing literal braces '{Room 301}' preserves prose instead of throwing SerializationException,
+        // while an explicit broken JSON object envelope still fails closed.
+        val proseBracesEngine = MockEngine {
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"Meeting scheduled at {Room 301} tomorrow."}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val proseClient = KtorLlmClient(LlmConfig(apiKey = "k"), proseBracesEngine)
+        assertEquals("Meeting scheduled at {Room 301} tomorrow.", MessageTranslator(proseClient).translateMessages("原文", "en").getOrThrow())
+        proseClient.close()
+
+        val brokenEnvelopeEngine = MockEngine {
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"{\"unexpected\":true}"}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val brokenClient = KtorLlmClient(LlmConfig(apiKey = "k"), brokenEnvelopeEngine)
+        assertTrue(MessageTranslator(brokenClient).translateMessages("原文", "en").isFailure)
+        brokenClient.close()
+
+        // Truncated JSON with nested braces inside string AND valid JSON with trailing `{note}` preserve full text
+        val braceEdgeEngine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                body.contains("TRUNC_BRACE") -> """{"translated_text":"Meet at {Room 301} tomorrow"""
+                body.contains("TRAILING_BRACE") -> """{"translated_text":"Hello world"} (note {1})"""
+                else -> """{"translated_text":"""
+            }
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val braceClient = KtorLlmClient(LlmConfig(apiKey = "k"), braceEdgeEngine)
+        val braceTranslator = MessageTranslator(braceClient)
+        assertEquals("Meet at {Room 301} tomorrow", braceTranslator.translateMessages("TRUNC_BRACE", "en").getOrThrow())
+        assertEquals("Hello world", braceTranslator.translateMessages("TRAILING_BRACE", "en").getOrThrow())
+        assertTrue(braceTranslator.translateMessages("BAD_SYNTAX", "en").isFailure)
+        braceClient.close()
     }
 }

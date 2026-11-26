@@ -7,9 +7,12 @@ import java.io.FileNotFoundException
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.DriverManager
+import java.util.concurrent.ConcurrentHashMap
 
 class WeChatDatabaseDriver(
     val baseDir: File,
@@ -46,6 +49,9 @@ class WeChatDatabaseDriver(
     ): File {
         if (!rawFile.exists()) {
             throw FileNotFoundException("Database file not found: ${rawFile.absolutePath}")
+        }
+        require(!Files.isSymbolicLink(rawFile.toPath())) {
+            "Refusing to open symlinked database: ${rawFile.name}"
         }
         sessionContext?.getResolvedFile(rawFile)?.let { cached ->
             if (cached.exists()) return cached
@@ -89,7 +95,10 @@ class WeChatDatabaseDriver(
             val snapshotDir = sessionContext.getOrCreateSnapshotDir()
             val prefix = WcdbDecryptor.sha256Prefix(rawFile.canonicalPath, 12)
             val snapshotFile = File(snapshotDir, "${prefix}_${rawFile.name}")
-            return createPlaintextWalSnapshot(rawFile, walFile, snapshotFile)
+            val lock = snapshotLocks.computeIfAbsent("session:$prefix") { Any() }
+            return synchronized(lock) {
+                createPlaintextWalSnapshot(rawFile, walFile, snapshotFile).first
+            }
         }
 
         val acctNamespace = WcdbDecryptor.accountNamespace(baseDir)
@@ -104,89 +113,103 @@ class WeChatDatabaseDriver(
         require(snapshotFile.canonicalFile.toPath().startsWith(canonicalCacheRoot.toPath())) {
             "Refusing to write snapshot outside cacheDir: ${rawFile.name}"
         }
+        WcdbDecryptor.requireNoSymlinkBetween(cacheDir, targetDir)
         require(
-            !Files.isSymbolicLink(cacheDir.toPath()) &&
-                !Files.isSymbolicLink(snapshotRoot.toPath()) &&
-                !Files.isSymbolicLink(acctDir.toPath()) &&
-                !Files.isSymbolicLink(targetDir.toPath()) &&
-                !Files.isSymbolicLink(snapshotFile.toPath()) &&
+            !Files.isSymbolicLink(snapshotFile.toPath()) &&
                 !Files.isSymbolicLink(walStateFile.toPath())
         ) {
             "Refusing to write snapshot through a symbolic link: ${rawFile.name}"
         }
 
-        val sourceMtime = rawFile.lastModified()
-        val sourceLen = rawFile.length()
-        val walMtime = walFile.lastModified()
-        val walLen = walFile.length()
-        val effectiveMtime = maxOf(sourceMtime, walMtime)
-        val expectedState = "$sourceMtime|$sourceLen|$walMtime|$walLen"
-        val stateMatches = walStateFile.exists() &&
-            runCatching { walStateFile.readText().trim() == expectedState }.getOrDefault(false)
+        val lock = snapshotLocks.computeIfAbsent(snapshotFile.canonicalPath) { Any() }
+        return synchronized(lock) {
+            val sourceMtime = rawFile.lastModified()
+            val sourceLen = rawFile.length()
+            val walMtime = walFile.lastModified()
+            val walLen = walFile.length()
+            val effectiveMtime = maxOf(sourceMtime, walMtime)
+            val expectedState = "$sourceMtime|$sourceLen|$walMtime|$walLen"
+            val stateMatches = walStateFile.exists() &&
+                !Files.isSymbolicLink(walStateFile.toPath()) &&
+                runCatching { walStateFile.readText().trim() == expectedState }.getOrDefault(false)
 
-        if (snapshotFile.exists() &&
-            snapshotFile.length() > 0 &&
-            snapshotFile.lastModified() >= effectiveMtime &&
-            stateMatches
-        ) {
-            WcdbDecryptor.setOwnerOnlyPermissions(snapshotFile, isDirectory = false)
-            return snapshotFile
+            if (snapshotFile.exists() &&
+                snapshotFile.length() > 0 &&
+                snapshotFile.lastModified() >= effectiveMtime &&
+                stateMatches
+            ) {
+                WcdbDecryptor.setOwnerOnlyPermissions(snapshotFile, isDirectory = false)
+                return@synchronized snapshotFile
+            }
+
+            WcdbDecryptor.ensureOwnerOnlyDirectoryTree(cacheDir, targetDir)
+            val (flattened, walCheckpointed) = createPlaintextWalSnapshot(rawFile, walFile, snapshotFile)
+            if (walCheckpointed) {
+                runCatching {
+                    WcdbDecryptor.writeOwnerOnlyTextAtomically(walStateFile, expectedState)
+                }
+            } else {
+                runCatching { walStateFile.delete() }
+            }
+            flattened
         }
-
-        cacheDir.mkdirs()
-        WcdbDecryptor.setOwnerOnlyPermissions(cacheDir, isDirectory = true)
-        snapshotRoot.mkdirs()
-        WcdbDecryptor.setOwnerOnlyPermissions(snapshotRoot, isDirectory = true)
-        acctDir.mkdirs()
-        WcdbDecryptor.setOwnerOnlyPermissions(acctDir, isDirectory = true)
-        targetDir.mkdirs()
-        WcdbDecryptor.setOwnerOnlyPermissions(targetDir, isDirectory = true)
-
-        val flattened = createPlaintextWalSnapshot(rawFile, walFile, snapshotFile)
-        runCatching {
-            walStateFile.writeText(expectedState)
-            WcdbDecryptor.setOwnerOnlyPermissions(walStateFile, isDirectory = false)
-        }
-        return flattened
     }
 
     private fun createPlaintextWalSnapshot(
         rawFile: File,
         walFile: File,
         snapshotFile: File
-    ): File {
-        val snapshotDir = snapshotFile.parentFile
-        val snapshotWal = File(snapshotDir, "${snapshotFile.name}-wal")
-        val snapshotShm = File(snapshotDir, "${snapshotFile.name}-shm")
-        runCatching { snapshotWal.delete() }
-        runCatching { snapshotShm.delete() }
+    ): Pair<File, Boolean> {
+        val snapshotDir = snapshotFile.parentFile ?: error("Missing snapshot parent directory")
+        snapshotDir.mkdirs()
+        WcdbDecryptor.setOwnerOnlyPermissions(snapshotDir, isDirectory = true)
 
-        Files.copy(rawFile.toPath(), snapshotFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        WcdbDecryptor.setOwnerOnlyPermissions(snapshotFile, isDirectory = false)
-        Files.copy(walFile.toPath(), snapshotWal.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        WcdbDecryptor.setOwnerOnlyPermissions(snapshotWal, isDirectory = false)
-
-        try {
-            DriverManager.getConnection("jdbc:sqlite:${snapshotFile.canonicalPath}").use { conn ->
-                conn.createStatement().use { stmt ->
-                    stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    stmt.execute("PRAGMA journal_mode=DELETE")
-                }
+        val ownerOnlyDirPerms = setOf(
+            PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.OWNER_EXECUTE
+        )
+        val stagingDir = runCatching {
+            Files.createTempDirectory(snapshotDir.toPath(), ".snap_", PosixFilePermissions.asFileAttribute(ownerOnlyDirPerms)).toFile()
+        }.getOrElse {
+            Files.createTempDirectory(snapshotDir.toPath(), ".snap_").toFile().also {
+                WcdbDecryptor.setOwnerOnlyPermissions(it, isDirectory = true)
             }
-        } catch (e: Exception) {
-            System.err.println(
-                "[WeChatDatabaseDriver] Plaintext WAL snapshot checkpoint skipped for ${rawFile.name}: " +
-                    LlmJsonUtils.sanitizeLogMessage(e.message)
-            )
-            runCatching { snapshotWal.delete() }
-            runCatching { snapshotShm.delete() }
-            Files.copy(rawFile.toPath(), snapshotFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        } finally {
-            runCatching { snapshotWal.delete() }
-            runCatching { snapshotShm.delete() }
-            WcdbDecryptor.setOwnerOnlyPermissions(snapshotFile, isDirectory = false)
         }
-        return snapshotFile
+        val stagedDb = File(stagingDir, snapshotFile.name)
+        val stagedWal = File(stagingDir, "${snapshotFile.name}-wal")
+
+        var walCheckpointed = false
+        try {
+            Files.copy(rawFile.toPath(), stagedDb.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            WcdbDecryptor.setOwnerOnlyPermissions(stagedDb, isDirectory = false)
+            Files.copy(walFile.toPath(), stagedWal.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            WcdbDecryptor.setOwnerOnlyPermissions(stagedWal, isDirectory = false)
+
+            try {
+                val stagingUri = URI("file", null, stagedDb.canonicalFile.absolutePath, null, null).toASCIIString()
+                DriverManager.getConnection("jdbc:sqlite:$stagingUri").use { conn ->
+                    conn.createStatement().use { stmt ->
+                        stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        stmt.execute("PRAGMA journal_mode=DELETE")
+                    }
+                }
+                walCheckpointed = true
+            } catch (e: Exception) {
+                System.err.println(
+                    "[WeChatDatabaseDriver] Plaintext WAL snapshot checkpoint skipped for ${rawFile.name}: " +
+                        LlmJsonUtils.sanitizeLogMessage(e.message)
+                )
+                Files.copy(rawFile.toPath(), stagedDb.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+
+            WcdbDecryptor.setOwnerOnlyPermissions(stagedDb, isDirectory = false)
+            WcdbDecryptor.moveAtomicallyWithFallback(stagedDb, snapshotFile)
+            WcdbDecryptor.setOwnerOnlyPermissions(snapshotFile, isDirectory = false)
+        } finally {
+            runCatching { stagingDir.deleteRecursively() }
+        }
+        return snapshotFile to walCheckpointed
     }
 
     /**
@@ -213,6 +236,8 @@ class WeChatDatabaseDriver(
     }
 
     companion object {
+        private val snapshotLocks = ConcurrentHashMap<String, Any>()
+
         /**
          * Computes WeChat's internal table name for a chatroom: Msg_<md5(roomId)>
          */

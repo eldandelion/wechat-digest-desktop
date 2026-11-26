@@ -404,4 +404,72 @@ class WcdbDecryptorTest {
         }
         return out.toByteArray()
     }
+
+    @Test
+    fun `WAL replay rejects forged multi-TB dbSizeAfterCommit, prunes shrunk pages on regrow, and loadKeys avoids leaking JSON snippets`() {
+        val encKey = ByteArray(WcdbDecryptor.KEY_SIZE) { (it + 11).toByte() }
+        val mainPlain = ByteArray(WcdbDecryptor.PAGE_SIZE * 2) { 0x11.toByte() }
+        System.arraycopy(WcdbDecryptor.SQLITE_HEADER, 0, mainPlain, 0, 16)
+        val mainFile = File(tempDir, "message_0.db").apply { writeBytes(mainPlain) }
+
+        val forgedWalFile = File(tempDir, "forged.wal").apply {
+            writeBytes(
+                buildSyntheticWal(
+                    magic = WcdbDecryptor.WAL_MAGIC_LE,
+                    salt1 = 10,
+                    salt2 = 20,
+                    frames = listOf(
+                        Triple(2, -1 /* 0xFFFFFFFF unsigned */, encryptPageForTest(ByteArray(WcdbDecryptor.PAGE_SIZE), pgno = 2, rawKey = encKey, ivSeed = 9))
+                    )
+                )
+            )
+        }
+        val forgedTarget = File(tempDir, "out_forged.db").apply { writeBytes(mainPlain) }
+        assertFalse(WcdbDecryptor.replayEncryptedWalIfValid(forgedTarget, forgedWalFile, encKey))
+        assertEquals(mainPlain.size.toLong(), forgedTarget.length())
+
+        // Shrink from 3 pages -> 2 pages -> regrow to 3 pages without rewriting page 3:
+        // stale pre-shrink page 3 must NOT resurrect into the output!
+        val page3BeforeShrink = ByteArray(WcdbDecryptor.PAGE_SIZE) { 0x77.toByte() }
+        val page2Shrink = ByteArray(WcdbDecryptor.PAGE_SIZE) { 0x22.toByte() }
+        val page1Final = ByteArray(WcdbDecryptor.PAGE_SIZE) { 0x33.toByte() }.also {
+            System.arraycopy(WcdbDecryptor.SQLITE_HEADER, 0, it, 0, 16)
+        }
+        val shrinkWalFile = File(tempDir, "shrink.wal").apply {
+            writeBytes(
+                buildSyntheticWal(
+                    magic = WcdbDecryptor.WAL_MAGIC_BE,
+                    salt1 = 33,
+                    salt2 = 44,
+                    frames = listOf(
+                        Triple(3, 3, encryptPageForTest(page3BeforeShrink, pgno = 3, rawKey = encKey, ivSeed = 3)),
+                        Triple(2, 2, encryptPageForTest(page2Shrink, pgno = 2, rawKey = encKey, ivSeed = 2)),
+                        Triple(1, 3, encryptPageForTest(page1Final, pgno = 1, rawKey = encKey, ivSeed = 1))
+                    )
+                )
+            )
+        }
+        val shrinkOut = File(tempDir, "out_shrink.db").apply { writeBytes(mainPlain) }
+        assertTrue(WcdbDecryptor.replayEncryptedWalIfValid(shrinkOut, shrinkWalFile, encKey))
+        assertEquals(3L * WcdbDecryptor.PAGE_SIZE, shrinkOut.length())
+        val finalBytes = shrinkOut.readBytes()
+        // Page 3 region (bytes 2*4096 until end) should remain 0-filled from setLength, NOT 0x77
+        assertTrue(finalBytes.copyOfRange(2 * WcdbDecryptor.PAGE_SIZE, 2 * WcdbDecryptor.PAGE_SIZE + 64).all { it == 0.toByte() })
+
+        // Symlinked custom keys file must be rejected by findKeysFile
+        val realKeys = File(tempDir, "real_keys.json").apply { writeText("""{"contact.db":{"enc_key":"${"aa".repeat(32)}"}}""") }
+        val symlinkKeys = File(tempDir, "link_keys.json")
+        runCatching { java.nio.file.Files.createSymbolicLink(symlinkKeys.toPath(), realKeys.toPath()) }
+        if (java.nio.file.Files.isSymbolicLink(symlinkKeys.toPath())) {
+            assertEquals(null, WcdbDecryptor.findKeysFile(customKeysFile = symlinkKeys, baseDir = tempDir))
+        }
+
+        // Symlinked WAL file leaves mainDecryptedFile intact and does not corrupt output
+        val symWal = File(tempDir, "sym_target.wal").apply { writeBytes(shrinkWalFile.readBytes()) }
+        val linkWal = File(tempDir, "link.wal")
+        Files.createSymbolicLink(linkWal.toPath(), symWal.toPath())
+        val intactOut = File(tempDir, "out_intact.db").apply { writeBytes(mainPlain) }
+        assertFalse(WcdbDecryptor.replayEncryptedWalIfValid(intactOut, linkWal, encKey))
+        assertTrue(intactOut.readBytes().contentEquals(mainPlain))
+    }
 }

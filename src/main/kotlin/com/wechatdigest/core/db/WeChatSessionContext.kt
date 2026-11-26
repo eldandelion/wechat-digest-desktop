@@ -60,6 +60,7 @@ class WeChatSessionContext(
 
     /** Returns the cached `all_keys.json` map or throws if missing when opening an encrypted database. */
     fun getKeysOrThrow(forDbName: String): Map<String, ByteArray> {
+        check(!closed) { "WeChatSessionContext is already closed" }
         return keysMapLazy ?: throw IllegalStateException(
             "WeChat database '$forDbName' is encrypted with SQLCipher4, but all_keys.json was not found. " +
                 "Please place all_keys.json in ${driver.baseDir.absolutePath} or specify it in Settings."
@@ -108,8 +109,10 @@ class WeChatSessionContext(
 
     /** Returns the cached contacts map, invoking [loader] at most once per session. */
     fun getOrLoadContactsMap(loader: () -> Map<String, String>): Map<String, String> {
+        check(!closed) { "WeChatSessionContext is already closed" }
         cachedContactsMap?.let { return it }
         synchronized(contactsLock) {
+            check(!closed) { "WeChatSessionContext is already closed" }
             cachedContactsMap?.let { return it }
             return loader().also { cachedContactsMap = it }
         }
@@ -117,8 +120,10 @@ class WeChatSessionContext(
 
     /** Returns the cached `message_*.db` shard index, invoking [loader] at most once per session. */
     fun getOrLoadShardIndex(loader: () -> List<MessageShardIndexEntry>): List<MessageShardIndexEntry> {
+        check(!closed) { "WeChatSessionContext is already closed" }
         cachedShardIndex?.let { return it }
         synchronized(shardIndexLock) {
+            check(!closed) { "WeChatSessionContext is already closed" }
             cachedShardIndex?.let { return it }
             return loader().also { cachedShardIndex = it }
         }
@@ -128,6 +133,8 @@ class WeChatSessionContext(
         closed = true
         driver.detachSession(this)
         resolvedDbPaths.clear()
+        cachedContactsMap = null
+        cachedShardIndex = null
         synchronized(snapshotDirLock) {
             ephemeralSnapshotDir?.let { dir ->
                 runCatching {
