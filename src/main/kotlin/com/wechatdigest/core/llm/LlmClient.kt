@@ -4,34 +4,86 @@ import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.net.InetAddress
 import java.net.URI
 import java.util.Locale
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+
+/**
+ * Per-call structured output & token budget options passed to [LlmClient.chatCompletion].
+ */
+data class LlmCompletionOptions(
+    val responseSchema: JsonObject? = null,
+    val schemaName: String = "response",
+    val maxTokens: Int? = null,
+    val allowSchemaFallback: Boolean = true
+)
+
+/**
+ * Shared retry classification for transient empty-response and malformed-JSON local LLM quirks.
+ */
+internal object LlmRetryPolicy {
+    fun isRetryableError(error: Throwable): Boolean {
+        if (error is SerializationException) return true
+        val msg = error.message.orEmpty()
+        return msg.contains("Empty or missing message", ignoreCase = true) ||
+            msg.contains("Empty or missing choices", ignoreCase = true) ||
+            msg.contains("returned no text", ignoreCase = true)
+    }
+}
+
+/**
+ * Coroutine-scoped telemetry capture element so decorators (e.g. `TracingLlmClient`) receive exact
+ * per-request token & finish-reason metrics even under concurrent cloud execution.
+ */
+internal class LlmTelemetryElement : AbstractCoroutineContextElement(Key) {
+    @Volatile
+    var latest: LlmHttpTelemetry? = null
+
+    fun record(telemetry: LlmHttpTelemetry) {
+        latest = telemetry
+    }
+
+    companion object Key : CoroutineContext.Key<LlmTelemetryElement>
+}
 
 // OpenAI Request / Response DTOs
 @Serializable
 internal data class OpenAiMessage(val role: String = "", val content: String = "")
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
 internal data class OpenAiRequest(
     val model: String,
     val messages: List<OpenAiMessage>,
     val temperature: Double,
-    @SerialName("response_format") val responseFormat: JsonObject? = null
+    @SerialName("response_format") val responseFormat: JsonObject? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    @SerialName("max_tokens") val maxTokens: Int? = null
 )
 
 @Serializable
@@ -65,7 +117,7 @@ internal data class OllamaRequest(
     val model: String,
     val messages: List<OpenAiMessage>,
     val stream: Boolean = false,
-    val format: String = "json",
+    val format: JsonElement = JsonPrimitive("json"),
     val options: OllamaOptions? = null
 )
 
@@ -80,6 +132,12 @@ internal data class OllamaResponse(
 
 interface LlmClient : AutoCloseable {
     suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String
+
+    suspend fun chatCompletion(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String = chatCompletion(systemPrompt, userPrompt)
 }
 
 /** Optional capability interface allowing decorated clients to propagate provider concurrency caps. */
@@ -106,6 +164,7 @@ class KtorLlmClient(
     }
 
     private val client = HttpClient(resolvedEngine) {
+        expectSuccess = true
         install(ContentNegotiation) {
             json(json)
         }
@@ -124,10 +183,17 @@ class KtorLlmClient(
         }
     }
 
-    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String {
+    override suspend fun chatCompletion(systemPrompt: String, userPrompt: String): String =
+        chatCompletion(systemPrompt, userPrompt, LlmCompletionOptions())
+
+    override suspend fun chatCompletion(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String {
         return when (config.providerType) {
-            LlmProviderType.OPENAI_COMPATIBLE -> executeOpenAi(systemPrompt, userPrompt)
-            LlmProviderType.OLLAMA -> executeOllama(systemPrompt, userPrompt)
+            LlmProviderType.OPENAI_COMPATIBLE -> executeOpenAi(systemPrompt, userPrompt, options)
+            LlmProviderType.OLLAMA -> executeOllama(systemPrompt, userPrompt, options)
             LlmProviderType.BUILT_IN_LOCAL -> {
                 val baseUrl = config.endpointUrl.trim().trimEnd('/')
                 if (!isStrictLoopbackHttpUrl(baseUrl)) {
@@ -135,26 +201,64 @@ class KtorLlmClient(
                         "Built-in local model server is not active. Select or download a local model in Settings."
                     )
                 }
-                executeOpenAi(systemPrompt, userPrompt)
+                executeOpenAi(systemPrompt, userPrompt, options)
             }
         }
     }
 
-    private suspend fun executeOpenAi(systemPrompt: String, userPrompt: String): String {
+    private suspend fun executeOpenAi(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String {
         val baseUrl = config.endpointUrl.trim().trimEnd('/')
         validateTransportSecurity(baseUrl)
         val url = if (baseUrl.endsWith("/chat/completions")) baseUrl else "$baseUrl/chat/completions"
 
-        val requestPayload = OpenAiRequest(
+        val primaryPayload = buildOpenAiPayload(systemPrompt, userPrompt, options, useSchema = options.responseSchema != null)
+        return try {
+            executeOpenAiAttempt(url, primaryPayload)
+        } catch (e: ClientRequestException) {
+            if (shouldFallbackFromSchema(e, options, isOllama = false)) {
+                val fallbackPayload = buildOpenAiPayload(systemPrompt, userPrompt, options, useSchema = false)
+                executeOpenAiAttempt(url, fallbackPayload)
+            } else {
+                throw e
+            }
+        }
+    }
+
+    private fun buildOpenAiPayload(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions,
+        useSchema: Boolean
+    ): OpenAiRequest {
+        val responseFormat = if (useSchema && options.responseSchema != null) {
+            buildJsonObject {
+                put("type", "json_schema")
+                put("json_schema", buildJsonObject {
+                    put("name", options.schemaName)
+                    put("strict", true)
+                    put("schema", options.responseSchema)
+                })
+            }
+        } else {
+            buildJsonObject { put("type", "json_object") }
+        }
+        return OpenAiRequest(
             model = config.modelName,
             messages = listOf(
                 OpenAiMessage("system", systemPrompt),
                 OpenAiMessage("user", userPrompt)
             ),
             temperature = config.temperature,
-            responseFormat = buildJsonObject { put("type", "json_object") }
+            responseFormat = responseFormat,
+            maxTokens = options.maxTokens
         )
+    }
 
+    private suspend fun executeOpenAiAttempt(url: String, requestPayload: OpenAiRequest): String {
         val startMs = System.currentTimeMillis()
         val response = client.post(url) {
             contentType(ContentType.Application.Json)
@@ -166,7 +270,7 @@ class KtorLlmClient(
         val durationMs = System.currentTimeMillis() - startMs
 
         val firstChoice = response.choices.firstOrNull()
-        onTelemetry?.invoke(
+        emitTelemetry(
             LlmHttpTelemetry(
                 providerType = config.providerType,
                 model = config.modelName,
@@ -177,31 +281,63 @@ class KtorLlmClient(
             )
         )
 
-        return firstChoice?.message?.content
-            ?: throw IllegalStateException("Empty or missing choices in OpenAI response")
+        if (firstChoice == null) {
+            throw IllegalStateException("Empty or missing choices in OpenAI response")
+        }
+        return firstChoice.message.content.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("Empty or missing message in OpenAI response")
     }
 
-    private suspend fun executeOllama(systemPrompt: String, userPrompt: String): String {
+    private suspend fun executeOllama(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions
+    ): String {
         val baseUrl = config.endpointUrl.trim().trimEnd('/')
         validateTransportSecurity(baseUrl)
         val url = if (baseUrl.endsWith("/api/chat")) baseUrl else "$baseUrl/api/chat"
 
-        val requestPayload = OllamaRequest(
+        val primaryPayload = buildOllamaPayload(systemPrompt, userPrompt, options, useSchema = options.responseSchema != null)
+        return try {
+            executeOllamaAttempt(url, primaryPayload)
+        } catch (e: ClientRequestException) {
+            if (shouldFallbackFromSchema(e, options, isOllama = true)) {
+                val fallbackPayload = buildOllamaPayload(systemPrompt, userPrompt, options, useSchema = false)
+                executeOllamaAttempt(url, fallbackPayload)
+            } else {
+                throw e
+            }
+        }
+    }
+
+    private fun buildOllamaPayload(
+        systemPrompt: String,
+        userPrompt: String,
+        options: LlmCompletionOptions,
+        useSchema: Boolean
+    ): OllamaRequest {
+        val formatElement: JsonElement = if (useSchema && options.responseSchema != null) {
+            options.responseSchema
+        } else {
+            JsonPrimitive("json")
+        }
+        return OllamaRequest(
             model = config.modelName,
             messages = listOf(
                 OpenAiMessage("system", systemPrompt),
                 OpenAiMessage("user", userPrompt)
             ),
             stream = false,
-            format = "json",
+            format = formatElement,
             options = OllamaOptions(
                 temperature = config.temperature,
-                // Provide enough context/output headroom for 15-message triage and detailed sections
-                numCtx = 8192,
-                numPredict = 4096
+                numCtx = config.localContextSize.coerceIn(2048, 32768),
+                numPredict = options.maxTokens ?: 4096
             )
         )
+    }
 
+    private suspend fun executeOllamaAttempt(url: String, requestPayload: OllamaRequest): String {
         val startMs = System.currentTimeMillis()
         val response = client.post(url) {
             contentType(ContentType.Application.Json)
@@ -209,7 +345,7 @@ class KtorLlmClient(
         }.body<OllamaResponse>()
         val durationMs = System.currentTimeMillis() - startMs
 
-        onTelemetry?.invoke(
+        emitTelemetry(
             LlmHttpTelemetry(
                 providerType = LlmProviderType.OLLAMA,
                 model = config.modelName,
@@ -228,6 +364,25 @@ class KtorLlmClient(
         }
         return response.message?.content?.takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("Empty or missing message in Ollama response")
+    }
+
+    private suspend fun shouldFallbackFromSchema(
+        error: ClientRequestException,
+        options: LlmCompletionOptions,
+        isOllama: Boolean
+    ): Boolean {
+        if (options.responseSchema == null || !options.allowSchemaFallback) return false
+        if (error.response.status != HttpStatusCode.BadRequest) return false
+        val bodyText = runCatching { error.response.bodyAsText() }.getOrDefault("")
+        val matchesOpenAi = bodyText.contains("response_format", ignoreCase = true) ||
+            bodyText.contains("json_schema", ignoreCase = true) ||
+            bodyText.contains("unsupported", ignoreCase = true)
+        return matchesOpenAi || (isOllama && bodyText.contains("format", ignoreCase = true))
+    }
+
+    private suspend fun emitTelemetry(telemetry: LlmHttpTelemetry) {
+        onTelemetry?.invoke(telemetry)
+        currentCoroutineContext()[LlmTelemetryElement]?.record(telemetry)
     }
 
     private fun validateTransportSecurity(baseUrl: String) {

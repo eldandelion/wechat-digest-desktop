@@ -2,23 +2,15 @@
     "version": 1,
     "scenarioId": "REG-11_english_to_chinese_and_japanese_compliance",
     "descriptions": {
-        "001809191e82b584253e7b69bc12e8ed5aa8468aeb36b5a368181f292dd32f08": "pass1_triage",
-        "2f1f6aa92ea1e9679646e24fe70a99e2f2a21c869864f5c8126de176c6ed8c0a": "pass2_gatekeeper",
-        "875297ab03e20019ace6f26c8ab4fb7fcd8f05134760780f4515adee6437cf19": "card_translator",
-        "e830c8ff0444cde732b28bd69dca71cd089b388e6e38f2257616b5575388c709": "pass3_synthesis"
+        "5ea09f47686dc10908601340c8ffd162ee579271c542edb2984f0b1b4cab69e5": "pass3_synthesis",
+        "875297ab03e20019ace6f26c8ab4fb7fcd8f05134760780f4515adee6437cf19": "card_translator"
     },
     "entries": {
-        "001809191e82b584253e7b69bc12e8ed5aa8468aeb36b5a368181f292dd32f08": [
-            "{\"chunks\":[{\"topic\":\"Distributed Systems Guest Lecture\",\"message_ids\":[1101],\"category\":\"ACTIVITY\",\"reason\":\"Academic guest talk\"}]}"
-        ],
-        "2f1f6aa92ea1e9679646e24fe70a99e2f2a21c869864f5c8126de176c6ed8c0a": [
-            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Concrete time and auditorium\"}]}"
+        "5ea09f47686dc10908601340c8ffd162ee579271c542edb2984f0b1b4cab69e5": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"分布式系统客座讲座\",\"summary\":\"本周二上午十点在礼堂举行分布式系统客座讲座。\",\"translated_summary\":\"本周二上午十点在礼堂举行分布式系统客座讲座。\",\"sections\":[{\"heading\":\"时间地点\",\"content\":\"- 本周二 10:00，Auditorium A\"}],\"category\":\"ACTIVITY\",\"priority\":\"NORMAL\",\"source_message_ids\":[1101]}]}"
         ],
         "875297ab03e20019ace6f26c8ab4fb7fcd8f05134760780f4515adee6437cf19": [
             "{\"title\":\"分散システム特別講義のご案内\",\"summary\":\"今週火曜日の10:00よりAuditorium Aにて分散システムの特別講義を開催します。\",\"sections\":[{\"heading\":\"日時と会場\",\"content\":\"- 今週火曜日の10:00よりAuditorium Aで特別講義が行われます。\"}]}"
-        ],
-        "e830c8ff0444cde732b28bd69dca71cd089b388e6e38f2257616b5575388c709": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"分布式系统客座讲座\",\"summary\":\"本周二上午十点在礼堂举行分布式系统客座讲座。\",\"translated_summary\":\"本周二上午十点在礼堂举行分布式系统客座讲座。\",\"sections\":[{\"heading\":\"时间地点\",\"content\":\"- 本周二 10:00，Auditorium A\"}],\"category\":\"ACTIVITY\",\"priority\":\"NORMAL\",\"source_message_ids\":[1101]}]}"
         ]
     }
 }

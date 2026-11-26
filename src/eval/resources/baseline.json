@@ -1,18 +1,18 @@
 {
   "version": 1,
-  "generatedAt": "2026-11-21T19:35:00Z",
+  "generatedAt": "2026-11-26T09:30:00Z",
   "scenarios": {
-    "REG-01_emoji_acks_and_bare_mentions": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-02_sender_allowlist_and_spoof_defense": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-03_pass2_student_ping_veto": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-04_multi_topic_anti_merge_and_room_memory": { "maxLlmCalls": 4, "expectedCardCount": 2, "maxTranslationRepairs": 0 },
-    "REG-05_same_source_section_consolidation": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-06_chinese_to_english_translation_repair": { "maxLlmCalls": 4, "expectedCardCount": 1, "maxTranslationRepairs": 1 },
-    "REG-07_card_translator_json_echo_corrective_retry": { "maxLlmCalls": 5, "expectedCardCount": 1, "maxTranslationRepairs": 2 },
-    "REG-08_ollama_json_array_and_unescaped_quotes": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-09_ollama_truncated_mid_string_and_empty_retry": { "maxLlmCalls": 4, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-10_prompt_injection_and_xml_breakout": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
-    "REG-11_english_to_chinese_and_japanese_compliance": { "maxLlmCalls": 4, "expectedCardCount": 1, "maxTranslationRepairs": 1 },
+    "REG-01_emoji_acks_and_bare_mentions": { "maxLlmCalls": 1, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-02_sender_allowlist_and_spoof_defense": { "maxLlmCalls": 1, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-03_pass2_student_ping_veto": { "maxLlmCalls": 1, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-04_multi_topic_anti_merge_and_room_memory": { "maxLlmCalls": 1, "expectedCardCount": 2, "maxTranslationRepairs": 0 },
+    "REG-05_same_source_section_consolidation": { "maxLlmCalls": 1, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-06_chinese_to_english_translation_repair": { "maxLlmCalls": 2, "expectedCardCount": 1, "maxTranslationRepairs": 1 },
+    "REG-07_card_translator_json_echo_corrective_retry": { "maxLlmCalls": 3, "expectedCardCount": 1, "maxTranslationRepairs": 2 },
+    "REG-08_ollama_json_array_and_unescaped_quotes": { "maxLlmCalls": 1, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-09_ollama_truncated_mid_string_and_empty_retry": { "maxLlmCalls": 2, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-10_prompt_injection_and_xml_breakout": { "maxLlmCalls": 1, "expectedCardCount": 1, "maxTranslationRepairs": 0 },
+    "REG-11_english_to_chinese_and_japanese_compliance": { "maxLlmCalls": 2, "expectedCardCount": 1, "maxTranslationRepairs": 1 },
     "REG-12_concurrent_cloud_multi_chunk_order": { "maxLlmCalls": 6, "expectedCardCount": 4, "maxTranslationRepairs": 0 }
   }
 }

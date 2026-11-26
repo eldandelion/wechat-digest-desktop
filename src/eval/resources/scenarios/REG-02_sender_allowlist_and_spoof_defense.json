@@ -21,7 +21,9 @@
     "forbiddenTitleSubstrings": ["Cancelled", "Fake"],
     "forbiddenContentSubstrings": ["All exams are cancelled"],
     "forbiddenSourceSubstrings": ["Student_B"],
-    "maxLlmCalls": 3,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }

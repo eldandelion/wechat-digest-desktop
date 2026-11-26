@@ -360,6 +360,8 @@ class AppStateFeedAndAttachmentTest {
                 stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
                 stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'admin', CAST('First streamed notice' AS BLOB))")
                 stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800020, 'admin', CAST('Second slower notice' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1794800030, 'admin', CAST('Third background discussion note' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (4, 1794800040, 'admin', CAST('Fourth background discussion note' AS BLOB))")
             }
         }
 

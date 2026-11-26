@@ -3,12 +3,21 @@ package com.wechatdigest.eval
 import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.KtorLlmClient
+import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.OllamaDiscoveryResult
 import com.wechatdigest.core.llm.OllamaService
+import com.wechatdigest.core.llm.local.LlamaRuntimeManager
+import com.wechatdigest.core.llm.local.LlamaServerManager
+import com.wechatdigest.core.llm.local.LocalModelStore
+import com.wechatdigest.core.llm.local.ManagedLocalLlmClient
 import com.wechatdigest.core.repository.WeChatContactRepository
 import com.wechatdigest.core.repository.WeChatMessageRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import java.io.File
@@ -55,23 +64,46 @@ object PipelineTestbedCli {
             exitProcess(1)
         }
 
+        val localHarness = if (llmConfig.providerType == LlmProviderType.BUILT_IN_LOCAL) {
+            val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            val store = LocalModelStore()
+            val runtimeManager = LlamaRuntimeManager()
+            val serverManager = LlamaServerManager(runtimeManager = runtimeManager, scope = scope)
+            Triple(scope, store, Pair(runtimeManager, serverManager))
+        } else {
+            null
+        }
+
         val recorders = mutableListOf<Pair<File, RecordingLlmClient>>()
-        val report = EvalRunner.runSuite(
-            scenarios = scenarios,
-            mode = if (record) "record" else "live",
-            provider = llmConfig.providerType.name,
-            model = llmConfig.modelName,
-            trialsPerScenario = runs,
-            baseline = EvalRunner.loadBaseline(baselineFile),
-            targetLanguageOverride = targetLangOverride
-        ) { scenario ->
-            val liveClient = KtorLlmClient(llmConfig)
-            if (record) {
-                val recorder = RecordingLlmClient(liveClient, scenario.id)
-                recorders.add(File(cassettesDir, "${scenario.id}.cassette.json") to recorder)
-                recorder
-            } else {
-                liveClient
+        val report = try {
+            EvalRunner.runSuite(
+                scenarios = scenarios,
+                mode = if (record) "record" else "live",
+                provider = llmConfig.providerType.name,
+                model = llmConfig.modelName,
+                trialsPerScenario = runs,
+                baseline = EvalRunner.loadBaseline(baselineFile),
+                targetLanguageOverride = targetLangOverride
+            ) { scenario ->
+                val liveClient = if (localHarness != null) {
+                    val (_, store, managers) = localHarness
+                    ManagedLocalLlmClient(llmConfig, store, managers.second)
+                } else {
+                    KtorLlmClient(llmConfig)
+                }
+                if (record) {
+                    val recorder = RecordingLlmClient(liveClient, scenario.id)
+                    recorders.add(File(cassettesDir, "${scenario.id}.cassette.json") to recorder)
+                    recorder
+                } else {
+                    liveClient
+                }
+            }
+        } finally {
+            localHarness?.let { (scope, _, managers) ->
+                runCatching { managers.second.close() }
+                runCatching { managers.first.close() }
+                scope.cancel()
             }
         }
 
@@ -121,21 +153,45 @@ object PipelineTestbedCli {
         val llmConfig = resolveLlmConfig()
         var callRecords: List<LlmCallRecord> = emptyList()
 
-        val result = KtorLlmClient(llmConfig).use { liveClient ->
-            val tracer = TracingLlmClient(liveClient)
-            val extractor = EventExtractor(
-                llmClient = tracer,
-                zoneId = ZoneOffset.UTC,
-                observer = observer
-            )
-            val res = extractor.extractEventsResult(
-                messages = filtered,
-                roomId = roomId,
-                targetLanguage = targetLang,
-                customRules = customRules
-            )
-            callRecords = tracer.snapshotCalls()
-            res
+        val localHarness = if (llmConfig.providerType == LlmProviderType.BUILT_IN_LOCAL) {
+            val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            val store = LocalModelStore()
+            val runtimeManager = LlamaRuntimeManager()
+            val serverManager = LlamaServerManager(runtimeManager = runtimeManager, scope = scope)
+            Triple(scope, store, Pair(runtimeManager, serverManager))
+        } else {
+            null
+        }
+
+        val result = try {
+            val baseClient = if (localHarness != null) {
+                val (_, store, managers) = localHarness
+                ManagedLocalLlmClient(llmConfig, store, managers.second)
+            } else {
+                KtorLlmClient(llmConfig)
+            }
+            baseClient.use { liveClient ->
+                val tracer = TracingLlmClient(liveClient)
+                val extractor = EventExtractor(
+                    llmClient = tracer,
+                    zoneId = ZoneOffset.UTC,
+                    observer = observer
+                )
+                val res = extractor.extractEventsResult(
+                    messages = filtered,
+                    roomId = roomId,
+                    targetLanguage = targetLang,
+                    customRules = customRules
+                )
+                callRecords = tracer.snapshotCalls()
+                res
+            }
+        } finally {
+            localHarness?.let { (scope, _, managers) ->
+                runCatching { managers.second.close() }
+                runCatching { managers.first.close() }
+                scope.cancel()
+            }
         }
 
         val trace = observer.buildTrace(callRecords, callRecords.sumOf { it.latencyMs })
@@ -187,10 +243,22 @@ object PipelineTestbedCli {
 
     private suspend fun resolveLlmConfig(): LlmConfig {
         val providerRaw = System.getProperty("eval.provider", "OLLAMA").trim().uppercase()
-        val providerType = if (providerRaw == "OPENAI" || providerRaw == "OPENAI_COMPATIBLE") {
-            LlmProviderType.OPENAI_COMPATIBLE
-        } else {
-            LlmProviderType.OLLAMA
+        val providerType = when (providerRaw) {
+            "OPENAI", "OPENAI_COMPATIBLE" -> LlmProviderType.OPENAI_COMPATIBLE
+            "BUILT_IN_LOCAL", "BUILTIN_LOCAL", "LOCAL" -> LlmProviderType.BUILT_IN_LOCAL
+            else -> LlmProviderType.OLLAMA
+        }
+        if (providerType == LlmProviderType.BUILT_IN_LOCAL) {
+            val model = System.getProperty("eval.model")?.takeIf { it.isNotBlank() } ?: "qwen3-4b-instruct-2507-q4km"
+            val contextSize = System.getProperty("eval.ctx")?.toIntOrNull()?.coerceIn(2048, 32768) ?: 8192
+            return LlmConfig(
+                providerType = LlmProviderType.BUILT_IN_LOCAL,
+                endpointUrl = "",
+                apiKey = "",
+                modelName = model,
+                localModelId = model,
+                localContextSize = contextSize
+            )
         }
         val defaultEndpoint = if (providerType == LlmProviderType.OLLAMA) {
             "http://localhost:11434"
@@ -226,7 +294,12 @@ object PipelineTestbedCli {
         println("Passed: ${report.passedScenarios}/${report.totalScenarios} | Regression pass^k=${"%.1f".format(report.regressionPassRate * 100)}%")
         for (s in report.summaries) {
             val status = if (s.passAllK == 1.0) "PASS" else "FAIL(${s.passedTrials}/${s.trials})"
-            println(" - [$status] ${s.scenarioId} (${s.track}): calls=${"%.1f".format(s.avgLlmCalls)}, repairs=${"%.1f".format(s.avgJsonRepairs)}, langRepairs=${"%.1f".format(s.avgTranslationRepairs)}, ${s.avgDurationMs}ms")
+            val tokensPart = if (s.avgPromptTokens > 0 || s.avgCompletionTokens > 0) {
+                ", tokens=${"%.0f".format(s.avgPromptTokens)}+${"%.0f".format(s.avgCompletionTokens)}"
+            } else {
+                ""
+            }
+            println(" - [$status] ${s.scenarioId} (${s.track}): calls=${"%.1f".format(s.avgLlmCalls)}, repairs=${"%.1f".format(s.avgJsonRepairs)}, langRepairs=${"%.1f".format(s.avgTranslationRepairs)}, ${s.avgDurationMs}ms$tokensPart")
             s.trialResults.firstOrNull { !it.passed }?.let { failedTrial ->
                 printStageTrace(s.scenarioId, failedTrial.trace)
                 failedTrial.findings.filterNot { it.passed }.forEach { f ->

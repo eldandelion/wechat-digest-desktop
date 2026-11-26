@@ -1,13 +1,15 @@
 package com.wechatdigest.eval
 
+import com.wechatdigest.core.calendar.IcsCalendarGenerator
 import com.wechatdigest.core.llm.LanguageHelper
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
+import java.util.Locale
 
 /**
  * Deterministic layered evaluation graders enforcing extraction correctness, grounding, fact recall,
- * target-language compliance, and budget constraints without probabilistic judge variance.
+ * target-language compliance, per-card source grounding, `.ics` date validity, and budget constraints.
  */
 object EvalGraders {
 
@@ -15,6 +17,19 @@ object EvalGraders {
         "refer to the official notification",
         "check details in the group",
         "pending updates"
+    )
+
+    private val sourceHeaderPrefixRegex = Regex("""(?m)^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*[^:\n]{1,64}:\s*""")
+    private val latinTokenRegex = Regex("""[A-Za-z][A-Za-z0-9_-]{3,}""")
+    private val numericTokenRegex = Regex("""\d{1,2}:\d{2}|\d{2,}(?:-\d+)?""")
+    private val cjkCharRegex = Regex("""[\u4E00-\u9FFF]""")
+    private val genericEnglishStopwords = setOf(
+        "notice", "deadline", "schedule", "reminder", "update", "event", "events",
+        "submission", "submitted", "submit", "please", "must", "before", "after",
+        "between", "required", "details", "group", "students", "student", "applicant",
+        "applicants", "with", "from", "into", "your", "their", "will", "have", "been",
+        "about", "more", "only", "also", "when", "where", "that", "this", "these",
+        "those", "hall", "room", "building", "card", "copy", "copies", "form", "forms"
     )
 
     fun gradeAll(
@@ -28,6 +43,8 @@ object EvalGraders {
         val cards = result.getOrElse { emptyList() }
         if (!scenario.expectations.expectFailure) {
             findings.addAll(gradeGroundingAndAntiHallucination(scenario, cards))
+            findings.addAll(gradePerCardSourceGrounding(scenario, cards))
+            findings.addAll(gradeEventDateIcsValidity(scenario, cards))
             findings.addAll(gradeFactRecall(scenario, cards))
             findings.addAll(gradeLanguageCompliance(scenario, cards))
         }
@@ -218,6 +235,168 @@ object EvalGraders {
             )
         }
         return findings
+    }
+
+    private fun gradePerCardSourceGrounding(
+        scenario: EvalScenario,
+        cards: List<EventCard>
+    ): List<GraderFinding> {
+        val exp = scenario.expectations
+        if (cards.isEmpty() && exp.expectedPerCardGrounding.isEmpty()) return emptyList()
+
+        val errors = mutableListOf<String>()
+
+        for (expectation in exp.expectedPerCardGrounding) {
+            val matched = cards.firstOrNull { it.title.contains(expectation.titleSubstring, ignoreCase = true) }
+            if (matched == null) {
+                errors.add("No card found matching title '${expectation.titleSubstring}'")
+                continue
+            }
+            for (srcSub in expectation.requiredSourceSubstrings) {
+                if (!matched.sourceMessages.contains(srcSub, ignoreCase = true)) {
+                    errors.add("Card '${matched.title}' sourceMessages missing '$srcSub'")
+                }
+            }
+            if (expectation.requiredContentSubstrings.isNotEmpty()) {
+                val cardText = buildCardCorpus(listOf(matched))
+                for (contentSub in expectation.requiredContentSubstrings) {
+                    if (!cardText.contains(contentSub, ignoreCase = true)) {
+                        errors.add("Card '${matched.title}' content missing '$contentSub'")
+                    }
+                }
+            }
+        }
+
+        if (cards.size > 1) {
+            val sourceBodies = cards.map { stripSourceHeaders(it.sourceMessages) }
+            for ((idx, card) in cards.withIndex()) {
+                val titleTokens = extractSalientLatinTokens(card.title)
+                val titleCjk = extractCjkBigrams(card.title)
+                val ownSource = sourceBodies[idx]
+                val ownTitleOverlap = countMatchingTokens(titleTokens, ownSource) + countMatchingBigrams(titleCjk, ownSource)
+                if (ownTitleOverlap == 0 && (titleTokens.isNotEmpty() || titleCjk.isNotEmpty())) {
+                    val betterOtherIdx = sourceBodies.indices.firstOrNull { otherIdx ->
+                        otherIdx != idx &&
+                            (countMatchingTokens(titleTokens, sourceBodies[otherIdx]) +
+                                countMatchingBigrams(titleCjk, sourceBodies[otherIdx])) > 0
+                    }
+                    if (betterOtherIdx != null) {
+                        errors.add("Card[$idx] '${card.title}' has 0 title overlap with its own sourceMessages but matches card[$betterOtherIdx]'s sourceMessages")
+                    }
+                }
+            }
+        }
+
+        for ((idx, card) in cards.withIndex()) {
+            val sourceBody = stripSourceHeaders(card.sourceMessages)
+            val cardCorpus = buildCardCorpus(listOf(card))
+            val numTokens = extractNumericTokens(cardCorpus)
+            val latinTokens = extractSalientLatinTokens(cardCorpus)
+            val cjkBigrams = extractCjkBigrams(cardCorpus)
+
+            val sourceHasLatin = extractSalientLatinTokens(sourceBody).isNotEmpty()
+            val sourceHasCjk = cjkCharRegex.containsMatchIn(sourceBody)
+            val sourceHasNumbers = extractNumericTokens(sourceBody).isNotEmpty()
+
+            val comparableSignalExists =
+                (latinTokens.isNotEmpty() && sourceHasLatin) ||
+                    (cjkBigrams.isNotEmpty() && sourceHasCjk) ||
+                    (numTokens.isNotEmpty() && sourceHasNumbers)
+
+            if (comparableSignalExists) {
+                val matchedCount = countMatchingTokens(numTokens, sourceBody) +
+                    countMatchingTokens(latinTokens, sourceBody) +
+                    countMatchingBigrams(cjkBigrams, sourceBody)
+                if (matchedCount == 0) {
+                    errors.add("Card[$idx] '${card.title}' shares zero grounded tokens with its own sourceMessages")
+                }
+            }
+        }
+
+        return listOf(
+            GraderFinding(
+                grader = "per_card_source_grounding",
+                passed = errors.isEmpty(),
+                message = if (errors.isEmpty()) {
+                    "All ${cards.size} card(s) grounded cleanly to their own sourceMessages"
+                } else {
+                    errors.joinToString("; ")
+                }
+            )
+        )
+    }
+
+    private fun gradeEventDateIcsValidity(
+        scenario: EvalScenario,
+        cards: List<EventCard>
+    ): List<GraderFinding> {
+        val exp = scenario.expectations
+        val datedCards = cards.filter { !it.eventDate.isNullOrBlank() }
+        if (!exp.requireValidEventDates && exp.minDatedCards <= 0 && datedCards.isEmpty()) {
+            return emptyList()
+        }
+
+        val generator = IcsCalendarGenerator()
+        val errors = mutableListOf<String>()
+
+        for (card in datedCards) {
+            val icsRes = runCatching { generator.generateIcs(card) }
+            if (icsRes.isFailure) {
+                errors.add("Card '${card.title}' invalid eventDate='${card.eventDate}': ${icsRes.exceptionOrNull()?.message}")
+            }
+        }
+        if (exp.requireValidEventDates && datedCards.size < cards.size) {
+            val undated = cards.filter { it.eventDate.isNullOrBlank() }.map { it.title }
+            errors.add("Missing eventDate on card(s): $undated")
+        }
+        if (exp.minDatedCards > 0 && datedCards.size < exp.minDatedCards) {
+            errors.add("Dated card count=${datedCards.size}, expected >= ${exp.minDatedCards}")
+        }
+
+        return listOf(
+            GraderFinding(
+                grader = "event_date_ics_validity",
+                passed = errors.isEmpty(),
+                message = if (errors.isEmpty()) {
+                    "Validated ${datedCards.size}/${cards.size} card eventDate value(s) via IcsCalendarGenerator"
+                } else {
+                    errors.joinToString("; ")
+                }
+            )
+        )
+    }
+
+    private fun stripSourceHeaders(sourceMessages: String): String =
+        sourceMessages.replace(sourceHeaderPrefixRegex, "")
+
+    private fun extractSalientLatinTokens(text: String): Set<String> =
+        latinTokenRegex.findAll(text)
+            .map { it.value.lowercase(Locale.ROOT) }
+            .filter { it !in genericEnglishStopwords }
+            .toSet()
+
+    private fun extractNumericTokens(text: String): Set<String> =
+        numericTokenRegex.findAll(text).map { it.value }.toSet()
+
+    private fun extractCjkBigrams(text: String): Set<String> {
+        val chars = cjkCharRegex.findAll(text).map { it.value }.toList()
+        if (chars.size < 2) return emptySet()
+        val out = LinkedHashSet<String>()
+        for (i in 0 until chars.size - 1) {
+            out.add(chars[i] + chars[i + 1])
+        }
+        return out
+    }
+
+    private fun countMatchingTokens(tokens: Set<String>, haystack: String): Int {
+        if (tokens.isEmpty() || haystack.isBlank()) return 0
+        val lower = haystack.lowercase(Locale.ROOT)
+        return tokens.count { it in lower }
+    }
+
+    private fun countMatchingBigrams(bigrams: Set<String>, haystack: String): Int {
+        if (bigrams.isEmpty() || haystack.isBlank()) return 0
+        return bigrams.count { it in haystack }
     }
 
     private fun gradeFactRecall(

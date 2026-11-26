@@ -282,7 +282,7 @@ class SanitizationAndLlmTest {
             modelName = "gpt-4o-mini"
         )
         val client = KtorLlmClient(config, mockEngine)
-        val extractor = EventExtractor(client)
+        val extractor = EventExtractor(client, enableFastPath = false)
 
         val messages = listOf(
             WeChatMessage(1L, 1794298726L, "wxid_teacher", "Prof_Lin", longOriginalMessage, longOriginalMessage, false),
@@ -390,7 +390,7 @@ class SanitizationAndLlmTest {
             modelName = "qwen2.5:7b"
         )
         val client = KtorLlmClient(config, mockEngine)
-        val extractor = EventExtractor(client)
+        val extractor = EventExtractor(client, enableFastPath = false)
 
         val messages = listOf(
             WeChatMessage(1L, 1794298700L, "wxid_prof", "Prof_Zhang", "周三下午在A101举行研讨会，请大家准时参加", "周三下午在A101举行研讨会，请大家准时参加", false),
@@ -400,7 +400,8 @@ class SanitizationAndLlmTest {
         val events = extractor.extractEvents(messages, roomId = "lab@chatroom")
         assertEquals(3, capturedOllamaBodies.size)
         assertTrue(capturedOllamaBodies.first().contains("\"num_ctx\":8192"))
-        assertTrue(capturedOllamaBodies.first().contains("\"num_predict\":4096"))
+        assertTrue(capturedOllamaBodies.first().contains("\"num_predict\":768"))
+        assertTrue(capturedOllamaBodies.last().contains("\"num_predict\":2048"))
         assertEquals(1, events.size)
         val event = events.first()
         assertEquals("Lab Seminar Registration", event.title)
@@ -1402,7 +1403,7 @@ class SanitizationAndLlmTest {
         val progressStages = java.util.Collections.synchronizedList(mutableListOf<String>())
         val firstEmittedSignal = kotlinx.coroutines.CompletableDeferred<Unit>()
         KtorLlmClient(LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, apiKey = "k"), engine).use { llmClient ->
-            val extractor = EventExtractor(llmClient = llmClient, maxConcurrency = 4)
+            val extractor = EventExtractor(llmClient = llmClient, maxConcurrency = 4, enableFastPath = false)
             val extractJob = this@runBlocking.async {
                 extractor.extractEventsResult(
                     messages = listOf(msg1, msg2),
@@ -1444,5 +1445,80 @@ class SanitizationAndLlmTest {
             assertTrue(failedProgressCb.isFailure)
             assertTrue(failedProgressCb.exceptionOrNull()?.message?.contains("progress boom") == true)
         }
+    }
+
+    @Test
+    fun `KtorLlmClient sends json_schema and max_tokens, omits null max_tokens, and falls back to json_object on 400`() = runBlocking {
+        val capturedBodies = mutableListOf<String>()
+        val openAiEngine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            capturedBodies.add(body)
+            if (capturedBodies.size == 1) {
+                respond(
+                    content = """{"error":{"message":"response_format json_schema is unsupported by this model"}}""",
+                    status = HttpStatusCode.BadRequest,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                )
+            } else {
+                val encoded = kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), """{"chunks":[]}""")
+                respond(
+                    content = """{"choices":[{"message":{"role":"assistant","content":$encoded},"finish_reason":"stop"}]}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                )
+            }
+        }
+
+        val client = KtorLlmClient(
+            LlmConfig(providerType = LlmProviderType.OPENAI_COMPATIBLE, endpointUrl = "https://api.openai.com/v1", apiKey = "k"),
+            openAiEngine
+        )
+        val res = client.chatCompletion("sys", "usr", com.wechatdigest.core.llm.StageJsonSchemas.pass1TriageOptions())
+        assertEquals("""{"chunks":[]}""", res)
+        assertEquals(2, capturedBodies.size)
+        assertTrue(capturedBodies[0].contains("\"json_schema\""))
+        assertTrue(capturedBodies[0].contains("\"max_tokens\":768"))
+        assertTrue(capturedBodies[1].contains("\"json_object\""))
+        assertTrue(capturedBodies[1].contains("\"max_tokens\":768"))
+
+        // Default 2-arg call omits max_tokens when null
+        client.chatCompletion("sys", "usr")
+        assertEquals(3, capturedBodies.size)
+        assertFalse(capturedBodies.last().contains("\"max_tokens\""), "Null maxTokens must not be serialized")
+        client.close()
+
+        // Ollama sends schema format, localContextSize num_ctx, num_predict, and falls back to "json" on 400
+        val ollamaBodies = mutableListOf<String>()
+        val ollamaEngine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            ollamaBodies.add(body)
+            if (ollamaBodies.size == 1) {
+                respond(
+                    content = """{"error":"invalid format parameter"}""",
+                    status = HttpStatusCode.BadRequest,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                )
+            } else {
+                val encoded = kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), """{"translated_text":"Hello"}""")
+                respond(
+                    content = """{"message":{"role":"assistant","content":$encoded},"done_reason":"stop"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+                )
+            }
+        }
+        val ollamaClient = KtorLlmClient(
+            LlmConfig(providerType = LlmProviderType.OLLAMA, endpointUrl = "http://localhost:11434", modelName = "qwen3", localContextSize = 16384),
+            ollamaEngine
+        )
+        val msgTranslator = MessageTranslator(ollamaClient)
+        val translated = msgTranslator.translateMessages("你好", "en").getOrThrow()
+        assertEquals("Hello", translated)
+        assertEquals(2, ollamaBodies.size)
+        assertTrue(ollamaBodies[0].contains("\"num_ctx\":16384"))
+        assertTrue(ollamaBodies[0].contains("\"num_predict\":1536"))
+        assertTrue(ollamaBodies[0].contains("\"translated_text\""))
+        assertTrue(ollamaBodies[1].contains("\"format\":\"json\""))
+        ollamaClient.close()
     }
 }

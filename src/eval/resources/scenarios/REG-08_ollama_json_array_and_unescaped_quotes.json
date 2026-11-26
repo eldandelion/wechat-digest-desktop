@@ -15,7 +15,9 @@
     "expectedTitles": ["Midterm"],
     "mustContainFacts": ["422-1", "ta@eval.edu", "12:00"],
     "minJsonRepairs": 1,
-    "maxLlmCalls": 3,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true
   }
 }

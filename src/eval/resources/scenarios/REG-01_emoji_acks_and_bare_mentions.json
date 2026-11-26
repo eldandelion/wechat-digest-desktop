@@ -25,7 +25,9 @@
     "mustContainFacts": ["Canvas", "17:00", "305"],
     "forbiddenContentSubstrings": ["谢谢老师", "Sticker"],
     "forbiddenSourceSubstrings": ["Student_1", "Student_2"],
-    "maxLlmCalls": 3,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 1,
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }

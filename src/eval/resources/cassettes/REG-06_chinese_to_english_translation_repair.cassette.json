@@ -2,23 +2,15 @@
     "version": 1,
     "scenarioId": "REG-06_chinese_to_english_translation_repair",
     "descriptions": {
-        "0b8b1abfd7423495f063cb09a4bf7480b7e6d8a88951c3d85e668faf1b91def2": "pass2_gatekeeper",
-        "4e9cbd1e2b723c5cc8891cb318e6e7fb84dd1efb815a23c8cd54ac37c8920aa9": "card_translator",
-        "b0cbd36228a9ef78b7736ed7b9a26aaeba0aaece4bc1d3fe7d47107b06646eeb": "pass1_triage",
-        "b77c83c779f25ae7a31b1af45e2bb1a3aaed517f5edd20f7dfcda456502f718b": "pass3_synthesis"
+        "06907aec8bca18ce149616496c9b610fc33d81e3f1d759d3d4a6860431f50d67": "pass3_synthesis",
+        "4e9cbd1e2b723c5cc8891cb318e6e7fb84dd1efb815a23c8cd54ac37c8920aa9": "card_translator"
     },
     "entries": {
-        "0b8b1abfd7423495f063cb09a4bf7480b7e6d8a88951c3d85e668faf1b91def2": [
-            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official submission deadline\"}]}"
+        "06907aec8bca18ce149616496c9b610fc33d81e3f1d759d3d4a6860431f50d67": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"开题报告提交通知\",\"summary\":\"请所有研究生于周五下午16:00前将开题报告纸质版交至行政楼308室张老师处，逾期不再受理。\",\"translated_summary\":\"请所有研究生于周五下午16:00前将开题报告纸质版交至行政楼308室张老师处，逾期不再受理。\",\"sections\":[{\"heading\":\"提交要求\",\"content\":\"- 周五下午16:00前交至行政楼308室张老师处\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[601]}]}"
         ],
         "4e9cbd1e2b723c5cc8891cb318e6e7fb84dd1efb815a23c8cd54ac37c8920aa9": [
             "{\"title\":\"Proposal Report Hard Copy Submission\",\"summary\":\"Graduate students must submit printed proposal reports to Zhang at Room 308 Administrative Building before Friday 16:00.\",\"sections\":[{\"heading\":\"Submission Requirements\",\"content\":\"- Submit printed copy to Room 308 Administrative Building before Friday 16:00\"}]}"
-        ],
-        "b0cbd36228a9ef78b7736ed7b9a26aaeba0aaece4bc1d3fe7d47107b06646eeb": [
-            "{\"chunks\":[{\"topic\":\"开题报告提交截止\",\"message_ids\":[601],\"category\":\"DEADLINE\",\"reason\":\"明确提交时间与地点\"}]}"
-        ],
-        "b77c83c779f25ae7a31b1af45e2bb1a3aaed517f5edd20f7dfcda456502f718b": [
-            "{\"is_relevant\":true,\"events\":[{\"title\":\"开题报告提交通知\",\"summary\":\"请所有研究生于周五下午16:00前将开题报告纸质版交至行政楼308室张老师处，逾期不再受理。\",\"translated_summary\":\"请所有研究生于周五下午16:00前将开题报告纸质版交至行政楼308室张老师处，逾期不再受理。\",\"sections\":[{\"heading\":\"提交要求\",\"content\":\"- 周五下午16:00前交至行政楼308室张老师处\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"source_message_ids\":[601]}]}"
         ]
     }
 }

@@ -489,7 +489,7 @@ class LanguageAndCardTranslatorTest {
             }
         }
 
-        val extractor = EventExtractor(cloudClient, zoneId = java.time.ZoneOffset.UTC, observer = observer)
+        val extractor = EventExtractor(cloudClient, zoneId = java.time.ZoneOffset.UTC, observer = observer, enableFastPath = false)
         val msg = WeChatMessage(11L, 1779000000L, "teacher", "Admin", "Evacuation drill on May 22 at 10:00.", "Evacuation drill on May 22 at 10:00.", false)
         val cards = extractor.extractEventsResult(listOf(msg), "room@chatroom", targetLanguage = "en").getOrThrow()
 

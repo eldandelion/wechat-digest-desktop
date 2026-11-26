@@ -38,7 +38,9 @@
     "forbiddenTitleSubstrings": ["Hot Water"],
     "forbiddenContentSubstrings": ["Dorm Building 5"],
     "allowSlashMergedTitles": false,
-    "maxLlmCalls": 4,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 2,
     "requireLanguageCompliance": true,
     "requireZeroJsonParseFailures": true
   }
