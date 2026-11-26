@@ -1,0 +1,41 @@
+{
+  "id": "REG-14_rich_xml_sysmsg_recall_solitaire_and_stranger",
+  "description": "Phase 2 end-to-end gate: type=10002 revokemsg recalls serverId 50001, type=10000 drops sysmsg, type=57 trivial ack drops despite long quote, #接龙 chain collapses to latest, while type=5 link, type=33 mini-program, and type=87 group announcement survive into cards with owner cues.",
+  "track": "REGRESSION",
+  "roomId": "room_phase2@chatroom",
+  "roomDisplayName": "Phase 2 Research Group",
+  "targetLanguage": "en",
+  "messages": [
+    { "localId": 1401, "serverId": 50001, "localType": 1, "timestampSeconds": 1779012000, "senderId": "wxid_prof_lin", "senderDisplayName": "Prof_Lin", "isOwner": true, "content": "Old typo: meeting moved to Hall Z at 08:00." },
+    { "localId": 1402, "localType": 10002, "timestampSeconds": 1779012030, "senderId": "wxid_prof_lin", "senderDisplayName": "Prof_Lin", "content": "<sysmsg type=\"revokemsg\"><revokemsg><msgid>1</msgid><newmsgid>50001</newmsgid><replacemsg><![CDATA[\"Prof_Lin\" recalled a message]]></replacemsg></revokemsg></sysmsg>" },
+    { "localId": 1403, "localType": 10000, "timestampSeconds": 1779012060, "senderId": "sys", "senderDisplayName": "sys", "content": "Student_B invited Student_C to the group chat" },
+    { "localId": 1404, "localType": 244813135921, "timestampSeconds": 1779012090, "senderId": "wxid_student_a", "senderDisplayName": "Student_A", "content": "<msg><appmsg><title>收到</title><type>57</type><refermsg><type>1</type><svrid>50002</svrid><displayname>Prof_Lin</displayname><content>Register online for 2026 Research Symposium by May 25 at 17:00</content></refermsg></appmsg></msg>" },
+    { "localId": 1405, "serverId": 50002, "localType": 21474836529, "timestampSeconds": 1779012120, "senderId": "wxid_prof_lin", "senderDisplayName": "Prof_Lin", "isOwner": true, "content": "<msg><appmsg><title>2026 Research Symposium Registration</title><des>Submit registration by May 25 at 17:00</des><type>5</type><url>https://symposium.example.edu/register</url><sourcedisplayname>Academic Affairs</sourcedisplayname></appmsg></msg>" },
+    { "localId": 1406, "localType": 141733920817, "timestampSeconds": 1779012150, "senderId": "wxid_ta_zhang", "senderDisplayName": "TA_Zhang", "content": "<msg><appmsg><title>Safety Training Sign-In</title><des>Mandatory quiz deadline May 27</des><type>33</type><url>https://mp.weixin.qq.com/mp/waerrpage?appid=wx1</url><sourcedisplayname>问卷星</sourcedisplayname><weappinfo><pagepath>pages/safety/index</pagepath></weappinfo></appmsg></msg>" },
+    { "localId": 1407, "localType": 1, "timestampSeconds": 1779012180, "senderId": "wxid_student_a", "senderDisplayName": "Student_A", "content": "#接龙 Weekly Tea Sign-Up\n1. Student_A" },
+    { "localId": 1408, "localType": 1, "timestampSeconds": 1779012210, "senderId": "wxid_student_b", "senderDisplayName": "Student_B", "content": "#接龙 Weekly Tea Sign-Up\n1. Student_A\n2. Student_B" },
+    { "localId": 1409, "localType": 373662154801, "timestampSeconds": 1779012240, "senderId": "wxid_prof_lin", "senderDisplayName": "Prof_Lin", "isOwner": true, "content": "<msg><appmsg><title>@所有人 Short header</title><textannouncement>@所有人 Building B Fire Drill on May 29 at 14:00. Evacuate to South Courtyard.</textannouncement><type>87</type></appmsg></msg>" }
+  ],
+  "expectations": {
+    "minCards": 3,
+    "maxCards": 3,
+    "minSurvivingPrefilter": 4,
+    "maxSurvivingPrefilter": 4,
+    "expectedTitles": ["Symposium", "Safety Training", "Fire Drill"],
+    "mustContainFacts": ["May 25", "17:00", "symposium.example.edu", "May 27", "May 29", "14:00", "South Courtyard"],
+    "forbiddenTitleSubstrings": ["Hall Z", "Tea"],
+    "forbiddenContentSubstrings": ["Hall Z", "invited Student_C", "waerrpage", "revokemsg"],
+    "forbiddenSourceSubstrings": ["Hall Z", "invited Student_C", "Student_A", "1407"],
+    "allowSlashMergedTitles": false,
+    "maxLlmCalls": 5,
+    "requireValidEventDates": true,
+    "minDatedCards": 3,
+    "expectedPerCardGrounding": [
+      { "titleSubstring": "Symposium", "requiredSourceSubstrings": ["symposium.example.edu", "Prof_Lin [Owner]"], "requiredContentSubstrings": ["May 25"] },
+      { "titleSubstring": "Safety Training", "requiredSourceSubstrings": ["Safety Training Sign-In", "TA_Zhang"], "requiredContentSubstrings": ["May 27"] },
+      { "titleSubstring": "Fire Drill", "requiredSourceSubstrings": ["South Courtyard", "Prof_Lin [Owner]"], "requiredContentSubstrings": ["May 29"] }
+    ],
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

@@ -146,10 +146,11 @@ object PipelineTestbedCli {
         }
         println("[Snapshot] Loaded ${rawMessages.size} message(s) from room '$roomId' (read-only)")
 
+        val recallCleaned = com.wechatdigest.core.sanitizer.MessageSanitizer.suppressSystemAndRecalledMessages(rawMessages)
         val filtered = if (allowSenders.isNotEmpty()) {
-            rawMessages.filter { it.senderId in allowSenders }
+            recallCleaned.filter { it.senderId in allowSenders }
         } else {
-            rawMessages
+            recallCleaned
         }
         val observer = CollectingExtractionObserver(rawMessages.size, filtered.size)
         val llmConfig = resolveLlmConfig()

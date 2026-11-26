@@ -22,6 +22,7 @@ enum class AppThemeMode(val displayName: String) {
 data class AppSettings(
     val wechatDataDir: String = "",
     val keysPath: String = "",
+    val wechatAttachmentRootDir: String = "",
     val llm: LlmConfig = LlmConfig(),
     val monitoredRoomIds: Set<String> = emptySet(),
     val userPersona: String = "international student studying at university",

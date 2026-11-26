@@ -155,11 +155,12 @@ fun OnboardingWizardDialog(
     LaunchedEffect(currentStep, selectedPath) {
         if (currentStep == WizardStep.CHATROOMS && selectedPath.isNotBlank()) {
             isLoadingRooms = true
-            val dir = File(selectedPath)
-            if (dir.exists() && dir.isDirectory) {
-                try {
+            try {
+                val dir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)
+                if (dir != null && dir.exists() && dir.isDirectory) {
                     val rooms = withContext(Dispatchers.IO) {
-                        val driver = WeChatDatabaseDriver(dir)
+                        val defaultCacheDir = File(System.getProperty("user.home"), "Library/Application Support/WeChatDigest/decrypted")
+                        val driver = WeChatDatabaseDriver(baseDir = dir, cacheDir = defaultCacheDir)
                         val repo = WeChatContactRepository(driver)
                         repo.listAllChatrooms()
                     }
@@ -167,11 +168,14 @@ fun OnboardingWizardDialog(
                     if (selectedRoomIds.isEmpty() && rooms.isNotEmpty()) {
                         selectedRoomIds = setOf(rooms.first().roomId)
                     }
-                } catch (e: Exception) {
-                    System.err.println("[OnboardingWizard] Failed to list rooms: ${e.message}")
                 }
+            } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                System.err.println("[OnboardingWizard] Failed to list rooms: ${com.wechatdigest.core.llm.LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            } finally {
+                isLoadingRooms = false
             }
-            isLoadingRooms = false
         }
     }
 
@@ -657,7 +661,8 @@ fun OnboardingWizardDialog(
                                     modelName.trim()
                                 }
                                 val updatedSettings = currentSettings.copy(
-                                    wechatDataDir = selectedPath.trim(),
+                                    wechatDataDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)?.absolutePath
+                                        ?: selectedPath.trim(),
                                     llm = currentSettings.llm.copy(
                                         providerType = providerType,
                                         endpointUrl = endpointUrl.trim(),

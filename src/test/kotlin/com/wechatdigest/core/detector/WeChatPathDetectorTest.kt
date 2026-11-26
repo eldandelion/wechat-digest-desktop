@@ -68,4 +68,31 @@ class WeChatPathDetectorTest {
         assertTrue(candidates.single().isDecryptedCopy)
         assertTrue(candidates.single().label.contains("Plaintext / Decrypted"))
     }
+
+    @Test
+    fun `isValidWeChatDir ignores message_fts and non-numeric auxiliary message databases`() {
+        val ftsOnlyDir = File(tempDir, "fts_only").apply { mkdirs() }
+        File(ftsOnlyDir, "contact.db").createNewFile()
+        File(ftsOnlyDir, "message_fts.db").createNewFile()
+        File(ftsOnlyDir, "message_resource.db").createNewFile()
+
+        assertFalse(detector.isValidWeChatDir(ftsOnlyDir))
+        assertTrue(detector.detectCandidates(customRoots = listOf(ftsOnlyDir)).single().let { it.hasContacts && !it.hasMessages })
+    }
+
+    @Test
+    fun `resolveUserPath expands tilde and detector rejects symlinked message and contact dirs`() {
+        val home = System.getProperty("user.home")
+        assertEquals(File(home, "Documents/wechat"), WeChatPathDetector.resolveUserPath("~/Documents/wechat"))
+        assertEquals(null, WeChatPathDetector.resolveUserPath("   "))
+
+        val realTarget = File(tempDir, "real_target").apply { mkdirs() }
+        File(realTarget, "contact.db").createNewFile()
+        File(realTarget, "message_0.db").createNewFile()
+
+        val symAccount = File(tempDir, "sym_account").apply { mkdirs() }
+        java.nio.file.Files.createSymbolicLink(File(symAccount, "contact").toPath(), realTarget.toPath())
+        java.nio.file.Files.createSymbolicLink(File(symAccount, "message").toPath(), realTarget.toPath())
+        assertFalse(detector.isValidWeChatDir(symAccount))
+    }
 }

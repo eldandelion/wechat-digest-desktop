@@ -700,5 +700,23 @@ class MultiPassExtractionTest {
         assertEquals(1, ruleCards.size)
         assertEquals(listOf("pass1", "pass2", "pass3"), seenStages)
         rulesClient.close()
+
+        // Single unrelated message with non-blank roomAnnouncement refuses unattributed empty source_message_ids fallback
+        val annEngine = MockEngine {
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"{\"is_relevant\":true,\"events\":[{\"title\":\"Stale Pinned Exam\",\"summary\":\"From background announcement only.\",\"category\":\"EXAM\",\"priority\":\"HIGH\",\"source_message_ids\":[]}]}"}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val annClient = KtorLlmClient(LlmConfig(apiKey = "test-key"), annEngine)
+        val annExtractor = EventExtractor(annClient, enableFastPath = true)
+        val annCards = annExtractor.extractEventsResult(
+            messages = listOf(WeChatMessage(1, 1700000000, "a", "Student", "See you in the library at 3pm today.", "See you in the library at 3pm today.", false)),
+            roomId = "r@chatroom",
+            roomAnnouncement = "Final exam Dec 20 in Hall A"
+        ).getOrThrow()
+        assertTrue(annCards.isEmpty(), "Stale roomAnnouncement card without explicit source_message_ids must not hijack unrelated message")
+        annClient.close()
     }
 }

@@ -1,0 +1,28 @@
+{
+    "version": 1,
+    "scenarioId": "REG-14_rich_xml_sysmsg_recall_solitaire_and_stranger",
+    "descriptions": {
+        "50b11067211dd927baa3c686e46108866dfd158dda8c3e7a67c21f48e0afbd55": "pass3_synthesis",
+        "b2180c243a4a29f8ea927eacc26e91a4ef2f5ad7440d942df7a0c0435532b9df": "pass2_gatekeeper",
+        "c5390b0df1b68ee427060a7819fb0495b44601226298865ca2d8fb864c60b7cc": "pass3_synthesis",
+        "dc5b1f87ad7d3313a52a4b6a385db82cd95f6ea48c39fa3bfc12bc58171e7ccd": "pass3_synthesis",
+        "e3363db2139443ae50f70649b34ecd68487d7c6c7ede43d5b6bfa8fb978b1a6a": "pass1_triage"
+    },
+    "entries": {
+        "50b11067211dd927baa3c686e46108866dfd158dda8c3e7a67c21f48e0afbd55": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Safety Training Sign-In\",\"summary\":\"Complete the mandatory Safety Training Sign-In mini-program quiz before May 27.\",\"translated_summary\":\"Complete the mandatory Safety Training Sign-In mini-program quiz before May 27.\",\"sections\":[{\"heading\":\"Mini Program\",\"content\":\"- App: Questionnaire Mini Program\\n- Deadline: May 27\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"event_date\":\"2026-05-27T23:59:00\",\"source_message_ids\":[1406]}]}"
+        ],
+        "b2180c243a4a29f8ea927eacc26e91a4ef2f5ad7440d942df7a0c0435532b9df": [
+            "{\"verdicts\":[{\"chunk_index\":0,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Official symposium link\"},{\"chunk_index\":1,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Mandatory safety training\"},{\"chunk_index\":2,\"is_group_notice\":false,\"passes_rules\":false,\"has_substance\":false,\"keep\":false,\"reason\":\"Casual tea #接龙 check-in\"},{\"chunk_index\":3,\"is_group_notice\":true,\"passes_rules\":true,\"has_substance\":true,\"keep\":true,\"reason\":\"Mandatory fire drill notice\"}]}"
+        ],
+        "c5390b0df1b68ee427060a7819fb0495b44601226298865ca2d8fb864c60b7cc": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"2026 Research Symposium Registration\",\"summary\":\"Register online for the 2026 Research Symposium by May 25 at 17:00 via https://symposium.example.edu/register.\",\"translated_summary\":\"Register online for the 2026 Research Symposium by May 25 at 17:00 via https://symposium.example.edu/register.\",\"sections\":[{\"heading\":\"Registration\",\"content\":\"- Deadline: May 25 at 17:00\\n- Link: https://symposium.example.edu/register\"}],\"category\":\"DEADLINE\",\"priority\":\"IMPORTANT\",\"event_date\":\"2026-05-25T17:00:00\",\"source_message_ids\":[1405]}]}"
+        ],
+        "dc5b1f87ad7d3313a52a4b6a385db82cd95f6ea48c39fa3bfc12bc58171e7ccd": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Building B Fire Drill\",\"summary\":\"Building B Fire Drill on May 29 at 14:00; evacuate to South Courtyard.\",\"translated_summary\":\"Building B Fire Drill on May 29 at 14:00; evacuate to South Courtyard.\",\"sections\":[{\"heading\":\"Drill Location\",\"content\":\"- May 29 at 14:00\\n- Evacuate to South Courtyard\"}],\"category\":\"EVENT\",\"priority\":\"CRITICAL\",\"event_date\":\"2026-05-29T14:00:00\",\"source_message_ids\":[1409]}]}"
+        ],
+        "e3363db2139443ae50f70649b34ecd68487d7c6c7ede43d5b6bfa8fb978b1a6a": [
+            "{\"chunks\":[{\"topic\":\"2026 Research Symposium Registration\",\"message_ids\":[1405],\"category\":\"DEADLINE\"},{\"topic\":\"Safety Training Sign-In\",\"message_ids\":[1406],\"category\":\"DEADLINE\"},{\"topic\":\"Weekly Tea Sign-Up\",\"message_ids\":[1408],\"category\":\"NOTICE\"},{\"topic\":\"Building B Fire Drill\",\"message_ids\":[1409],\"category\":\"EVENT\"}]}"
+        ]
+    }
+}

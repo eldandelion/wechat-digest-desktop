@@ -348,6 +348,42 @@ class AttachmentPipelineTest {
         assertFalse(EventAttachment(fileName = "valid.pdf", mediaExpireAtSeconds = 300L).isExpired(nowEpochSeconds = 200L))
     }
 
+    @Test
+    fun `resolver links standalone decrypted DB mirror to explicit WeChat msg attachment root`() {
+        val decryptedMirror = File(tempDir, "wcdb-key-tool/decrypted").apply { mkdirs() }
+        val liveAccount = File(tempDir, "live_wxid_account").apply { mkdirs() }
+        val msgFileMonth = File(liveAccount, "msg/file/2026-11").apply { mkdirs() }
+        val syllabusBytes = "Final schedule attached".toByteArray()
+        val liveFile = File(msgFileMonth, "syllabus_v2.pdf").apply { writeBytes(syllabusBytes) }
+
+        val driver = WeChatDatabaseDriver(decryptedMirror, cacheDir = File(tempDir, "cache_explicit"))
+        val resolver = WeChatAttachmentResolver(
+            driver = driver,
+            explicitAttachmentRootDir = liveAccount,
+            autoDetectSingleAccountRoot = false
+        )
+        val resolved = resolver.resolve(
+            EventAttachment(
+                fileName = "syllabus_v2.pdf",
+                fileExtension = "pdf",
+                fileSizeBytes = syllabusBytes.size.toLong(),
+                md5 = md5Hex(syllabusBytes),
+                messageTimestampSeconds = 1795000000L
+            )
+        )
+        assertEquals(liveFile.canonicalPath, resolved.localPath)
+
+        // Intermediate symlinked msg/ directory inside explicit root must be rejected fail-closed
+        val symRoot = File(tempDir, "sym_explicit_account").apply { mkdirs() }
+        java.nio.file.Files.createSymbolicLink(File(symRoot, "msg").toPath(), File(liveAccount, "msg").toPath())
+        val symResolver = WeChatAttachmentResolver(
+            driver = driver,
+            explicitAttachmentRootDir = symRoot,
+            autoDetectSingleAccountRoot = false
+        )
+        kotlin.test.assertNull(symResolver.resolveMsgFileRoot())
+    }
+
     private fun md5Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
 }

@@ -1,7 +1,9 @@
 package com.wechatdigest.core.repository
 
+import com.wechatdigest.core.attachment.ParsedWeChatMessage
 import com.wechatdigest.core.attachment.WeChatAttachmentResolver
 import com.wechatdigest.core.attachment.WeChatFileMessageParser
+import com.wechatdigest.core.attachment.WeChatXmlMessageParser
 import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.db.WeChatSessionContext
 import com.wechatdigest.core.decompress.ZstdDecompressor
@@ -9,6 +11,7 @@ import com.wechatdigest.core.model.SyncCheckpoint
 import com.wechatdigest.core.model.WeChatMessage
 import java.io.File
 import java.io.FileNotFoundException
+import java.util.concurrent.CancellationException
 
 class WeChatMessageRepository(
     private val driver: WeChatDatabaseDriver,
@@ -173,6 +176,15 @@ class WeChatMessageRepository(
         return shards.minWithOrNull(newestShardComparator())?.shardFile
     }
 
+    private fun loadRoomOwnerUsername(roomId: String): String {
+        return try {
+            contactRepository.loadRoomOwnersMap()[roomId].orEmpty()
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            ""
+        }
+    }
+
     /**
      * Fetches the latest messages for a chatroom and resolves sender names and decompresses content.
      */
@@ -183,7 +195,8 @@ class WeChatMessageRepository(
             ?: throw FileNotFoundException("Could not find database shard containing table $tableName for room $roomId")
 
         val contactsMap = contactRepository.loadContactsMap()
-        return readRecentFromShard(shard, tableName, contactsMap, limit)
+        val roomOwnerUsername = loadRoomOwnerUsername(roomId)
+        return readRecentFromShard(shard, tableName, contactsMap, limit, roomOwnerUsername)
     }
 
     /**
@@ -196,7 +209,8 @@ class WeChatMessageRepository(
             ?: throw FileNotFoundException("Could not find database shard containing table $tableName for room $roomId")
 
         val contactsMap = contactRepository.loadContactsMap()
-        return readSinceLocalIdFromShard(shard, tableName, sinceLocalId, contactsMap, limit)
+        val roomOwnerUsername = loadRoomOwnerUsername(roomId)
+        return readSinceLocalIdFromShard(shard, tableName, sinceLocalId, contactsMap, limit, roomOwnerUsername)
     }
 
     /**
@@ -226,9 +240,10 @@ class WeChatMessageRepository(
         }
 
         val contactsMap = contactRepository.loadContactsMap()
+        val roomOwnerUsername = loadRoomOwnerUsername(roomId)
 
         if (checkpoint == null || checkpoint.lastLocalId <= 0L) {
-            val recent = readRecentFromShard(newestShard, tableName, contactsMap, safeLimit)
+            val recent = readRecentFromShard(newestShard, tableName, contactsMap, safeLimit, roomOwnerUsername)
             if (recent.isEmpty()) {
                 return IncrementalReadResult(emptyList(), newestShard.shardFile.name, 0L, 0L)
             }
@@ -250,7 +265,8 @@ class WeChatMessageRepository(
                     tableName = tableName,
                     contactsMap = contactsMap,
                     limit = safeLimit,
-                    fallbackCheckpoint = checkpoint
+                    fallbackCheckpoint = checkpoint,
+                    roomOwnerUsername = roomOwnerUsername
                 )
             }
             // Saved shard is no longer present: advance safely by create_time across remaining shards
@@ -268,7 +284,7 @@ class WeChatMessageRepository(
                 var cursorLocalId = 0L
                 while (collected.size < safeLimit) {
                     val remaining = safeLimit - collected.size
-                    val batch = readSinceCreateTimeFromShard(shard, tableName, cursorCreateTime, cursorLocalId, contactsMap, remaining)
+                    val batch = readSinceCreateTimeFromShard(shard, tableName, cursorCreateTime, cursorLocalId, contactsMap, remaining, roomOwnerUsername)
                     if (batch.isEmpty()) break
                     val added = appendDeduplicatedShardMessages(shard.shardFile.name, batch, collected, seenFingerprints)
                     val batchLast = batch.last()
@@ -307,7 +323,7 @@ class WeChatMessageRepository(
         if (nonEmptyShards.size == 1) {
             val single = nonEmptyShards.single()
             if (single.bounds.maxLocalId >= checkpoint.lastLocalId) {
-                val msgs = readSinceLocalIdFromShard(single, tableName, checkpoint.lastLocalId, contactsMap, safeLimit)
+                val msgs = readSinceLocalIdFromShard(single, tableName, checkpoint.lastLocalId, contactsMap, safeLimit, roomOwnerUsername)
                 if (msgs.isEmpty()) {
                     return IncrementalReadResult(emptyList(), single.shardFile.name, checkpoint.lastLocalId, checkpoint.lastSyncTimestamp)
                 }
@@ -342,7 +358,8 @@ class WeChatMessageRepository(
                 tableName = tableName,
                 contactsMap = contactsMap,
                 limit = safeLimit,
-                fallbackCheckpoint = checkpoint.copy(lastShardName = startShard.shardFile.name)
+                fallbackCheckpoint = checkpoint.copy(lastShardName = startShard.shardFile.name),
+                roomOwnerUsername = roomOwnerUsername
             )
         }
 
@@ -356,14 +373,15 @@ class WeChatMessageRepository(
         tableName: String,
         contactsMap: Map<String, String>,
         limit: Int,
-        fallbackCheckpoint: SyncCheckpoint
+        fallbackCheckpoint: SyncCheckpoint,
+        roomOwnerUsername: String = ""
     ): IncrementalReadResult {
         val collected = mutableListOf<ShardMessage>()
         val seenFingerprints = HashSet<CrossShardFingerprint>()
         var exhaustedCursor: Triple<String, Long, Long>? = null
 
         val startShard = orderedShards[startIdx]
-        val tailMessages = readSinceLocalIdFromShard(startShard, tableName, sinceLocalIdOnStart, contactsMap, limit)
+        val tailMessages = readSinceLocalIdFromShard(startShard, tableName, sinceLocalIdOnStart, contactsMap, limit, roomOwnerUsername)
         appendDeduplicatedShardMessages(startShard.shardFile.name, tailMessages, collected, seenFingerprints)
         if (tailMessages.isNotEmpty()) {
             val tailLast = tailMessages.last()
@@ -376,7 +394,7 @@ class WeChatMessageRepository(
             var shardCursorLocalId = 0L
             while (collected.size < limit) {
                 val remaining = limit - collected.size
-                val batch = readSinceLocalIdFromShard(nextShard, tableName, shardCursorLocalId, contactsMap, remaining)
+                val batch = readSinceLocalIdFromShard(nextShard, tableName, shardCursorLocalId, contactsMap, remaining, roomOwnerUsername)
                 if (batch.isEmpty()) break
                 appendDeduplicatedShardMessages(nextShard.shardFile.name, batch, collected, seenFingerprints)
                 val batchLast = batch.last()
@@ -436,7 +454,8 @@ class WeChatMessageRepository(
         shard: RoomShard,
         tableName: String,
         contactsMap: Map<String, String>,
-        limit: Int
+        limit: Int,
+        roomOwnerUsername: String = ""
     ): List<WeChatMessage> {
         return queryShardMessages(
             shard = shard,
@@ -444,7 +463,8 @@ class WeChatMessageRepository(
             contactsMap = contactsMap,
             whereClause = "",
             orderBy = "create_time DESC, local_id DESC",
-            limit = limit
+            limit = limit,
+            roomOwnerUsername = roomOwnerUsername
         ).reversed()
     }
 
@@ -453,7 +473,8 @@ class WeChatMessageRepository(
         tableName: String,
         sinceLocalId: Long,
         contactsMap: Map<String, String>,
-        limit: Int
+        limit: Int,
+        roomOwnerUsername: String = ""
     ): List<WeChatMessage> {
         return queryShardMessages(
             shard = shard,
@@ -462,7 +483,8 @@ class WeChatMessageRepository(
             whereClause = "WHERE local_id > ?",
             orderBy = "local_id ASC",
             limit = limit,
-            bindParams = listOf(sinceLocalId)
+            bindParams = listOf(sinceLocalId),
+            roomOwnerUsername = roomOwnerUsername
         )
     }
 
@@ -472,7 +494,8 @@ class WeChatMessageRepository(
         sinceCreateTime: Long,
         sinceLocalIdAtSameTime: Long,
         contactsMap: Map<String, String>,
-        limit: Int
+        limit: Int,
+        roomOwnerUsername: String = ""
     ): List<WeChatMessage> {
         return queryShardMessages(
             shard = shard,
@@ -481,7 +504,8 @@ class WeChatMessageRepository(
             whereClause = "WHERE (create_time > ? OR (create_time = ? AND local_id > ?))",
             orderBy = "create_time ASC, local_id ASC",
             limit = limit,
-            bindParams = listOf(sinceCreateTime, sinceCreateTime, sinceLocalIdAtSameTime)
+            bindParams = listOf(sinceCreateTime, sinceCreateTime, sinceLocalIdAtSameTime),
+            roomOwnerUsername = roomOwnerUsername
         )
     }
 
@@ -492,13 +516,16 @@ class WeChatMessageRepository(
         whereClause: String,
         orderBy: String,
         limit: Int,
-        bindParams: List<Long> = emptyList()
+        bindParams: List<Long> = emptyList(),
+        roomOwnerUsername: String = ""
     ): List<WeChatMessage> {
         val messages = mutableListOf<WeChatMessage>()
         driver.openReadOnlyConnection(shard.shardFile, sessionContext).use { conn ->
             val hasLocalType = hasColumn(conn, tableName, "local_type")
+            val hasServerId = hasColumn(conn, tableName, "server_id")
             val localTypeSelect = if (hasLocalType) "local_type" else "1 AS local_type"
-            val sql = "SELECT local_id, create_time, real_sender_id, $localTypeSelect, message_content FROM $tableName $whereClause ORDER BY $orderBy LIMIT ?"
+            val serverIdSelect = if (hasServerId) "server_id" else "0 AS server_id"
+            val sql = "SELECT local_id, create_time, real_sender_id, $localTypeSelect, $serverIdSelect, message_content FROM $tableName $whereClause ORDER BY $orderBy LIMIT ?"
             conn.prepareStatement(sql).use { stmt ->
                 var paramIdx = 1
                 for (param in bindParams) {
@@ -507,7 +534,7 @@ class WeChatMessageRepository(
                 stmt.setInt(paramIdx, limit)
                 stmt.executeQuery().use { rs ->
                     while (rs.next()) {
-                        messages.add(parseMessageRow(rs, contactsMap, shard.name2IdMap, hasLocalType))
+                        messages.add(parseMessageRow(rs, contactsMap, shard.name2IdMap, hasLocalType, roomOwnerUsername))
                     }
                 }
             }
@@ -551,25 +578,31 @@ class WeChatMessageRepository(
         rs: java.sql.ResultSet,
         contactsMap: Map<String, String>,
         name2IdMap: Map<Long, String>,
-        hasLocalType: Boolean
+        hasLocalType: Boolean,
+        roomOwnerUsername: String = ""
     ): WeChatMessage {
         val localId = rs.getLong("local_id")
         val createTime = rs.getLong("create_time")
         val realSenderId = rs.getString("real_sender_id") ?: ""
         val localType = rs.getLong("local_type")
+        val serverId = rs.getLong("server_id")
         val contentBytes = rs.getBytes("message_content") ?: ByteArray(0)
 
         val isCompressed = ZstdDecompressor.isZstdCompressed(contentBytes)
         val decompressed = ZstdDecompressor.decompressToString(contentBytes)
         val (senderId, initialText) = resolveSenderAndBody(realSenderId, decompressed, contactsMap, name2IdMap)
         val senderDisplayName = contactsMap[senderId] ?: senderId.ifBlank { "Unknown" }
+        val isOwner = roomOwnerUsername.isNotBlank() && senderId == roomOwnerUsername
 
-        val attachments = extractRowAttachments(localType, initialText, createTime, hasLocalType)
-        val textContent = if (attachments.isNotEmpty()) {
-            WeChatFileMessageParser.formatAttachmentMarker(attachments.first())
-        } else {
-            initialText
-        }
+        val parsedXml = WeChatXmlMessageParser.parseMessage(
+            rawContent = initialText,
+            localType = localType,
+            timestampSeconds = createTime,
+            allowLegacyXmlFallback = !hasLocalType
+        )
+        val fields = parsedXml?.toMessageFields(initialText)
+            ?: ParsedWeChatMessage.ResolvedXmlFields(textContent = initialText)
+        val resolvedAttachments = fields.attachments.map { attachmentResolver?.resolve(it) ?: it }
 
         return WeChatMessage(
             localId = localId,
@@ -577,10 +610,16 @@ class WeChatMessageRepository(
             senderId = senderId,
             senderDisplayName = senderDisplayName,
             rawContent = decompressed,
-            textContent = textContent,
+            textContent = fields.textContent,
             isZstdCompressed = isCompressed,
             localType = localType,
-            attachments = attachments
+            attachments = resolvedAttachments,
+            serverId = serverId,
+            isOwner = isOwner,
+            isSystemMessage = fields.isSystemMessage,
+            recalledServerId = fields.recalledServerId,
+            quoteContext = fields.quoteContext,
+            extractedUrls = fields.extractedUrls
         )
     }
 
@@ -614,22 +653,6 @@ class WeChatMessageRepository(
         } else {
             baseSenderId to decompressed
         }
-    }
-
-    private fun extractRowAttachments(
-        localType: Long,
-        textContent: String,
-        createTime: Long,
-        hasLocalType: Boolean
-    ): List<com.wechatdigest.core.model.EventAttachment> {
-        val isCandidate = WeChatFileMessageParser.isCandidateFileMessage(
-            localType = localType,
-            content = textContent,
-            allowLegacyXmlFallback = !hasLocalType
-        )
-        if (!isCandidate) return emptyList()
-        val parsed = WeChatFileMessageParser.parseFileMessage(textContent, createTime) ?: return emptyList()
-        return listOf(attachmentResolver?.resolve(parsed) ?: parsed)
     }
 
     companion object {

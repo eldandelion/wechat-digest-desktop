@@ -62,11 +62,29 @@ internal object PromptMessageFormatter {
         truncateWithEllipsis: Boolean
     ) {
         val timeStr = timeFormatter.format(Instant.ofEpochSecond(msg.timestampSeconds))
-        val safeSender = ExtractionPrompts.sanitizeInline(msg.senderDisplayName, 64).ifBlank { "Unknown" }
-        val sliced = if (truncateWithEllipsis) {
-            truncateWithEllipsis(msg.textContent, maxSingleMessageChars)
+        val sanitizedBaseSender = ExtractionPrompts.sanitizeInline(msg.senderDisplayName, 56)
+            .replace(Regex("(?i)\\[\\s*owner\\s*\\]"), "")
+            .replace("[", "(")
+            .replace("]", ")")
+            .trim()
+            .ifBlank { "Unknown" }
+        val senderHeader = if (msg.isOwner) {
+            ExtractionPrompts.sanitizeInline("$sanitizedBaseSender [Owner]", 64)
         } else {
-            msg.textContent.take(maxSingleMessageChars)
+            sanitizedBaseSender
+        }
+        val quotePrefix = if (sanitizeForPrompt && msg.quoteContext.isNotBlank()) {
+            "[Context: ${ExtractionPrompts.sanitizeInline(msg.quoteContext, 200)}]\n"
+        } else if (!sanitizeForPrompt && msg.quoteContext.isNotBlank()) {
+            "[${msg.quoteContext}]\n"
+        } else {
+            ""
+        }
+        val combinedRawBody = quotePrefix + msg.textContent
+        val sliced = if (truncateWithEllipsis) {
+            truncateWithEllipsis(combinedRawBody, maxSingleMessageChars)
+        } else {
+            combinedRawBody.take(maxSingleMessageChars)
         }
         val body = if (sanitizeForPrompt) {
             ExtractionPrompts.sanitizeTranscriptForPrompt(sliced)
@@ -74,7 +92,7 @@ internal object PromptMessageFormatter {
             sliced
         }
         if (includeIds) sb.append("[id:${msg.localId}] ")
-        sb.append("[$timeStr] $safeSender: $body")
+        sb.append("[$timeStr] $senderHeader: $body")
         if (includeAttachmentPreviews && msg.attachmentPreviews.isNotEmpty()) {
             appendAttachmentPreviews(sb, msg, sanitizeForPrompt, maxSingleMessageChars, truncateWithEllipsis)
         }

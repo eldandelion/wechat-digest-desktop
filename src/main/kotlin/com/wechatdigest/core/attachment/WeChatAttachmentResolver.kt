@@ -4,6 +4,7 @@ import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.model.EventAttachment
 import java.io.File
+import java.nio.file.Files
 import java.security.MessageDigest
 import java.time.Instant
 import java.time.YearMonth
@@ -16,7 +17,9 @@ import java.util.Locale
  * using read-only queries against `hardlink/hardlink.db` plus timestamp-month fallback.
  */
 class WeChatAttachmentResolver(
-    private val driver: WeChatDatabaseDriver
+    private val driver: WeChatDatabaseDriver,
+    private val explicitAttachmentRootDir: File? = null,
+    private val autoDetectSingleAccountRoot: Boolean = true
 ) {
 
     private data class HardlinkEntry(
@@ -77,17 +80,63 @@ class WeChatAttachmentResolver(
 
     private fun locateMsgFileRoot(): File? {
         val candidates = buildList {
-            add(File(driver.baseDir, "msg/file"))
-            driver.baseDir.parentFile?.let { add(File(it, "msg/file")) }
-        }.distinct()
-        return candidates.firstOrNull { it.exists() && it.isDirectory }
+            explicitAttachmentRootDir?.let { explicit ->
+                add(explicit to File(explicit, "msg/file"))
+                add(explicit to File(explicit, "file"))
+                if (explicit.name.equals("file", ignoreCase = true)) {
+                    add(explicit to explicit)
+                }
+            }
+            add(driver.baseDir to File(driver.baseDir, "msg/file"))
+            driver.baseDir.parentFile?.let { parent ->
+                add(parent to File(parent, "msg/file"))
+            }
+        }.distinctBy { (_, leaf) -> leaf.absolutePath }
+
+        candidates.firstOrNull { (anchor, leaf) -> isSymlinkFreeDirectoryChain(anchor, leaf) }
+            ?.let { (_, leaf) -> return leaf }
+
+        if (!autoDetectSingleAccountRoot) return null
+        val userHome = System.getProperty("user.home")?.takeIf { it.isNotBlank() } ?: return null
+        val xwechatFiles = File(userHome, "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
+        if (!xwechatFiles.exists() || !xwechatFiles.isDirectory || Files.isSymbolicLink(xwechatFiles.toPath())) {
+            return null
+        }
+        val accountRoots = xwechatFiles.listFiles { f ->
+            f.isDirectory && !Files.isSymbolicLink(f.toPath()) && (f.name.startsWith("wxid_") || f.name.contains("_"))
+        }?.mapNotNull { account ->
+            val msgFile = File(account, "msg/file")
+            msgFile.takeIf { isSymlinkFreeDirectoryChain(account, msgFile) }
+        }.orEmpty()
+        return accountRoots.singleOrNull()
+    }
+
+    private fun isSymlinkFreeDirectoryChain(anchor: File, leaf: File): Boolean {
+        if (!anchor.exists() || !anchor.isDirectory || Files.isSymbolicLink(anchor.toPath())) return false
+        if (!leaf.exists() || !leaf.isDirectory) return false
+        val anchorCanonical = runCatching { anchor.canonicalPath }.getOrElse { return false }
+        var cursor: File? = leaf
+        while (cursor != null) {
+            if (Files.isSymbolicLink(cursor.toPath())) return false
+            val cursorCanonical = runCatching { cursor.canonicalPath }.getOrNull()
+            if (cursor == anchor || cursorCanonical == anchorCanonical) return true
+            cursor = cursor.parentFile
+        }
+        return false
     }
 
     private fun locateHardlinkDbFile(): File? {
-        val nested = File(driver.baseDir, "hardlink/hardlink.db")
-        if (nested.exists() && nested.isFile) return nested
+        val hardlinkDir = File(driver.baseDir, "hardlink")
+        val nested = File(hardlinkDir, "hardlink.db")
+        if (!Files.isSymbolicLink(hardlinkDir.toPath()) &&
+            nested.exists() &&
+            nested.isFile &&
+            !Files.isSymbolicLink(nested.toPath())
+        ) {
+            return nested
+        }
         val flat = File(driver.baseDir, "hardlink.db")
-        return flat.takeIf { it.exists() && it.isFile }
+        return flat.takeIf { it.exists() && it.isFile && !Files.isSymbolicLink(it.toPath()) }
     }
 
     private fun loadHardlinkEntries(): List<HardlinkEntry> {

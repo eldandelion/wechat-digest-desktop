@@ -772,13 +772,12 @@ class AppState(
 
     private fun resolveDriverFromSettings(): WeChatDatabaseDriver? {
         val snapshot = _settings.value
-        val dataDirStr = snapshot.wechatDataDir
-        if (dataDirStr.isBlank()) return null
-        val canonicalDir = runCatching { File(dataDirStr).canonicalFile }.getOrNull() ?: return null
+        val expandedDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(snapshot.wechatDataDir)
+            ?: return null
+        val canonicalDir = runCatching { expandedDir.canonicalFile }.getOrNull() ?: return null
         if (!canonicalDir.exists() || !canonicalDir.isDirectory) return null
-        val keysFile = snapshot.keysPath
-            .takeIf { it.isNotBlank() }
-            ?.let { runCatching { File(it).canonicalFile }.getOrNull() }
+        val keysFile = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(snapshot.keysPath)
+            ?.let { runCatching { it.canonicalFile }.getOrNull() }
             ?.takeIf { it.exists() && it.isFile }
         return WeChatDatabaseDriver(
             baseDir = canonicalDir,
@@ -1049,10 +1048,13 @@ class AppState(
             return@launch
         }
         val result = withContext(Dispatchers.IO) {
-            val allowedRoot = resolveDriverFromSettings()?.let { WeChatAttachmentResolver(it).resolveMsgFileRoot() }
-                ?: return@withContext Result.failure<Unit>(
-                    IllegalStateException("WeChat attachments folder could not be verified.")
-                )
+            val driver = resolveDriverFromSettings()
+            val explicitAttachmentRoot = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
+            val allowedRoot = driver?.let {
+                WeChatAttachmentResolver(it, explicitAttachmentRootDir = explicitAttachmentRoot).resolveMsgFileRoot()
+            } ?: return@withContext Result.failure<Unit>(
+                IllegalStateException("WeChat attachments folder could not be verified.")
+            )
             action(File(localPath), allowedRoot)
         }
         if (result.isFailure) {
@@ -1081,7 +1083,9 @@ class AppState(
             val (refreshed, foundCount) = eventsDbMutex.withLock {
                 withContext(Dispatchers.IO) {
                     val driver = resolveDriverFromSettings() ?: return@withContext null to 0
-                    val updatedList = WeChatAttachmentResolver(driver).refreshAttachments(card.attachments)
+                    val explicitAttachmentRoot = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
+                    val updatedList = WeChatAttachmentResolver(driver, explicitAttachmentRootDir = explicitAttachmentRoot)
+                        .refreshAttachments(card.attachments)
                     eventCardStore.updateAttachmentsOrThrow(cardId, updatedList)
                     updatedList to updatedList.count { it.isLocalFilePresent() }
                 }.also { (updatedList, _) ->

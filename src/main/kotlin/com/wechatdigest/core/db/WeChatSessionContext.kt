@@ -1,5 +1,6 @@
 package com.wechatdigest.core.db
 
+import com.wechatdigest.core.model.GroupChat
 import java.io.Closeable
 import java.io.File
 import java.nio.file.Files
@@ -31,6 +32,8 @@ class WeChatSessionContext(
     private val resolvedDbPaths = ConcurrentHashMap<String, File>()
     private val contactsLock = Any()
     private val shardIndexLock = Any()
+    private val chatroomsLock = Any()
+    private val roomOwnersLock = Any()
     private val snapshotDirLock = Any()
 
     @Volatile
@@ -38,6 +41,12 @@ class WeChatSessionContext(
 
     @Volatile
     private var cachedShardIndex: List<MessageShardIndexEntry>? = null
+
+    @Volatile
+    private var cachedChatrooms: List<GroupChat>? = null
+
+    @Volatile
+    private var cachedRoomOwners: Map<String, String>? = null
 
     @Volatile
     private var ephemeralSnapshotDir: File? = null
@@ -129,12 +138,36 @@ class WeChatSessionContext(
         }
     }
 
+    /** Returns the cached chatroom list with metadata, invoking [loader] at most once per session. */
+    fun getOrLoadChatrooms(loader: () -> List<GroupChat>): List<GroupChat> {
+        check(!closed) { "WeChatSessionContext is already closed" }
+        cachedChatrooms?.let { return it }
+        synchronized(chatroomsLock) {
+            check(!closed) { "WeChatSessionContext is already closed" }
+            cachedChatrooms?.let { return it }
+            return loader().also { cachedChatrooms = it }
+        }
+    }
+
+    /** Returns the cached `roomId -> ownerUsername` map, invoking [loader] at most once per session. */
+    fun getOrLoadRoomOwners(loader: () -> Map<String, String>): Map<String, String> {
+        check(!closed) { "WeChatSessionContext is already closed" }
+        cachedRoomOwners?.let { return it }
+        synchronized(roomOwnersLock) {
+            check(!closed) { "WeChatSessionContext is already closed" }
+            cachedRoomOwners?.let { return it }
+            return loader().also { cachedRoomOwners = it }
+        }
+    }
+
     override fun close() {
         closed = true
         driver.detachSession(this)
         resolvedDbPaths.clear()
         cachedContactsMap = null
         cachedShardIndex = null
+        cachedChatrooms = null
+        cachedRoomOwners = null
         synchronized(snapshotDirLock) {
             ephemeralSnapshotDir?.let { dir ->
                 runCatching {

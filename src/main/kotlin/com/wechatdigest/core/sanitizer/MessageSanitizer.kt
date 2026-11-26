@@ -111,15 +111,49 @@ object MessageSanitizer {
     }
 
     /**
-     * Filters a list of messages, stripping noise and returning only substantive announcements and queries.
+     * Deterministically suppresses WeChat `10000`/`10002` sysmsgs and any message recalled
+     * by a `<revokemsg><newmsgid>` target in the same batch. Run before sender allowlist filtering
+     * so recalls sent under system IDs still suppress recalled allowlisted messages.
+     */
+    fun suppressSystemAndRecalledMessages(messages: List<WeChatMessage>): List<WeChatMessage> {
+        if (messages.isEmpty()) return emptyList()
+        val recalledServerIds = messages.mapNotNullTo(HashSet()) { msg ->
+            msg.recalledServerId?.takeIf { it > 0L }
+        }
+        return messages.filterNot { msg -> isSystemOrRecalled(msg, recalledServerIds) }
+    }
+
+    /**
+     * Filters a list of messages, deterministically suppressing WeChat `10000`/`10002` sysmsgs,
+     * recalled messages matched via `<revokemsg><newmsgid>`, non-substantive chatter, and
+     * repetitive `#接龙` check-in chains before LLM submission.
      */
     fun filterSubstantiveMessages(
         messages: List<WeChatMessage>,
         config: PrefilterConfig = PrefilterConfig()
     ): List<WeChatMessage> {
-        return messages.filter { msg ->
-            msg.attachments.isNotEmpty() || isSubstantive(msg.textContent, config)
+        val withoutSystemOrRecalled = suppressSystemAndRecalledMessages(messages)
+        val filtered = withoutSystemOrRecalled.filter { msg ->
+            if (msg.attachments.isNotEmpty()) {
+                return@filter true
+            }
+            // Quote replies already isolate the user's reply body into textContent and store
+            // the quoted snippet in quoteContext, preventing long quotes from bypassing length rules.
+            isSubstantive(msg.textContent, config)
         }
+        return SolitaireCollapser.collapse(filtered)
+    }
+
+    private fun isSystemOrRecalled(
+        msg: WeChatMessage,
+        recalledServerIds: Set<Long>
+    ): Boolean {
+        if (msg.isSystemMessage) return true
+        val baseType = msg.localType and 0xFFFFFFFFL
+        if (baseType == 10_000L || baseType == 10_002L) return true
+        if (msg.serverId > 0L && msg.serverId in recalledServerIds) return true
+        val trimmed = msg.textContent.trimStart()
+        return trimmed.startsWith("<sysmsg", ignoreCase = true)
     }
 
     private fun normalizeWholeMessage(text: String): String {

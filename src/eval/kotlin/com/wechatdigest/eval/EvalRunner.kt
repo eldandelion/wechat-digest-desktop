@@ -165,11 +165,12 @@ object EvalRunner {
         trialIndex: Int = 0
     ): ScenarioTrialResult {
         val rawMessages = scenario.messages.map { it.toWeChatMessage() }
+        val recallCleaned = com.wechatdigest.core.sanitizer.MessageSanitizer.suppressSystemAndRecalledMessages(rawMessages)
         val allowedSet = scenario.allowedSenderIds.map { it.trim() }.filter { it.isNotBlank() }.toSet()
         val allowlistFiltered = if (allowedSet.isNotEmpty()) {
-            rawMessages.filter { it.senderId in allowedSet }
+            recallCleaned.filter { it.senderId in allowedSet }
         } else {
-            rawMessages
+            recallCleaned
         }
 
         val observer = CollectingExtractionObserver(

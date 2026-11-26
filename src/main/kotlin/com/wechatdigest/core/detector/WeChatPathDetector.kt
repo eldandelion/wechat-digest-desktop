@@ -49,39 +49,57 @@ class WeChatPathDetector {
 
     private fun collectXWeChatCandidates(userHome: String): List<DiscoveredPath> {
         val xwechatFiles = File(userHome, "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
-        if (!xwechatFiles.exists() || !xwechatFiles.isDirectory) return emptyList()
+        if (!xwechatFiles.exists() || !xwechatFiles.isDirectory || Files.isSymbolicLink(xwechatFiles.toPath())) {
+            return emptyList()
+        }
         val wxidDirs = xwechatFiles.listFiles { f ->
-            f.isDirectory && (f.name.startsWith("wxid_") || f.name.contains("_"))
+            f.isDirectory && !Files.isSymbolicLink(f.toPath()) && (f.name.startsWith("wxid_") || f.name.contains("_"))
         } ?: return emptyList()
 
         return wxidDirs.mapNotNull { accountDir ->
+            if (Files.isSymbolicLink(accountDir.toPath())) return@mapNotNull null
             val dbStorage = File(accountDir, "db_storage")
-            val targetDir = if (dbStorage.exists() && dbStorage.isDirectory) dbStorage else accountDir
+            val targetDir = if (dbStorage.exists() && dbStorage.isDirectory && !Files.isSymbolicLink(dbStorage.toPath())) {
+                dbStorage
+            } else {
+                accountDir
+            }
+            if (Files.isSymbolicLink(targetDir.toPath())) return@mapNotNull null
             inspectDirectory(targetDir, label = "WeChat Account: ${accountDir.name}")
         }
     }
 
-    private fun collectAppSupportCandidate(userHome: String): DiscoveredPath? {
+    fun collectAppSupportCandidate(userHome: String): DiscoveredPath? {
         val appSupportDir = File(userHome, "Library/Application Support/com.tencent.xinWeChat")
-        if (!appSupportDir.exists() || !appSupportDir.isDirectory) return null
+        if (!appSupportDir.exists() || !appSupportDir.isDirectory || Files.isSymbolicLink(appSupportDir.toPath())) return null
         return inspectDirectory(appSupportDir, label = "WeChat App Support Directory")
     }
 
     fun isValidWeChatDir(dir: File): Boolean {
-        if (!dir.exists() || !dir.isDirectory) return false
+        if (!dir.exists() || !dir.isDirectory || Files.isSymbolicLink(dir.toPath())) return false
         val hasContacts = hasContactDb(dir)
         val hasMessages = hasMessageDbs(dir)
         return hasContacts && hasMessages
     }
 
     private fun inspectDirectory(dir: File, label: String): DiscoveredPath? {
+        if (!dir.exists() || !dir.isDirectory || Files.isSymbolicLink(dir.toPath())) {
+            return null
+        }
         val hasContacts = hasContactDb(dir)
         val hasMessages = hasMessageDbs(dir)
         if (!hasContacts && !hasMessages) {
             return null
         }
-        val contactFile = File(dir, "contact/contact.db").takeIf { it.exists() } ?: File(dir, "contact.db")
-        val isEncrypted = com.wechatdigest.core.db.WcdbDecryptor.isEncrypted(contactFile)
+        val contactDir = File(dir, "contact")
+        val nestedContact = File(contactDir, "contact.db")
+        val flatContact = File(dir, "contact.db")
+        val contactFile = when {
+            !Files.isSymbolicLink(contactDir.toPath()) && nestedContact.isFile && !Files.isSymbolicLink(nestedContact.toPath()) -> nestedContact
+            flatContact.isFile && !Files.isSymbolicLink(flatContact.toPath()) -> flatContact
+            else -> null
+        }
+        val isEncrypted = contactFile?.let { com.wechatdigest.core.db.WcdbDecryptor.isEncrypted(it) } ?: true
         val hasKeys = com.wechatdigest.core.db.WcdbDecryptor.findKeysFile(baseDir = dir) != null
 
         val finalLabel = if (!isEncrypted) {
@@ -102,18 +120,43 @@ class WeChatPathDetector {
     }
 
     private fun hasContactDb(dir: File): Boolean {
-        if (File(dir, "contact.db").exists()) return true
-        if (File(dir, "contact/contact.db").exists()) return true
-        return false
+        val flat = File(dir, "contact.db")
+        if (flat.isFile && !Files.isSymbolicLink(flat.toPath())) return true
+        val contactDir = File(dir, "contact")
+        val nested = File(contactDir, "contact.db")
+        return contactDir.isDirectory &&
+            !Files.isSymbolicLink(contactDir.toPath()) &&
+            nested.isFile &&
+            !Files.isSymbolicLink(nested.toPath())
     }
+
+    private val SHARD_FILE_REGEX = Regex("^message_\\d+\\.db$")
 
     private fun hasMessageDbs(dir: File): Boolean {
         val messageSubdir = File(dir, "message")
-        if (messageSubdir.exists() && messageSubdir.isDirectory) {
-            val shard = messageSubdir.listFiles { f -> f.isFile && f.name.startsWith("message_") && f.name.endsWith(".db") }
+        if (messageSubdir.exists() && messageSubdir.isDirectory && !Files.isSymbolicLink(messageSubdir.toPath())) {
+            val shard = messageSubdir.listFiles { f ->
+                f.isFile && !Files.isSymbolicLink(f.toPath()) && SHARD_FILE_REGEX.matches(f.name)
+            }
             if (!shard.isNullOrEmpty()) return true
         }
-        val directShard = dir.listFiles { f -> f.isFile && f.name.startsWith("message_") && f.name.endsWith(".db") }
+        val directShard = dir.listFiles { f ->
+            f.isFile && !Files.isSymbolicLink(f.toPath()) && SHARD_FILE_REGEX.matches(f.name)
+        }
         return !directShard.isNullOrEmpty()
+    }
+
+    companion object {
+        /** Expands a leading `~/` against `user.home` for user-configured filesystem paths. */
+        internal fun resolveUserPath(rawPath: String): File? {
+            val trimmed = rawPath.trim()
+            if (trimmed.isBlank()) return null
+            val expanded = when {
+                trimmed == "~" -> System.getProperty("user.home").orEmpty()
+                trimmed.startsWith("~/") -> "${System.getProperty("user.home").orEmpty()}/${trimmed.removePrefix("~/")}"
+                else -> trimmed
+            }
+            return expanded.takeIf { it.isNotBlank() }?.let { File(it) }
+        }
     }
 }

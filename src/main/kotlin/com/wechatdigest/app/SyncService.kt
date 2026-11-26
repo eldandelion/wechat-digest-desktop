@@ -87,8 +87,11 @@ class SyncService(
     ): SyncResult = withContext(Dispatchers.IO) {
         validateSettings(settings)?.let { return@withContext SyncResult.Failure(it) }
 
-        val dataDir = File(settings.wechatDataDir).canonicalFile
-        val keysFile = settings.keysPath.takeIf { it.isNotBlank() }?.let { File(it).canonicalFile }?.takeIf { it.isFile }
+        val dataDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.wechatDataDir)?.canonicalFile
+            ?: return@withContext SyncResult.Failure("WeChat data directory is not configured.")
+        val keysFile = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.keysPath)
+            ?.canonicalFile
+            ?.takeIf { it.isFile }
         val driver = WeChatDatabaseDriver(
             baseDir = dataDir,
             customKeysFile = keysFile,
@@ -103,15 +106,16 @@ class SyncService(
 
         WeChatSessionContext(driver).use { session ->
             val contactRepo = WeChatContactRepository(driver, sessionContext = session)
-            val attachmentResolver = WeChatAttachmentResolver(driver)
+            val attachmentRoot = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.wechatAttachmentRootDir)
+            val attachmentResolver = WeChatAttachmentResolver(driver, explicitAttachmentRootDir = attachmentRoot)
             val messageRepo = WeChatMessageRepository(
                 driver = driver,
                 contactRepository = contactRepo,
                 attachmentResolver = attachmentResolver,
                 sessionContext = session
             )
-            val roomNamesMap = try {
-                contactRepo.listAllChatrooms().associate { it.roomId to it.displayName }
+            val roomsById = try {
+                contactRepo.listAllChatrooms().associateBy { it.roomId }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 System.err.println(
@@ -126,6 +130,7 @@ class SyncService(
                     maxConcurrency = EventExtractor.resolveConcurrencyForConfig(settings.llm)
                 )
                 settings.monitoredRoomIds.forEachIndexed { roomIdx, roomId ->
+                    val roomMeta = roomsById[roomId]
                     val roomOutcome = syncRoom(
                         roomId = roomId,
                         roomIndex = roomIdx + 1,
@@ -133,7 +138,8 @@ class SyncService(
                         settings = settings,
                         messageRepo = messageRepo,
                         extractor = extractor,
-                        roomDisplayName = roomNamesMap[roomId].orEmpty(),
+                        roomDisplayName = roomMeta?.displayName.orEmpty(),
+                        roomAnnouncement = roomMeta?.announcement.orEmpty(),
                         totalInsertedCounter = totalInsertedCounter,
                         callbackMutex = callbackMutex,
                         onCardPersisted = onCardPersisted,
@@ -165,8 +171,8 @@ class SyncService(
         if (settings.wechatDataDir.isBlank()) {
             return "WeChat data directory is not configured."
         }
-        val dataDir = File(settings.wechatDataDir)
-        if (!dataDir.exists() || !dataDir.isDirectory) {
+        val dataDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.wechatDataDir)
+        if (dataDir == null || !dataDir.exists() || !dataDir.isDirectory) {
             return "WeChat data directory does not exist."
         }
         if (settings.monitoredRoomIds.isEmpty()) {
@@ -183,6 +189,7 @@ class SyncService(
         messageRepo: WeChatMessageRepository,
         extractor: EventExtractor,
         roomDisplayName: String,
+        roomAnnouncement: String,
         totalInsertedCounter: AtomicInteger,
         callbackMutex: Mutex,
         onCardPersisted: (suspend (EventCard) -> Unit)?,
@@ -210,7 +217,8 @@ class SyncService(
 
             scannedInRoom = rawMessages.size
             val groupConfig = groupConfigStore?.getOrThrow(roomId)
-            val senderFiltered = applySenderAllowlist(rawMessages, groupConfig)
+            val recallCleaned = MessageSanitizer.suppressSystemAndRecalledMessages(rawMessages)
+            val senderFiltered = applySenderAllowlist(recallCleaned, groupConfig)
             val substantive = MessageSanitizer.filterSubstantiveMessages(senderFiltered, settings.prefilter)
 
             if (substantive.isNotEmpty()) {
@@ -220,6 +228,7 @@ class SyncService(
                     roomIndex = roomIndex,
                     totalRooms = totalRooms,
                     roomDisplayName = roomDisplayName,
+                    roomAnnouncement = roomAnnouncement,
                     roomLabel = roomLabel,
                     settings = settings,
                     groupConfig = groupConfig,
@@ -266,6 +275,7 @@ class SyncService(
         roomIndex: Int,
         totalRooms: Int,
         roomDisplayName: String,
+        roomAnnouncement: String,
         roomLabel: String,
         settings: AppSettings,
         groupConfig: GroupConfig?,
@@ -297,6 +307,7 @@ class SyncService(
             roomDisplayName = roomDisplayName,
             prefilterConfig = settings.prefilter,
             recentRoomCards = recentRoomCards,
+            roomAnnouncement = roomAnnouncement,
             onCardReady = { card ->
                 val inserted = dbWriteMutex.withLock {
                     eventCardStore.upsertOrThrow(listOf(card))

@@ -341,6 +341,16 @@ private fun GroupRoomMetadataColumn(
                     Text(text = label, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 }
             }
+            if (room.memberCount > 0) {
+                Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(4.dp)) {
+                    Text(text = "${room.memberCount} members", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Medium)
+                }
+            }
+            if (room.unreadCount > 0) {
+                Surface(color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.75f), shape = RoundedCornerShape(4.dp)) {
+                    Text(text = "${room.unreadCount} unread", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onTertiaryContainer, fontWeight = FontWeight.SemiBold)
+                }
+            }
             if (checkpoint != null && checkpoint.lastLocalId > 0) {
                 Surface(color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f), shape = RoundedCornerShape(4.dp)) {
                     Text(text = "Synced: #${checkpoint.lastLocalId}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer, fontWeight = FontWeight.Medium)

@@ -41,6 +41,7 @@ fun SettingsScreen(appState: AppState) {
 
     var dataDir by remember { mutableStateOf(currentSettings.wechatDataDir) }
     var keysPath by remember { mutableStateOf(currentSettings.keysPath) }
+    var attachmentRootDir by remember { mutableStateOf(currentSettings.wechatAttachmentRootDir) }
     var endpointUrl by remember { mutableStateOf(currentSettings.llm.endpointUrl) }
     var apiKey by remember { mutableStateOf(currentSettings.llm.apiKey) }
     var modelName by remember { mutableStateOf(currentSettings.llm.modelName) }
@@ -59,6 +60,7 @@ fun SettingsScreen(appState: AppState) {
     val resetLocalFieldsTo: (AppSettings) -> Unit = { target ->
         dataDir = target.wechatDataDir
         keysPath = target.keysPath
+        attachmentRootDir = target.wechatAttachmentRootDir
         endpointUrl = target.llm.endpointUrl
         apiKey = target.llm.apiKey
         modelName = target.llm.modelName
@@ -73,6 +75,7 @@ fun SettingsScreen(appState: AppState) {
     LaunchedEffect(currentSettings) {
         if (dataDir.trim() != currentSettings.wechatDataDir) dataDir = currentSettings.wechatDataDir
         if (keysPath.trim() != currentSettings.keysPath) keysPath = currentSettings.keysPath
+        if (attachmentRootDir.trim() != currentSettings.wechatAttachmentRootDir) attachmentRootDir = currentSettings.wechatAttachmentRootDir
         if (endpointUrl.trim() != currentSettings.llm.endpointUrl) endpointUrl = currentSettings.llm.endpointUrl
         if (apiKey.trim() != currentSettings.llm.apiKey) apiKey = currentSettings.llm.apiKey
         if (modelName.trim() != currentSettings.llm.modelName) modelName = currentSettings.llm.modelName
@@ -136,6 +139,7 @@ fun SettingsScreen(appState: AppState) {
         WeChatStorageSettingsCard(
             dataDir = dataDir,
             keysPath = keysPath,
+            attachmentRootDir = attachmentRootDir,
             messagesPerSync = messagesPerSync,
             parseAttachmentContents = currentSettings.parseAttachmentContents,
             isAutoDetecting = isAutoDetectingWeChat,
@@ -163,6 +167,10 @@ fun SettingsScreen(appState: AppState) {
             onLaunchWizard = { appState.setShowWizard(true) },
             onDataDirChange = { next -> dataDir = next; appState.transformSettings { it.copy(wechatDataDir = next.trim()) } },
             onKeysPathChange = { next -> keysPath = next; appState.transformSettings { it.copy(keysPath = next.trim()) } },
+            onAttachmentRootDirChange = { next ->
+                attachmentRootDir = next
+                appState.transformSettings { it.copy(wechatAttachmentRootDir = next.trim()) }
+            },
             onMessagesPerSyncChange = { next ->
                 messagesPerSync = next
                 next.toIntOrNull()?.let { count ->

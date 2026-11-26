@@ -153,6 +153,7 @@ internal fun ThemeSettingsCard(
 internal fun WeChatStorageSettingsCard(
     dataDir: String,
     keysPath: String,
+    attachmentRootDir: String,
     messagesPerSync: String,
     parseAttachmentContents: Boolean,
     isAutoDetecting: Boolean,
@@ -161,6 +162,7 @@ internal fun WeChatStorageSettingsCard(
     onLaunchWizard: () -> Unit,
     onDataDirChange: (String) -> Unit,
     onKeysPathChange: (String) -> Unit,
+    onAttachmentRootDirChange: (String) -> Unit,
     onMessagesPerSyncChange: (String) -> Unit,
     onParseAttachmentContentsChange: (Boolean) -> Unit
 ) {
@@ -187,6 +189,14 @@ internal fun WeChatStorageSettingsCard(
             modifier = Modifier.fillMaxWidth(),
             label = { Text("all_keys.json Path (Optional - auto-detected if left blank)") },
             placeholder = { Text("~/.wcdb-key-tool/all_keys.json") },
+            singleLine = true
+        )
+        OutlinedTextField(
+            value = attachmentRootDir,
+            onValueChange = onAttachmentRootDirChange,
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("WeChat Attachment Root (Optional - for standalone decrypted DB mirrors)") },
+            placeholder = { Text("~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_.../msg/file") },
             singleLine = true
         )
         OutlinedTextField(

@@ -27,7 +27,11 @@ data class GroupMember(
 data class GroupChat(
     val roomId: String,
     val displayName: String,
-    val memberCount: Int = 0
+    val memberCount: Int = 0,
+    val lastActivityTimestamp: Long = 0L,
+    val unreadCount: Int = 0,
+    val announcement: String = "",
+    val ownerUsername: String = ""
 )
 
 /**
@@ -43,5 +47,11 @@ data class WeChatMessage(
     val isZstdCompressed: Boolean,
     val localType: Long = 1L,
     val attachments: List<EventAttachment> = emptyList(),
-    val attachmentPreviews: Map<String, String> = emptyMap()
+    val attachmentPreviews: Map<String, String> = emptyMap(),
+    val serverId: Long = 0L,
+    val isOwner: Boolean = false,
+    val isSystemMessage: Boolean = false,
+    val recalledServerId: Long? = null,
+    val quoteContext: String = "",
+    val extractedUrls: List<String> = emptyList()
 )

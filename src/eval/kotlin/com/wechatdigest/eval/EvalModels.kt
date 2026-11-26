@@ -1,5 +1,7 @@
 package com.wechatdigest.eval
 
+import com.wechatdigest.core.attachment.ParsedWeChatMessage
+import com.wechatdigest.core.attachment.WeChatXmlMessageParser
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.GatekeeperVerdictTrace
 import com.wechatdigest.core.llm.LanguageComplianceResult
@@ -25,17 +27,43 @@ data class EvalMessageInput(
     val senderDisplayName: String,
     val content: String,
     val rawContent: String = content,
-    val isZstdCompressed: Boolean = false
+    val isZstdCompressed: Boolean = false,
+    val localType: Long = 1L,
+    val serverId: Long = 0L,
+    val isOwner: Boolean = false
 ) {
-    fun toWeChatMessage(): WeChatMessage = WeChatMessage(
-        localId = localId,
-        timestampSeconds = timestampSeconds,
-        senderId = senderId,
-        senderDisplayName = senderDisplayName,
-        rawContent = rawContent,
-        textContent = content,
-        isZstdCompressed = isZstdCompressed
-    )
+    fun toWeChatMessage(): WeChatMessage {
+        val parsedXml = if (localType != 1L) {
+            WeChatXmlMessageParser.parseMessage(
+                rawContent = content,
+                localType = localType,
+                timestampSeconds = timestampSeconds,
+                allowLegacyXmlFallback = false
+            )
+        } else {
+            null
+        }
+        val fields = parsedXml?.toMessageFields(content)
+            ?: ParsedWeChatMessage.ResolvedXmlFields(textContent = content)
+
+        return WeChatMessage(
+            localId = localId,
+            timestampSeconds = timestampSeconds,
+            senderId = senderId,
+            senderDisplayName = senderDisplayName,
+            rawContent = rawContent,
+            textContent = fields.textContent,
+            isZstdCompressed = isZstdCompressed,
+            localType = localType,
+            attachments = fields.attachments,
+            serverId = serverId,
+            isOwner = isOwner,
+            isSystemMessage = fields.isSystemMessage,
+            recalledServerId = fields.recalledServerId,
+            quoteContext = fields.quoteContext,
+            extractedUrls = fields.extractedUrls
+        )
+    }
 }
 
 /** Per-card source grounding expectation tying a card title to its own source & content substrings. */

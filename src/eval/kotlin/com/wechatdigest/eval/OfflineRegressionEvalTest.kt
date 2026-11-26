@@ -34,7 +34,7 @@ class OfflineRegressionEvalTest {
         val baselineFile = File("src/eval/resources/baseline.json")
 
         val scenarios = EvalRunner.loadScenarios(scenariosDir)
-        assertTrue(scenarios.size >= 13, "Expected at least 13 golden scenarios in ${scenariosDir.path}, found ${scenarios.size}")
+        assertTrue(scenarios.size >= 14, "Expected at least 14 golden scenarios in ${scenariosDir.path}, found ${scenarios.size}")
 
         val baseline = EvalRunner.loadBaseline(baselineFile)
         val report = EvalRunner.runSuite(
@@ -213,7 +213,7 @@ class OfflineRegressionEvalTest {
     @Test
     fun `EvalBaseline loads scenarios map and EvalGraders catches per-card source swaps and invalid ICS dates`() = runBlocking {
         val baseline = EvalRunner.loadBaseline(File("src/eval/resources/baseline.json"))
-        assertTrue(baseline.entries.size >= 13, "Expected >= 13 baseline entries loaded from 'scenarios' key, got ${baseline.entries.size}")
+        assertTrue(baseline.entries.size >= 14, "Expected >= 14 baseline entries loaded from 'scenarios' key, got ${baseline.entries.size}")
 
         val scenarios = EvalRunner.loadScenarios(File("src/eval/resources/scenarios"), idFilter = "REG-12_concurrent_cloud_multi_chunk_order")
         val reg12 = scenarios.single()

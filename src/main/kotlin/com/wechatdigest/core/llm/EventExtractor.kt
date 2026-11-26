@@ -159,7 +159,8 @@ class EventExtractor(
         customRules: String = "",
         roomDisplayName: String = "",
         prefilterConfig: PrefilterConfig = PrefilterConfig(),
-        recentRoomCards: List<EventCard> = emptyList()
+        recentRoomCards: List<EventCard> = emptyList(),
+        roomAnnouncement: String = ""
     ): List<EventCard> {
         return extractEventsResult(
             messages = messages,
@@ -169,7 +170,8 @@ class EventExtractor(
             customRules = customRules,
             roomDisplayName = roomDisplayName,
             prefilterConfig = prefilterConfig,
-            recentRoomCards = recentRoomCards
+            recentRoomCards = recentRoomCards,
+            roomAnnouncement = roomAnnouncement
         ).getOrElse { emptyList() }
     }
 
@@ -188,7 +190,8 @@ class EventExtractor(
         prefilterConfig: PrefilterConfig = PrefilterConfig(),
         recentRoomCards: List<EventCard> = emptyList(),
         onCardReady: (suspend (EventCard) -> Unit)? = null,
-        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)? = null
+        onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)? = null,
+        roomAnnouncement: String = ""
     ): Result<List<EventCard>> {
         val substantive = MessageSanitizer.filterSubstantiveMessages(messages, prefilterConfig)
         if (observer !== ExtractionObserver.NoOp) {
@@ -210,6 +213,7 @@ class EventExtractor(
                 targetLanguage = targetLanguage,
                 customRules = customRules,
                 recentRoomCards = recentRoomCards,
+                roomAnnouncement = roomAnnouncement,
                 semaphore = semaphore,
                 onCardReady = onCardReady,
                 onProgress = onProgress
@@ -218,7 +222,7 @@ class EventExtractor(
 
         notifyProgress(onProgress, "Triaging messages...", 0, substantive.size)
             .getOrElse { return Result.failure(it) }
-        val discovered = runPass1Triage(substantive, userPersona, targetLanguage, customRules, recentRoomCards, semaphore)
+        val discovered = runPass1Triage(substantive, userPersona, targetLanguage, customRules, recentRoomCards, roomAnnouncement, semaphore)
             .getOrElse { return Result.failure(it) }
 
         val messageIndexById = substantive.withIndex().associate { it.value.localId to it.index }
@@ -302,6 +306,7 @@ class EventExtractor(
         targetLanguage: String,
         customRules: String,
         recentRoomCards: List<EventCard>,
+        roomAnnouncement: String,
         semaphore: Semaphore,
         onCardReady: (suspend (EventCard) -> Unit)?,
         onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
@@ -321,7 +326,8 @@ class EventExtractor(
         val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules)
         val userPrompt = ExtractionPrompts.buildFastPathSynthesisUserPrompt(
             transcript = formatTranscriptForPrompt(remaining),
-            recentRoomCards = recentRoomCards
+            recentRoomCards = recentRoomCards,
+            roomAnnouncement = roomAnnouncement
         )
 
         val startMs = System.currentTimeMillis()
@@ -331,6 +337,7 @@ class EventExtractor(
             remaining = remaining,
             roomId = roomId,
             roomDisplayName = roomDisplayName,
+            requireExplicitIds = roomAnnouncement.isNotBlank(),
             semaphore = semaphore,
             startMs = startMs
         ).getOrElse { return Result.failure(it) }
@@ -419,6 +426,7 @@ class EventExtractor(
         remaining: List<WeChatMessage>,
         roomId: String,
         roomDisplayName: String,
+        requireExplicitIds: Boolean = false,
         semaphore: Semaphore,
         startMs: Long
     ): Result<List<EventCard>> {
@@ -443,7 +451,7 @@ class EventExtractor(
                 substantiveMessages = remaining,
                 roomId = roomId,
                 roomDisplayName = roomDisplayName,
-                singleMessageFallback = remaining.size == 1,
+                singleMessageFallback = remaining.size == 1 && !requireExplicitIds,
                 onRepaired = { jsonRepaired = true }
             )
             if (jsonRepaired) anyRepaired = true
@@ -474,13 +482,18 @@ class EventExtractor(
         targetLanguage: String,
         customRules: String,
         recentRoomCards: List<EventCard>,
+        roomAnnouncement: String,
         semaphore: Semaphore
     ): Result<List<NoticeChunk>> {
         val systemPrompt = buildTriageSystemPrompt(userPersona, targetLanguage, customRules, recentRoomCards)
         val windows = splitIntoTriageWindows(substantiveMessages)
         return mapConcurrent(windows, semaphore) { window ->
             val startMs = System.currentTimeMillis()
-            val userPrompt = ExtractionPrompts.buildTriageUserPrompt(formatTranscriptForPrompt(window), recentRoomCards)
+            val userPrompt = ExtractionPrompts.buildTriageUserPrompt(
+                transcript = formatTranscriptForPrompt(window),
+                recentRoomCards = recentRoomCards,
+                roomAnnouncement = roomAnnouncement
+            )
             var lastResult: Result<List<NoticeChunk>> = Result.failure(IllegalStateException("Pass 1 triage did not execute"))
             var anyRepaired = false
             var anyLegacyFallback = false
