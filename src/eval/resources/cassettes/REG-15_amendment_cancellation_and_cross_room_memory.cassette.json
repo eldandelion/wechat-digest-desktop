@@ -1,0 +1,12 @@
+{
+    "version": 1,
+    "scenarioId": "REG-15_amendment_cancellation_and_cross_room_memory",
+    "descriptions": {
+        "c6c24b17140b3f6167caeaef12bba94e5f9ed774ef4d64957200538d4683fa0c": "pass3_synthesis"
+    },
+    "entries": {
+        "c6c24b17140b3f6167caeaef12bba94e5f9ed774ef4d64957200538d4683fa0c": [
+            "{\"is_relevant\":true,\"events\":[{\"title\":\"Algorithm Final Exam Relocated\",\"summary\":\"Algorithm Final Exam has been moved from Hall A to Hall C301 on Dec 20 at 09:00.\",\"translated_summary\":\"Algorithm Final Exam has been moved from Hall A to Hall C301 on Dec 20 at 09:00.\",\"sections\":[{\"heading\":\"Updated Venue\",\"bullets\":[\"Exam moved to Hall C301 on 2026-12-20 at 09:00\"],\"items\":[{\"kind\":\"LOCATION\",\"icon\":\"meeting_room\",\"label\":\"Room\",\"value\":\"Hall C301\"},{\"kind\":\"DATE\",\"icon\":\"calendar_today\",\"label\":\"Date\",\"value\":\"2026-12-20 09:00\"}],\"content\":\"\"}],\"category\":\"EXAM\",\"priority\":\"CRITICAL\",\"event_date\":\"2026-12-20\",\"source_message_ids\":[1502],\"status\":\"UPDATED\",\"supersedes_card_id\":\"exam1111\"},{\"title\":\"Career Resume Clinic Cancelled\",\"summary\":\"Career Resume Clinic scheduled for Nov 29 in Room 204 has been cancelled due to speaker illness.\",\"translated_summary\":\"Career Resume Clinic scheduled for Nov 29 in Room 204 has been cancelled due to speaker illness.\",\"sections\":[{\"heading\":\"Cancellation\",\"bullets\":[\"Session on Nov 29 in Room 204 is cancelled\"],\"items\":[{\"kind\":\"WARNING\",\"icon\":\"block\",\"label\":\"Status\",\"value\":\"Cancelled due to speaker illness\"}],\"content\":\"\"}],\"category\":\"ACTIVITY\",\"priority\":\"IMPORTANT\",\"event_date\":\"2026-11-29\",\"source_message_ids\":[1503],\"status\":\"CANCELLED\",\"supersedes_card_id\":\"work2222\"}]}"
+        ]
+    }
+}

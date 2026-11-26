@@ -84,6 +84,22 @@ enum class EventCategory {
     }
 }
 
+/** Lifecycle state of a tracked event card supporting living amendments and cancellations. */
+@Serializable
+enum class EventCardStatus {
+    @SerialName("ACTIVE") ACTIVE,
+    @SerialName("UPDATED") UPDATED,
+    @SerialName("CANCELLED") CANCELLED;
+
+    companion object {
+        fun fromString(value: String?): EventCardStatus = when (value?.uppercase(Locale.ROOT)?.trim()) {
+            "UPDATED" -> UPDATED
+            "CANCELLED", "CANCELED" -> CANCELLED
+            else -> ACTIVE
+        }
+    }
+}
+
 /** Semantic metadata category for structured detail mini-tiles inside an [EventSection]. */
 @Serializable(with = FlexibleDetailKindSerializer::class)
 enum class EventDetailKind {
@@ -251,7 +267,12 @@ data class EventCard(
     val timestampSeconds: Long,
     val isRead: Boolean = false,
     val isStarred: Boolean = false,
-    val isDismissed: Boolean = false
+    val isDismissed: Boolean = false,
+    val status: EventCardStatus = EventCardStatus.ACTIVE,
+    val supersedesCardId: String? = null,
+    val originalSenderId: String = "",
+    val contentFingerprint: String = "",
+    val sourceLocalIds: List<Long> = emptyList()
 )
 
 @Serializable
@@ -263,7 +284,9 @@ data class LlmExtractedEvent(
     val category: String = "NOTICE",
     val priority: String = "NORMAL",
     @SerialName("event_date") val eventDate: String? = null,
-    @SerialName("source_message_ids") val sourceMessageIds: List<JsonPrimitive> = emptyList()
+    @SerialName("source_message_ids") val sourceMessageIds: List<JsonPrimitive> = emptyList(),
+    val status: String = "ACTIVE",
+    @SerialName("supersedes_card_id") val supersedesCardId: String? = null
 )
 
 /** Pass 1 triage chunk grouping semantically connected messages of a single announcement. */

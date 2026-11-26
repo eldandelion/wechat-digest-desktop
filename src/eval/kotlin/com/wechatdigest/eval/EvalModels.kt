@@ -99,7 +99,9 @@ data class ScenarioExpectations(
     val minSectionsOnFirstCard: Int = 0,
     val requireValidEventDates: Boolean = false,
     val minDatedCards: Int = 0,
-    val expectedPerCardGrounding: List<CardGroundingExpectation> = emptyList()
+    val expectedPerCardGrounding: List<CardGroundingExpectation> = emptyList(),
+    val expectedStatuses: List<String> = emptyList(),
+    val expectedSupersedesIds: List<String> = emptyList()
 )
 
 /** Self-contained golden test scenario runnable offline (via cassette) or against a live model. */
@@ -116,6 +118,7 @@ data class EvalScenario(
     val allowedSenderIds: List<String> = emptyList(),
     val prefilter: PrefilterConfig = PrefilterConfig(),
     val recentRoomCards: List<EventCard> = emptyList(),
+    val crossRoomDedupTexts: List<String> = emptyList(),
     val triageWindowSize: Int = EventExtractor.DEFAULT_TRIAGE_WINDOW_SIZE,
     val triageMaxWindowSize: Int = EventExtractor.DEFAULT_TRIAGE_MAX_WINDOW_SIZE,
     val gatekeeperBatchSize: Int = EventExtractor.DEFAULT_GATEKEEPER_BATCH_SIZE,

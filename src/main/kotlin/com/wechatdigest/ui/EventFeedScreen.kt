@@ -36,7 +36,9 @@ import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppState
 import com.wechatdigest.app.EventSortOrder
 import com.wechatdigest.core.attachment.WeChatFileMessageParser
+import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.GroupChat
@@ -65,6 +67,12 @@ internal fun formatPriorityLabel(priority: EventPriority): String =
 
 internal fun formatCategoryLabel(category: EventCategory): String =
     category.name.lowercase(Locale.ROOT).replaceFirstChar { it.titlecase(Locale.ROOT) }
+
+internal fun formatStatusLabel(status: EventCardStatus): String = when (status) {
+    EventCardStatus.ACTIVE -> "Active"
+    EventCardStatus.UPDATED -> "Updated"
+    EventCardStatus.CANCELLED -> "Cancelled"
+}
 
 private val eventDateOnlyDisplayFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy", Locale.ENGLISH)
 private val eventDateTimeDisplayFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy • HH:mm", Locale.ENGLISH)
@@ -283,11 +291,15 @@ fun EventFeedScreen(appState: AppState) {
 
         SyncTopProgressBar(isSyncing = isSyncing)
         cardPendingDelete?.let { target ->
-            DeleteConfirmationDialog(
-                title = "Delete Notice?",
-                message = "Remove \"${target.title}\" from your event feed?",
-                onConfirm = { appState.dismiss(target.id); cardPendingDelete = null },
-                onDismiss = { cardPendingDelete = null }
+            DismissCardDialog(
+                card = target,
+                onDismissOnly = { appState.dismiss(target.id); cardPendingDelete = null },
+                onDismissAndMuteSender = { appState.dismissAndMuteSender(target); cardPendingDelete = null },
+                onDismissAndAddFilter = { pattern, matchType ->
+                    appState.dismissAndAddPrefilterRule(target, pattern, matchType)
+                    cardPendingDelete = null
+                },
+                onCancel = { cardPendingDelete = null }
             )
         }
     }
@@ -369,6 +381,10 @@ private fun EventDetailHost(
     val translatingCardIds by appState.translatingCardIds.collectAsState()
     val recheckingCardIds by appState.recheckingAttachmentCardIds.collectAsState()
     val enrichingCardIds by appState.enrichingCardIds.collectAsState()
+    val reextractingCardIds by appState.reextractingCardIds.collectAsState()
+    val isSyncing by appState.isSyncing.collectAsState()
+    val settings by appState.settings.collectAsState()
+    val canReextract = !(isSyncing && EventExtractor.resolveConcurrencyForConfig(settings.llm) == 1)
 
     EventDetailPane(
         card = selectedCard,
@@ -382,8 +398,15 @@ private fun EventDetailHost(
         isTranslatingMessages = selectedCard.id in translatingCardIds,
         isRecheckingAttachments = selectedCard.id in recheckingCardIds,
         isEnrichingSections = selectedCard.id in enrichingCardIds,
+        isReextracting = selectedCard.id in reextractingCardIds,
+        canReextract = canReextract,
         onTranslateSourceMessages = { appState.translateSourceMessages(selectedCard.id) },
         onEnrichSections = { targetSectionIdx -> appState.enrichSectionCards(selectedCard.id, targetSectionIdx) },
+        onReextractCard = { appState.reextractCard(selectedCard.id) },
+        onQuickEditCard = { title, category, priority, eventDate ->
+            appState.quickEditCard(selectedCard.id, title, category, priority, eventDate)
+        },
+        onLoadContextMessages = { appState.loadContextMessages(selectedCard) },
         onOpenAttachment = { appState.openAttachment(it) },
         onRevealAttachmentInFinder = { appState.revealAttachmentInFinder(it) },
         onRecheckAttachments = { appState.recheckCardAttachments(selectedCard.id) },

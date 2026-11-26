@@ -34,7 +34,7 @@ class OfflineRegressionEvalTest {
         val baselineFile = File("src/eval/resources/baseline.json")
 
         val scenarios = EvalRunner.loadScenarios(scenariosDir)
-        assertTrue(scenarios.size >= 14, "Expected at least 14 golden scenarios in ${scenariosDir.path}, found ${scenarios.size}")
+        assertTrue(scenarios.size >= 15, "Expected at least 15 golden scenarios in ${scenariosDir.path}, found ${scenarios.size}")
 
         val baseline = EvalRunner.loadBaseline(baselineFile)
         val report = EvalRunner.runSuite(

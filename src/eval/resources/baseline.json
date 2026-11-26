@@ -15,6 +15,7 @@
     "REG-11_english_to_chinese_and_japanese_compliance": { "maxLlmCalls": 2, "expectedCardCount": 1, "maxTranslationRepairs": 1 },
     "REG-12_concurrent_cloud_multi_chunk_order": { "maxLlmCalls": 6, "expectedCardCount": 4, "maxTranslationRepairs": 0 },
     "REG-13_multipass_json_repair_and_gatekeeper_veto": { "maxLlmCalls": 4, "expectedCardCount": 2, "maxTranslationRepairs": 0 },
-    "REG-14_rich_xml_sysmsg_recall_solitaire_and_stranger": { "maxLlmCalls": 5, "expectedCardCount": 3, "maxTranslationRepairs": 0 }
+    "REG-14_rich_xml_sysmsg_recall_solitaire_and_stranger": { "maxLlmCalls": 5, "expectedCardCount": 3, "maxTranslationRepairs": 0 },
+    "REG-15_amendment_cancellation_and_cross_room_memory": { "maxLlmCalls": 1, "expectedCardCount": 2, "maxTranslationRepairs": 0 }
   }
 }

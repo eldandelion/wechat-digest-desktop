@@ -615,4 +615,213 @@ class StorageTest {
         assertEquals("Venue", enrichedLoaded.sections.single().items.single().label)
         assertEquals(listOf("Location: 422-1"), enrichedLoaded.sections.single().bullets)
     }
+
+    @Test
+    fun `applyUpdateOrInsert atomically supersedes active card by short id prefix and preserves star`() {
+        val originalId = "abcdef12-3456-7890-abcd-111122223333"
+        val original = EventCard(
+            id = originalId,
+            title = "Algorithm Exam Room A",
+            summary = "Exam in Hall A.",
+            translatedSummary = "Exam in Hall A.",
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Prof. Wang",
+            originalSenderId = "wxid_prof_wang",
+            sourceRoomId = "algo@chatroom",
+            sourceMessages = "[2026-11-20 09:00:00] Prof. Wang: Algorithm Final Exam will be held in Hall A on Dec 20.",
+            sourceLocalIds = listOf(101L),
+            timestampSeconds = 1795000000L,
+            isStarred = true
+        )
+        assertEquals(1, eventCardStore.upsert(listOf(original)))
+        val fpSet = eventCardStore.listActiveFingerprints()
+        assertEquals(1, fpSet.size)
+
+        // Update referencing 8-char prefix supersedes original atomically and inherits star state
+        val updated = EventCard(
+            id = "fedcba98-0000-0000-0000-444455556666",
+            title = "Algorithm Exam Moved to Hall B",
+            summary = "Exam moved to Hall B.",
+            translatedSummary = "Exam moved to Hall B.",
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Prof. Wang",
+            originalSenderId = "wxid_prof_wang",
+            sourceRoomId = "algo@chatroom",
+            sourceMessages = "[2026-11-21 10:00:00] Prof. Wang: Correction: Algorithm Final Exam moved from Hall A to Hall B.",
+            sourceLocalIds = listOf(102L),
+            timestampSeconds = 1795086400L,
+            status = com.wechatdigest.core.model.EventCardStatus.UPDATED,
+            supersedesCardId = "card:abcdef12"
+        )
+        val applyResult = eventCardStore.applyUpdateOrInsertOrThrow(listOf(updated))
+        assertEquals(1, applyResult.insertedCards.size)
+        assertEquals(listOf(originalId), applyResult.supersededCardIds)
+        assertEquals(originalId, applyResult.insertedCards.single().supersedesCardId)
+        assertTrue(applyResult.insertedCards.single().isStarred)
+
+        val active = eventCardStore.listActive()
+        assertEquals(1, active.size)
+        assertEquals(updated.id, active.single().id)
+        assertEquals(com.wechatdigest.core.model.EventCardStatus.UPDATED, active.single().status)
+        assertEquals(originalId, active.single().supersedesCardId)
+        assertEquals("wxid_prof_wang", active.single().originalSenderId)
+        assertEquals(listOf(102L), active.single().sourceLocalIds)
+        assertTrue(active.single().isStarred)
+
+        // Security regressions: cross-room exact-ID supersede blocked & untrusted cross-sender spoof does not dismiss original
+        val foreignAttackerUpdate = EventCard(
+            id = "spoof-1",
+            title = "Fake Cancellation",
+            summary = "Cancelled",
+            translatedSummary = "Cancelled",
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Student_X",
+            originalSenderId = "wxid_student_spoof",
+            sourceRoomId = "algo@chatroom",
+            sourceMessages = "Cancelled",
+            timestampSeconds = 1795100000L,
+            status = com.wechatdigest.core.model.EventCardStatus.CANCELLED,
+            supersedesCardId = updated.id
+        )
+        val crossRoomUpdate = foreignAttackerUpdate.copy(
+            id = "cross-room-spoof",
+            originalSenderId = "wxid_prof_wang",
+            sourceRoomId = "other_room@chatroom",
+            supersedesCardId = updated.id
+        )
+        val spoofOutcome = eventCardStore.applyUpdateOrInsertOrThrow(listOf(foreignAttackerUpdate, crossRoomUpdate), roomOwnerId = "wxid_owner")
+        assertTrue(spoofOutcome.supersededCardIds.isEmpty(), "Untrusted cross-sender & cross-room supersedes must not dismiss prior card")
+        assertNotNull(eventCardStore.listActive().firstOrNull { it.id == updated.id && !it.isDismissed })
+
+        // Idempotent replay of the exact UPDATED card must keep dedupe_key identical and insert 0 duplicates
+        val replayCount = eventCardStore.applyUpdateOrInsertOrThrow(listOf(updated)).insertedCards.size
+        assertEquals(0, replayCount, "Re-applying already-persisted amended card must remain idempotent")
+
+        // Prefix guard rails: <6 char prefix, ambiguous >=6 char prefix across 2 active cards, and SQL LIKE wildcards
+        val w1 = original.copy(id = "wild12%3_a", title = "W1", sourceMessages = "W1 unique body for dedupe", isDismissed = false)
+        val w2 = original.copy(id = "wild129999", title = "W2", sourceMessages = "W2 unique body for dedupe", isDismissed = false)
+        val a1 = original.copy(id = "ambig12_one", title = "A1", sourceMessages = "A1 unique body for dedupe", isDismissed = false)
+        val a2 = original.copy(id = "ambig12_two", title = "A2", sourceMessages = "A2 unique body for dedupe", isDismissed = false)
+        eventCardStore.upsert(listOf(w1, w2, a1, a2))
+        val wildcardAttack = original.copy(
+            id = "wild-attack",
+            title = "Wildcard Attempt",
+            sourceMessages = "Wildcard attack text",
+            status = com.wechatdigest.core.model.EventCardStatus.UPDATED,
+            supersedesCardId = "wild12%",
+            isDismissed = false
+        )
+        val wildcardRes = eventCardStore.applyUpdateOrInsertOrThrow(listOf(wildcardAttack))
+        assertEquals(w1.id, wildcardRes.supersededCardIds.single(), "Escaped LIKE prefix 'wild12%' must match literal '%', never wild129999")
+
+        val ambiguousAttack = wildcardAttack.copy(id = "ambig-attack", sourceMessages = "Ambig text", supersedesCardId = "ambig12")
+        val shortAttack = wildcardAttack.copy(id = "short-attack", sourceMessages = "Short text", supersedesCardId = "ambig")
+        val guardRes = eventCardStore.applyUpdateOrInsertOrThrow(listOf(ambiguousAttack, shortAttack))
+        assertTrue(guardRes.supersededCardIds.isEmpty(), "Ambiguous or <6-char prefixes must fail closed without superseding")
+    }
+
+    @Test
+    fun `migrates legacy pre-phase-3 event_cards table safely`() {
+        val legacyFile = File(tempDir, "legacy_events_v2.db")
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${legacyFile.absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute(
+                    """
+                    CREATE TABLE event_cards (
+                        id TEXT PRIMARY KEY,
+                        dedupe_key TEXT UNIQUE,
+                        title TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        translated_summary TEXT NOT NULL,
+                        sections TEXT DEFAULT '[]',
+                        category TEXT NOT NULL,
+                        priority TEXT NOT NULL,
+                        event_date TEXT,
+                        action_items TEXT NOT NULL,
+                        original_sender TEXT NOT NULL,
+                        source_room_id TEXT NOT NULL,
+                        source_room_name TEXT DEFAULT '',
+                        source_messages TEXT DEFAULT '',
+                        translated_source_messages TEXT DEFAULT '',
+                        attachments TEXT DEFAULT '[]',
+                        timestamp_seconds INTEGER NOT NULL,
+                        is_read INTEGER DEFAULT 0,
+                        is_starred INTEGER DEFAULT 0,
+                        is_dismissed INTEGER DEFAULT 0,
+                        created_at INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                stmt.execute(
+                    "INSERT INTO event_cards VALUES ('leg-1', 'd1', 'Old Title', 'Sum', 'Sum', '[]', 'NOTICE', 'NORMAL', NULL, '[]', 'Prof', 'r@chatroom', 'Room', 'body', '', '[]', 1700000000, 0, 0, 0, 1700000000)"
+                )
+            }
+        }
+        val migratedDb = AppDatabase(legacyFile)
+        val migratedStore = EventCardStore(migratedDb)
+        val loaded = migratedStore.listActive().single()
+        assertEquals("leg-1", loaded.id)
+        assertEquals(com.wechatdigest.core.model.EventCardStatus.ACTIVE, loaded.status)
+        assertTrue(loaded.sourceLocalIds.isEmpty())
+        assertEquals("", loaded.originalSenderId)
+    }
+
+    @Test
+    fun `updateCardFieldsOrThrow and replaceExtractedCardOrThrow preserve flags and attribution`() {
+        val card = EventCard(
+            id = "edit-card-1",
+            title = "Draft Notice",
+            summary = "Original summary",
+            translatedSummary = "Original translated",
+            category = EventCategory.NOTICE,
+            priority = EventPriority.NORMAL,
+            eventDate = "2026-12-01",
+            originalSender = "Admin",
+            originalSenderId = "wxid_admin",
+            sourceRoomId = "dept@chatroom",
+            sourceMessages = "[2026-11-20 09:00:00] Admin: Submit forms before Dec 1.",
+            sourceLocalIds = listOf(55L),
+            timestampSeconds = 1795000000L,
+            isRead = true,
+            isStarred = true
+        )
+        eventCardStore.upsert(listOf(card))
+
+        val edited = eventCardStore.updateCardFieldsOrThrow(
+            id = "edit-card-1",
+            title = "Updated Form Deadline",
+            category = EventCategory.DEADLINE,
+            priority = EventPriority.CRITICAL,
+            eventDate = "2026-12-03"
+        )
+        assertNotNull(edited)
+        assertEquals("Updated Form Deadline", edited.title)
+        assertEquals(EventCategory.DEADLINE, edited.category)
+        assertEquals(EventPriority.CRITICAL, edited.priority)
+        assertEquals("2026-12-03", edited.eventDate)
+        assertTrue(edited.isRead)
+        assertTrue(edited.isStarred)
+        assertEquals("wxid_admin", edited.originalSenderId)
+        assertEquals(listOf(55L), edited.sourceLocalIds)
+
+        val reextracted = eventCardStore.replaceExtractedCardOrThrow(
+            existingId = "edit-card-1",
+            replacement = card.copy(
+                title = "Re-extracted Thesis Notice",
+                summary = "New summary",
+                translatedSummary = "New translated",
+                status = com.wechatdigest.core.model.EventCardStatus.CANCELLED
+            )
+        )
+        assertNotNull(reextracted)
+        assertEquals("Re-extracted Thesis Notice", reextracted.title)
+        assertEquals(com.wechatdigest.core.model.EventCardStatus.CANCELLED, reextracted.status)
+        assertTrue(reextracted.isRead)
+        assertTrue(reextracted.isStarred)
+        // Cancelled cards drop out of active fingerprint dedup set
+        assertTrue(eventCardStore.listActiveFingerprints().isEmpty())
+    }
 }

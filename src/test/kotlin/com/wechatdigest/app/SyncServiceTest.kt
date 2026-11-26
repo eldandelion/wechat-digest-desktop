@@ -1256,4 +1256,213 @@ class SyncServiceTest {
         assertEquals("message_1.db", legacyPostBatch.latestShardName)
         assertEquals(3L, legacyPostBatch.latestLocalId)
     }
+
+    @Test
+    fun `syncNow suppresses identical forwarded notices across rooms and respects mutedSenderIds`() = runBlocking {
+        val dir = File(tempDir, "cross_room_wechat").apply { mkdirs() }
+        val room1 = "room_a@chatroom"
+        val room2 = "room_b@chatroom"
+        val room3 = "room_c@chatroom"
+        val t1 = WeChatDatabaseDriver.calculateRoomTableName(room1)
+        val t2 = WeChatDatabaseDriver.calculateRoomTableName(room2)
+        val t3 = WeChatDatabaseDriver.calculateRoomTableName(room3)
+
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_prof', 'Prof. Chen', '')")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_ta', 'TA Li', '')")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_spam', 'Noisy Student', '')")
+            }
+        }
+        val noticeBody = "Final Robotics Project Demo starts Dec 22 at 14:00 in Innovation Hall 201."
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $t1 (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.execute("CREATE TABLE $t2 (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.execute("CREATE TABLE $t3 (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $t1 VALUES (1, 1794800000, 'wxid_prof', CAST('$noticeBody' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $t2 VALUES (1, 1794800100, 'wxid_ta', CAST('@All $noticeBody' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $t3 VALUES (1, 1794800200, 'wxid_spam', CAST('Join our unrelated club sale at booth 3 this afternoon!' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $t3 VALUES (2, 1794800250, 'wxid_prof', CAST('$noticeBody' AS BLOB))")
+            }
+        }
+
+        val groupConfigStore = com.wechatdigest.storage.GroupConfigStore(appDb)
+        // Only mute wxid_spam in room3 while keeping allowedSenderIds empty
+        groupConfigStore.save(
+            com.wechatdigest.core.model.GroupConfig(
+                roomId = room3,
+                mutedSenderIds = listOf("wxid_spam")
+            )
+        )
+
+        var llmCalls = 0
+        val engine = MockEngine {
+            llmCalls++
+            val content = """{"is_relevant":true,"events":[{"title":"Robotics Project Demo","summary":"Demo Dec 22 at 14:00 in Innovation Hall 201.","translated_summary":"Demo Dec 22 at 14:00 in Innovation Hall 201.","category":"EXAM","priority":"CRITICAL","event_date":"2026-12-22","source_message_ids":[1]}]}"""
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val checkpointStore = SyncCheckpointStore(appDb)
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            groupConfigStore = groupConfigStore,
+            syncCheckpointStore = checkpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val result = service.syncNow(
+            AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = linkedSetOf(room1, room2, room3),
+                targetLanguage = "en"
+            )
+        )
+        assertTrue(result is SyncResult.Success)
+        assertEquals(1, llmCalls, "Forwarded duplicates across rooms 2 & 3 and muted sender in room 3 must incur only 1 total LLM call")
+        assertEquals(1, eventCardStore.listActive().size)
+        assertEquals("wxid_prof", eventCardStore.listActive().single().originalSenderId)
+        assertEquals(2L, checkpointStore.get(room3)?.lastLocalId, "Skipped room3 must still advance checkpoint")
+    }
+
+    @Test
+    fun `getContextMessages walks chronologically across shards around legacy and localId anchors`() {
+        val dir = File(tempDir, "ctx_shards").apply { mkdirs() }
+        val msgDir = File(dir, "message").apply { mkdirs() }
+        val room = "ctx@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('u1', 'Alice', '')")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('u2', 'Prof', '')")
+            }
+        }
+        // Shard 0 has create_time 100..400 (local_id 1..4)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(msgDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, local_type INTEGER, server_id INTEGER, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 100, 'u1', 1, 10, CAST('m1' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 200, 'u1', 1, 20, CAST('m2' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 300, 'u1', 1, 30, CAST('m3' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (4, 400, 'u1', 10000, 40, CAST('sysmsg-skip' AS BLOB))")
+            }
+        }
+        // Shard 1 resets local_id to 1..4 with create_time 500..800
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(msgDir, "message_1.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, local_type INTEGER, server_id INTEGER, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 500, 'u1', 1, 50, CAST('m4' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 600, 'u2', 1, 60, CAST('Anchor Notice' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 700, 'u1', 1, 70, CAST('m5-after' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (4, 800, 'u1', 1, 80, CAST('m6-after' AS BLOB))")
+            }
+        }
+        val driver = WeChatDatabaseDriver(dir, cacheDir = File(tempDir, "ctx_cache"))
+        val repo = WeChatMessageRepository(driver, WeChatContactRepository(driver))
+
+        val ctx = repo.getContextMessages(
+            roomId = room,
+            anchorLocalIds = listOf(2L),
+            anchorTimestampSeconds = 600L,
+            beforeCount = 4,
+            afterCount = 2
+        )
+        assertEquals(
+            listOf("m1", "m2", "m3", "m4", "Anchor Notice", "m5-after", "m6-after"),
+            ctx.messages.map { it.textContent }
+        )
+        assertEquals(setOf(WeChatMessageRepository.contextKey(ctx.messages[4])), ctx.anchorFingerprints)
+
+        // Legacy fallback with empty anchorLocalIds resolves via timestamp cleanly
+        val legacyCtx = repo.getContextMessages(
+            roomId = room,
+            anchorLocalIds = emptyList(),
+            anchorTimestampSeconds = 600L,
+            beforeCount = 2,
+            afterCount = 1
+        )
+        assertEquals(listOf("m3", "m4", "Anchor Notice", "m5-after"), legacyCtx.messages.map { it.textContent })
+
+        // Forward rollover anchoring in shard 0 (timestamp=300) walks forward cleanly across shard boundary into shard 1
+        val forwardCtx = repo.getContextMessages(
+            roomId = room,
+            anchorLocalIds = listOf(3L),
+            anchorTimestampSeconds = 300L,
+            beforeCount = 1,
+            afterCount = 3
+        )
+        assertEquals(listOf("m2", "m3", "m4", "Anchor Notice", "m5-after"), forwardCtx.messages.map { it.textContent })
+        assertEquals(listOf("Anchor Notice"), repo.findAnchorMessages(room, listOf(2L), 600L).map { it.textContent })
+    }
+
+    @Test
+    fun `scoped room custom rules and allowlist bypass global cross-room fingerprint suppression`() = runBlocking {
+        val dir = File(tempDir, "scoped_policy_wechat").apply { mkdirs() }
+        val openRoom = "open@chatroom"
+        val scopedRoom = "scoped@chatroom"
+        val tOpen = WeChatDatabaseDriver.calculateRoomTableName(openRoom)
+        val tScoped = WeChatDatabaseDriver.calculateRoomTableName(scopedRoom)
+
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_any', 'Any', '')")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_dean', 'Dean', '')")
+            }
+        }
+        val body = "University wide scholarship portal opens Nov 28 for all full-time applicants."
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $tOpen (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.execute("CREATE TABLE $tScoped (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $tOpen VALUES (1, 1794800000, 'wxid_any', CAST('$body' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $tScoped VALUES (1, 1794800100, 'wxid_dean', CAST('$body' AS BLOB))")
+            }
+        }
+        val groupConfigStore = com.wechatdigest.storage.GroupConfigStore(appDb)
+        groupConfigStore.save(
+            com.wechatdigest.core.model.GroupConfig(
+                roomId = scopedRoom,
+                customPrompt = "Focus on graduate fellowships",
+                allowedSenderIds = listOf("wxid_dean")
+            )
+        )
+        var llmCalls = 0
+        val engine = MockEngine { req ->
+            llmCalls++
+            val bodyStr = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            val content = when {
+                bodyStr.contains("Semantic Filter & Topic Chunker") -> """{"chunks":[{"topic":"Scholarship","message_ids":[1]}]}"""
+                bodyStr.contains("Rule & Substance Gatekeeper") -> """{"is_group_notice":true,"passes_rules":true,"has_substance":true,"keep":true,"reason":"Clean"}"""
+                else -> """{"is_relevant":true,"events":[{"title":"Scholarship Portal","summary":"Portal opens Nov 28.","translated_summary":"Portal opens Nov 28.","category":"DEADLINE","priority":"IMPORTANT","event_date":"2026-11-28","source_message_ids":[1]}]}"""
+            }
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            groupConfigStore = groupConfigStore,
+            syncCheckpointStore = SyncCheckpointStore(appDb),
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val res = service.syncNow(
+            AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = linkedSetOf(openRoom, scopedRoom),
+                targetLanguage = "en"
+            )
+        )
+        assertTrue(res is SyncResult.Success)
+        // Open room runs fast-path (1 call), scoped room runs Pass 1+2+3 (3 calls) — scoped room was NOT suppressed by openRoom!
+        assertEquals(4, llmCalls)
+        assertEquals(2, eventCardStore.listActive().size)
+    }
 }

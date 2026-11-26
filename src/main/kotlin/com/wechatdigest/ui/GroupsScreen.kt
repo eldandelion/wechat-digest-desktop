@@ -317,11 +317,13 @@ private fun buildGroupRuleBadgeLabel(config: GroupConfig?): String? {
     val hasCustomPrompt = config?.customPrompt?.isNotBlank() == true
     val hasCustomPersona = config?.customPersona?.isNotBlank() == true
     val senderCount = config?.allowedSenderIds?.size ?: 0
-    if (!hasCustomPrompt && !hasCustomPersona && senderCount == 0) return null
+    val mutedCount = config?.mutedSenderIds?.size ?: 0
+    if (!hasCustomPrompt && !hasCustomPersona && senderCount == 0 && mutedCount == 0) return null
     return buildList {
         if (hasCustomPrompt) add("Custom Rule")
         if (hasCustomPersona) add("Persona")
         if (senderCount > 0) add("$senderCount sender(s)")
+        if (mutedCount > 0) add("$mutedCount muted")
     }.joinToString(" • ")
 }
 

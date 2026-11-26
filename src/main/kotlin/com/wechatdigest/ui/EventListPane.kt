@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.EventSortOrder
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.ui.theme.LocalIsDarkTheme
 import com.wechatdigest.ui.theme.PriorityColors
@@ -497,6 +498,21 @@ private fun EventListItemHeader(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+        if (card.status != EventCardStatus.ACTIVE) {
+            Spacer(Modifier.width(6.dp))
+            val isCancelled = card.status == EventCardStatus.CANCELLED
+            Surface(
+                color = if (isCancelled) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer,
+                shape = RoundedCornerShape(4.dp)
+            ) {
+                Text(
+                    text = formatStatusLabel(card.status),
+                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                    style = MaterialTheme.typography.labelSmall.copy(lineHeight = MaterialTheme.typography.labelSmall.fontSize),
+                    color = if (isCancelled) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+        }
         Spacer(Modifier.width(8.dp))
         if (card.attachments.isNotEmpty()) {
             Icon(Icons.Default.AttachFile, contentDescription = "Has attachment", modifier = Modifier.size(13.dp), tint = primaryTextColor)

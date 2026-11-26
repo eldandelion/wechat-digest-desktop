@@ -4,6 +4,7 @@ import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.LlmExtractionResponse
 import com.wechatdigest.core.model.LlmTriageResponse
 import com.wechatdigest.core.model.WeChatMessage
+import com.wechatdigest.core.sanitizer.ContentFingerprint
 import com.wechatdigest.core.sanitizer.MessageSanitizer
 import com.wechatdigest.core.sanitizer.PrefilterConfig
 import kotlinx.coroutines.CancellationException
@@ -191,9 +192,11 @@ class EventExtractor(
         recentRoomCards: List<EventCard> = emptyList(),
         onCardReady: (suspend (EventCard) -> Unit)? = null,
         onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)? = null,
-        roomAnnouncement: String = ""
+        roomAnnouncement: String = "",
+        crossRoomFingerprints: Set<String> = emptySet()
     ): Result<List<EventCard>> {
-        val substantive = MessageSanitizer.filterSubstantiveMessages(messages, prefilterConfig)
+        val rawSubstantive = MessageSanitizer.filterSubstantiveMessages(messages, prefilterConfig)
+        val substantive = filterCrossRoomDuplicates(rawSubstantive, crossRoomFingerprints)
         if (observer !== ExtractionObserver.NoOp) {
             observer.onPrefilterComplete(messages.size, substantive.size, substantive.map { it.localId })
         }
@@ -247,10 +250,25 @@ class EventExtractor(
             userPersona = userPersona,
             targetLanguage = targetLanguage,
             customRules = customRules,
+            recentRoomCards = recentRoomCards,
             semaphore = semaphore,
             onCardReady = onCardReady,
             onProgress = onProgress
         )
+    }
+
+    private fun filterCrossRoomDuplicates(
+        substantive: List<WeChatMessage>,
+        crossRoomFingerprints: Set<String>
+    ): List<WeChatMessage> {
+        if (substantive.isEmpty() || crossRoomFingerprints.isEmpty()) return substantive
+        val perMessageFiltered = substantive.filterNot { msg ->
+            val fp = ContentFingerprint.computeForMessages(listOf(msg))
+            fp.isNotEmpty() && fp in crossRoomFingerprints
+        }
+        if (perMessageFiltered.isEmpty()) return emptyList()
+        val combinedFp = ContentFingerprint.computeForMessages(perMessageFiltered)
+        return if (combinedFp.isNotEmpty() && combinedFp in crossRoomFingerprints) emptyList() else perMessageFiltered
     }
 
     private suspend fun <T, R> mapConcurrent(
@@ -323,7 +341,8 @@ class EventExtractor(
         notifyProgress(onProgress, "Extracting ${remaining.size} message(s)...", 0, 1)
             .getOrElse { return Result.failure(it) }
 
-        val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules)
+        val includeLifecycle = recentRoomCards.isNotEmpty()
+        val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules, includeLifecycle)
         val userPrompt = ExtractionPrompts.buildFastPathSynthesisUserPrompt(
             transcript = formatTranscriptForPrompt(remaining),
             recentRoomCards = recentRoomCards,
@@ -337,6 +356,7 @@ class EventExtractor(
             remaining = remaining,
             roomId = roomId,
             roomDisplayName = roomDisplayName,
+            recentRoomCards = recentRoomCards,
             requireExplicitIds = roomAnnouncement.isNotBlank(),
             semaphore = semaphore,
             startMs = startMs
@@ -426,10 +446,12 @@ class EventExtractor(
         remaining: List<WeChatMessage>,
         roomId: String,
         roomDisplayName: String,
+        recentRoomCards: List<EventCard> = emptyList(),
         requireExplicitIds: Boolean = false,
         semaphore: Semaphore,
         startMs: Long
     ): Result<List<EventCard>> {
+        val includeLifecycle = recentRoomCards.isNotEmpty()
         var lastResult: Result<List<EventCard>> = Result.failure(IllegalStateException("Fast-path Pass 3 did not execute"))
         var attemptsUsed = 0
         var anyRepaired = false
@@ -437,7 +459,7 @@ class EventExtractor(
         repeat(2) { attempt ->
             attemptsUsed = attempt + 1
             val rawResponse = semaphore.withPermit {
-                queryLlm("Fast-path Pass 3 synthesis", systemPrompt, userPrompt, StageJsonSchemas.pass3SynthesisOptions())
+                queryLlm("Fast-path Pass 3 synthesis", systemPrompt, userPrompt, StageJsonSchemas.pass3SynthesisOptions(includeLifecycle))
             }.getOrElse { err ->
                 lastResult = Result.failure(err)
                 val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(err)
@@ -452,6 +474,7 @@ class EventExtractor(
                 roomId = roomId,
                 roomDisplayName = roomDisplayName,
                 singleMessageFallback = remaining.size == 1 && !requireExplicitIds,
+                recentRoomCards = recentRoomCards,
                 onRepaired = { jsonRepaired = true }
             )
             if (jsonRepaired) anyRepaired = true
@@ -611,12 +634,14 @@ class EventExtractor(
         userPersona: String,
         targetLanguage: String,
         customRules: String,
+        recentRoomCards: List<EventCard> = emptyList(),
         semaphore: Semaphore,
         onCardReady: (suspend (EventCard) -> Unit)?,
         onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
     ): Result<List<EventCard>> {
         if (chunks.isEmpty()) return Result.success(emptyList())
-        val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules)
+        val includeLifecycle = recentRoomCards.isNotEmpty()
+        val systemPrompt = buildSystemPrompt(userPersona, targetLanguage, customRules, includeLifecycle)
         val translator = CardTranslator(llmClient)
         val completedCount = AtomicInteger(0)
         val progressMutex = Mutex()
@@ -627,6 +652,7 @@ class EventExtractor(
                 roomId = roomId,
                 roomDisplayName = roomDisplayName,
                 targetLanguage = targetLanguage,
+                recentRoomCards = recentRoomCards,
                 translator = translator,
                 semaphore = semaphore,
                 completedCount = completedCount,
@@ -643,6 +669,7 @@ class EventExtractor(
                 roomId = roomId,
                 roomDisplayName = roomDisplayName,
                 targetLanguage = targetLanguage,
+                recentRoomCards = recentRoomCards,
                 translator = translator,
                 semaphore = semaphore,
                 completedCount = completedCount,
@@ -668,6 +695,7 @@ class EventExtractor(
         roomId: String,
         roomDisplayName: String,
         targetLanguage: String,
+        recentRoomCards: List<EventCard> = emptyList(),
         translator: CardTranslator,
         semaphore: Semaphore,
         completedCount: AtomicInteger,
@@ -677,8 +705,8 @@ class EventExtractor(
     ): Result<List<EventCard>> {
         val synthesizedSlots = mutableListOf<Pair<Int, EventCard>>()
         for ((index, chunk) in chunks.withIndex()) {
-            val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages))
-            val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, semaphore)
+            val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages), recentRoomCards)
+            val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, recentRoomCards, semaphore)
                 .getOrElse { err ->
                     if (err is CancellationException) throw err
                     return Result.failure(err)
@@ -744,6 +772,7 @@ class EventExtractor(
         roomId: String,
         roomDisplayName: String,
         targetLanguage: String,
+        recentRoomCards: List<EventCard> = emptyList(),
         translator: CardTranslator,
         semaphore: Semaphore,
         completedCount: AtomicInteger,
@@ -751,8 +780,8 @@ class EventExtractor(
         onCardReady: (suspend (EventCard) -> Unit)?,
         onProgress: (suspend (stage: String, completed: Int, total: Int) -> Unit)?
     ): Result<EventCard?> {
-        val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages))
-        val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, semaphore)
+        val userPrompt = ExtractionPrompts.buildSynthesisUserPrompt(chunk.topic, formatTranscriptForPrompt(chunk.messages), recentRoomCards)
+        val synthesized = synthesizeChunkWithRetry(systemPrompt, userPrompt, chunk, roomId, roomDisplayName, recentRoomCards, semaphore)
             .getOrElse { return Result.failure(it) }
         if (synthesized == null) {
             reportPass3Progress(progressMutex, onProgress, completedCount, totalChunks, incrementCompleted = true, translating = false)
@@ -831,9 +860,11 @@ class EventExtractor(
         chunk: NoticeChunk,
         roomId: String,
         roomDisplayName: String,
+        recentRoomCards: List<EventCard> = emptyList(),
         semaphore: Semaphore
     ): Result<EventCard?> {
         val startMs = System.currentTimeMillis()
+        val includeLifecycle = recentRoomCards.isNotEmpty()
         var lastResult: Result<EventCard?> = Result.failure(IllegalStateException("Pass 3 did not execute"))
         var attemptsUsed = 0
         var anyRepaired = false
@@ -841,7 +872,7 @@ class EventExtractor(
         repeat(2) { attempt ->
             attemptsUsed = attempt + 1
             val rawResponse = semaphore.withPermit {
-                queryLlm("Pass 3 chunk synthesis", systemPrompt, userPrompt, StageJsonSchemas.pass3SynthesisOptions())
+                queryLlm("Pass 3 chunk synthesis", systemPrompt, userPrompt, StageJsonSchemas.pass3SynthesisOptions(includeLifecycle))
             }.getOrElse { err ->
                 lastResult = Result.failure(err)
                 val retryable = attempt == 0 && LlmRetryPolicy.isRetryableError(err)
@@ -849,7 +880,7 @@ class EventExtractor(
                 return@repeat
             }
             var jsonRepaired = false
-            val parsed = parseChunkExtractionResult(rawResponse, chunk, roomId, roomDisplayName) { jsonRepaired = true }
+            val parsed = parseChunkExtractionResult(rawResponse, chunk, roomId, roomDisplayName, recentRoomCards) { jsonRepaired = true }
             if (jsonRepaired) anyRepaired = true
             if (parsed.isSuccess) {
                 if (observer !== ExtractionObserver.NoOp) {
@@ -1167,6 +1198,7 @@ class EventExtractor(
         chunk: NoticeChunk,
         roomId: String,
         roomDisplayName: String = "",
+        recentRoomCards: List<EventCard> = emptyList(),
         onRepaired: (() -> Unit)? = null
     ): Result<EventCard?> {
         val response = try {
@@ -1193,7 +1225,11 @@ class EventExtractor(
             fallbackTitle = fallbackTitle,
             joinDistinctTitles = false,
             sourceAttachments = chunk.messages.flatMap { it.attachments },
-            zoneId = zoneId
+            zoneId = zoneId,
+            originalSenderId = chunk.messages.last().senderId,
+            sourceLocalIds = chunk.messages.map { it.localId },
+            contentFingerprint = ContentFingerprint.computeForMessages(chunk.messages),
+            recentRoomCards = recentRoomCards
         )
         return Result.success(card)
     }
@@ -1217,6 +1253,7 @@ class EventExtractor(
         roomId: String,
         roomDisplayName: String = "",
         singleMessageFallback: Boolean = false,
+        recentRoomCards: List<EventCard> = emptyList(),
         onRepaired: (() -> Unit)? = null
     ): Result<List<EventCard>> {
         val response = try {
@@ -1265,7 +1302,11 @@ class EventExtractor(
                 fallbackTitle = "Group Notice",
                 joinDistinctTitles = false,
                 sourceAttachments = allMatched.flatMap { it.attachments },
-                zoneId = zoneId
+                zoneId = zoneId,
+                originalSenderId = allMatched.lastOrNull()?.senderId.orEmpty(),
+                sourceLocalIds = allMatched.map { it.localId },
+                contentFingerprint = ContentFingerprint.computeForMessages(allMatched),
+                recentRoomCards = recentRoomCards
             )
         }
         return Result.success(cards)
@@ -1286,6 +1327,7 @@ class EventExtractor(
     internal fun buildSystemPrompt(
         userPersona: String,
         targetLanguage: String,
-        customRules: String = ""
-    ): String = ExtractionPrompts.buildSystemPrompt(userPersona, targetLanguage, customRules)
+        customRules: String = "",
+        includeLifecycleFields: Boolean = false
+    ): String = ExtractionPrompts.buildSystemPrompt(userPersona, targetLanguage, customRules, includeLifecycleFields)
 }

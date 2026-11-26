@@ -7,8 +7,10 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,9 +22,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,7 +42,9 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarToday
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.MarkEmailRead
 import androidx.compose.material.icons.filled.MarkEmailUnread
 import androidx.compose.material.icons.filled.PictureAsPdf
@@ -46,15 +53,19 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -73,6 +84,8 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -80,9 +93,15 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCardStatus
+import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventDetailItem
 import com.wechatdigest.core.model.EventDetailItemParser
+import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
+import com.wechatdigest.core.model.SourceMessageBubble
+import com.wechatdigest.core.model.SourceMessageParser
+import com.wechatdigest.core.repository.WeChatMessageRepository
 import com.wechatdigest.ui.theme.LocalIsDarkTheme
 import com.wechatdigest.ui.theme.PriorityColors
 import kotlinx.coroutines.Dispatchers
@@ -136,11 +155,21 @@ internal fun EventDetailPane(
     onRequestDelete: () -> Unit,
     isEnrichingSections: Boolean = false,
     onEnrichSections: (Int?) -> Unit = {},
+    isReextracting: Boolean = false,
+    canReextract: Boolean = true,
+    onReextractCard: () -> Unit = {},
+    onQuickEditCard: (String, EventCategory, EventPriority, String?) -> Unit = { _, _, _, _ -> },
+    onLoadContextMessages: suspend () -> Result<WeChatMessageRepository.ContextMessagesResult> = {
+        Result.failure(IllegalStateException("Context loader not configured."))
+    },
     contentStartPadding: Dp = 16.dp,
     onNavigateBack: (() -> Unit)? = null
 ) {
     var showTranslatedMessages by remember(card.id) { mutableStateOf(false) }
     var autoRevealTranslation by remember(card.id) { mutableStateOf(false) }
+    var highlightedBubbleIndex by remember(card.id) { mutableStateOf<Int?>(null) }
+    var showQuickEditDialog by remember(card.id) { mutableStateOf(false) }
+    var showContextDialog by remember(card.id) { mutableStateOf(false) }
 
     LaunchedEffect(card.translatedSourceMessages, isTranslatingMessages) {
         if (autoRevealTranslation && card.translatedSourceMessages.isNotBlank()) {
@@ -152,7 +181,10 @@ internal fun EventDetailPane(
     }
 
     val isShowingTranslation = showTranslatedMessages && card.translatedSourceMessages.isNotBlank()
+    val activeSourceText = if (isShowingTranslation) card.translatedSourceMessages else card.sourceMessages
+    val sourceBubbles = remember(activeSourceText) { SourceMessageParser.parse(activeSourceText) }
     val handleTranslationAction: () -> Unit = {
+        highlightedBubbleIndex = null
         if (card.translatedSourceMessages.isNotBlank()) {
             showTranslatedMessages = !showTranslatedMessages
         } else {
@@ -180,6 +212,10 @@ internal fun EventDetailPane(
                 onNavigateBack = onNavigateBack,
                 isTranslatingMessages = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
+                isReextracting = isReextracting,
+                canReextract = canReextract,
+                onQuickEdit = { showQuickEditDialog = true },
+                onReextract = onReextractCard,
                 onAddToCalendar = onAddToCalendar,
                 onTranslateAction = handleTranslationAction,
                 onRequestDelete = onRequestDelete,
@@ -194,6 +230,19 @@ internal fun EventDetailPane(
                 isShowingTranslation = isShowingTranslation,
                 isRecheckingAttachments = isRecheckingAttachments,
                 isEnrichingSections = isEnrichingSections,
+                sourceBubbles = sourceBubbles,
+                highlightedBubbleIndex = highlightedBubbleIndex,
+                onDetailItemClick = { item ->
+                    val matched = SourceMessageParser.findMatchingBubbleIndex(
+                        bubbles = sourceBubbles,
+                        queryText = "${item.label} ${item.value}"
+                    )
+                    if (matched != null) {
+                        highlightedBubbleIndex = if (highlightedBubbleIndex == matched) null else matched
+                    }
+                },
+                onClearHighlight = { highlightedBubbleIndex = null },
+                onShowContextDialog = { showContextDialog = true },
                 onTranslateAction = handleTranslationAction,
                 onEnrichSections = onEnrichSections,
                 onOpenAttachment = onOpenAttachment,
@@ -215,6 +264,26 @@ internal fun EventDetailPane(
             )
         }
     }
+
+    if (showQuickEditDialog) {
+        key(card.id) {
+            QuickEditCardDialog(
+                card = card,
+                onSave = { title, category, priority, eventDate ->
+                    onQuickEditCard(title, category, priority, eventDate)
+                    showQuickEditDialog = false
+                },
+                onDismiss = { showQuickEditDialog = false }
+            )
+        }
+    }
+    if (showContextDialog) {
+        ContextMessagesDialog(
+            card = card,
+            onLoadContextMessages = onLoadContextMessages,
+            onDismiss = { showContextDialog = false }
+        )
+    }
 }
 
 @Composable
@@ -225,6 +294,10 @@ private fun EventDetailTopBar(
     onNavigateBack: (() -> Unit)?,
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
+    isReextracting: Boolean,
+    canReextract: Boolean,
+    onQuickEdit: () -> Unit,
+    onReextract: () -> Unit,
     onAddToCalendar: () -> Unit,
     onTranslateAction: () -> Unit,
     onRequestDelete: () -> Unit,
@@ -253,6 +326,21 @@ private fun EventDetailTopBar(
                 }
             }
             Spacer(Modifier.weight(1f))
+            TopBarTonalIconButton(onClick = onQuickEdit) {
+                Icon(Icons.Default.Edit, contentDescription = "Quick edit notice", modifier = Modifier.size(20.dp))
+            }
+            if (card.sourceMessages.isNotBlank()) {
+                TopBarTonalIconButton(
+                    onClick = onReextract,
+                    enabled = canReextract && !isReextracting
+                ) {
+                    if (isReextracting) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = "Re-extract notice", modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
             if (!card.eventDate.isNullOrBlank()) {
                 TopBarTonalIconButton(onClick = onAddToCalendar) {
                     Icon(Icons.Default.CalendarToday, contentDescription = "Add to Calendar", modifier = Modifier.size(20.dp))
@@ -356,6 +444,11 @@ private fun EventDetailScrollContent(
     isShowingTranslation: Boolean,
     isRecheckingAttachments: Boolean,
     isEnrichingSections: Boolean,
+    sourceBubbles: List<SourceMessageBubble>,
+    highlightedBubbleIndex: Int?,
+    onDetailItemClick: (EventDetailItem) -> Unit,
+    onClearHighlight: () -> Unit,
+    onShowContextDialog: () -> Unit,
     onTranslateAction: () -> Unit,
     onEnrichSections: (Int?) -> Unit,
     onOpenAttachment: (EventAttachment) -> Unit,
@@ -367,6 +460,14 @@ private fun EventDetailScrollContent(
     val isDark = LocalIsDarkTheme.current
     val priorityColor = PriorityColors.getColor(card.priority, isDark)
     val priorityContainer = PriorityColors.getContainerColor(card.priority, isDark)
+    var sourceBoxTopPx by remember(card.id) { mutableStateOf(0) }
+    val hasSourceMessages = card.sourceMessages.isNotBlank()
+
+    LaunchedEffect(highlightedBubbleIndex) {
+        if (highlightedBubbleIndex != null && sourceBoxTopPx > 0) {
+            scrollState.animateScrollTo(sourceBoxTopPx)
+        }
+    }
 
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(start = contentStartPadding, top = 8.dp, end = 16.dp, bottom = 84.dp)
@@ -387,7 +488,9 @@ private fun EventDetailScrollContent(
                     EventDetailSectionCard(
                         section = section,
                         isEnrichingSections = isEnrichingSections,
-                        onEnrichSections = { onEnrichSections(idx) }
+                        onEnrichSections = { onEnrichSections(idx) },
+                        enableDetailItemClick = hasSourceMessages,
+                        onDetailItemClick = onDetailItemClick
                     )
                 }
             }
@@ -396,9 +499,19 @@ private fun EventDetailScrollContent(
             Spacer(Modifier.height(12.dp))
             AttachmentsSection(card.attachments, isRecheckingAttachments, onOpenAttachment, onRevealAttachmentInFinder, onRecheckAttachments)
         }
-        if (card.sourceMessages.isNotBlank()) {
+        if (hasSourceMessages) {
             Spacer(Modifier.height(12.dp))
-            EventDetailSourceMessagesBox(card, isTranslatingMessages, isShowingTranslation, onTranslateAction)
+            Box(modifier = Modifier.fillMaxWidth().onGloballyPositioned { sourceBoxTopPx = it.positionInParent().y.toInt() }) {
+                EventDetailSourceMessagesBox(
+                    bubbles = sourceBubbles,
+                    highlightedBubbleIndex = highlightedBubbleIndex,
+                    isTranslatingMessages = isTranslatingMessages,
+                    isShowingTranslation = isShowingTranslation,
+                    onClearHighlight = onClearHighlight,
+                    onShowContextDialog = onShowContextDialog,
+                    onTranslateAction = onTranslateAction
+                )
+            }
         }
     }
 }
@@ -416,6 +529,14 @@ private fun EventDetailTitleRow(
             Text(text = card.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Normal, color = MaterialTheme.colorScheme.onSurface)
             Spacer(Modifier.height(8.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (card.status != EventCardStatus.ACTIVE) {
+                    val isCancelled = card.status == EventCardStatus.CANCELLED
+                    DetailBadgeChip(
+                        text = formatStatusLabel(card.status),
+                        containerColor = if (isCancelled) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer,
+                        textColor = if (isCancelled) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
                 DetailBadgeChip(text = formatPriorityLabel(card.priority), containerColor = priorityContainer, textColor = priorityColor)
                 DetailBadgeChip(text = formatCategoryLabel(card.category), containerColor = MaterialTheme.colorScheme.surfaceContainerHigh, textColor = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (!card.eventDate.isNullOrBlank()) {
@@ -509,7 +630,9 @@ private fun EventDetailSenderRow(card: EventCard, roomName: String, priorityColo
 private fun EventDetailSectionCard(
     section: EventSection,
     isEnrichingSections: Boolean,
-    onEnrichSections: () -> Unit
+    onEnrichSections: () -> Unit,
+    enableDetailItemClick: Boolean,
+    onDetailItemClick: (EventDetailItem) -> Unit
 ) {
     val resolved = remember(section) { EventDetailItemParser.resolveSectionDisplay(section) }
     val safeHeading = remember(section.heading) {
@@ -577,7 +700,9 @@ private fun EventDetailSectionCard(
                 resolved.items.forEachIndexed { index, item ->
                     DetailMetadataRow(
                         item = item,
-                        shape = segmentedItemShape(index = index, totalCount = resolved.items.size)
+                        shape = segmentedItemShape(index = index, totalCount = resolved.items.size),
+                        enabled = enableDetailItemClick,
+                        onClick = { onDetailItemClick(item) }
                     )
                 }
             }
@@ -600,7 +725,9 @@ private fun EventDetailSectionCard(
 @Composable
 private fun DetailMetadataRow(
     item: EventDetailItem,
-    shape: RoundedCornerShape
+    shape: RoundedCornerShape,
+    enabled: Boolean,
+    onClick: () -> Unit
 ) {
     val visuals = detailItemVisuals(item)
     val labelText = item.label.ifBlank { EventDetailItemParser.defaultLabel(item.kind) }
@@ -608,6 +735,8 @@ private fun DetailMetadataRow(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(shape)
+            .let { mod -> if (enabled) mod.clickable(onClick = onClick) else mod }
             .semantics(mergeDescendants = true) {},
         shape = shape,
         color = MaterialTheme.colorScheme.surfaceContainerLowest
@@ -681,12 +810,14 @@ internal fun Modifier.shimmerOverlay(enabled: Boolean, highlightColor: Color): M
 
 @Composable
 private fun EventDetailSourceMessagesBox(
-    card: EventCard,
+    bubbles: List<SourceMessageBubble>,
+    highlightedBubbleIndex: Int?,
     isTranslatingMessages: Boolean,
     isShowingTranslation: Boolean,
+    onClearHighlight: () -> Unit,
+    onShowContextDialog: () -> Unit,
     onTranslateAction: () -> Unit
 ) {
-    val activeText = if (isShowingTranslation) card.translatedSourceMessages else card.sourceMessages
     val headingText = when {
         isTranslatingMessages -> "Source Messages (Translating…)"
         isShowingTranslation -> "Source Messages (Translated)"
@@ -695,12 +826,12 @@ private fun EventDetailSourceMessagesBox(
     val textColor = if (isTranslatingMessages) {
         MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
     } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
+        MaterialTheme.colorScheme.onSurface
     }
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
@@ -710,6 +841,15 @@ private fun EventDetailSourceMessagesBox(
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.weight(1f)
             )
+            OutlinedButton(
+                onClick = onShowContextDialog,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                modifier = Modifier.height(30.dp)
+            ) {
+                Icon(Icons.Default.Forum, contentDescription = null, modifier = Modifier.size(14.dp))
+                Spacer(Modifier.width(5.dp))
+                Text("±5 Context", style = MaterialTheme.typography.labelSmall)
+            }
             TranslationActionButton(
                 isTranslating = isTranslatingMessages,
                 isShowingTranslation = isShowingTranslation,
@@ -722,17 +862,266 @@ private fun EventDetailSourceMessagesBox(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .background(MaterialTheme.colorScheme.surfaceContainerLowest)
                 .shimmerOverlay(
                     enabled = isTranslatingMessages,
                     highlightColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
-                )
-                .padding(horizontal = 18.dp, vertical = 14.dp)
+                ),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(text = activeText, style = MaterialTheme.typography.bodySmall, color = textColor)
+            bubbles.forEach { bubble ->
+                val isHighlighted = bubble.index == highlightedBubbleIndex
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .let { mod -> if (isHighlighted) mod.clickable(onClick = onClearHighlight) else mod },
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (isHighlighted) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainerLowest
+                    },
+                    border = if (isHighlighted) {
+                        BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+                    } else {
+                        null
+                    }
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (bubble.sender.isNotBlank() || bubble.timestamp.isNotBlank()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (bubble.sender.isNotBlank()) {
+                                    Text(
+                                        text = bubble.sender,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                                if (bubble.isOwner) {
+                                    DetailBadgeChip(
+                                        text = "Owner",
+                                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                        textColor = MaterialTheme.colorScheme.onSecondaryContainer
+                                    )
+                                }
+                                Spacer(Modifier.weight(1f))
+                                if (bubble.timestamp.isNotBlank()) {
+                                    Text(
+                                        text = bubble.timestamp,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            text = bubble.body,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = textColor
+                        )
+                    }
+                }
+            }
         }
     }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun QuickEditCardDialog(
+    card: EventCard,
+    onSave: (title: String, category: EventCategory, priority: EventPriority, eventDate: String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var title by remember { mutableStateOf(card.title) }
+    var category by remember { mutableStateOf(card.category) }
+    var priority by remember { mutableStateOf(card.priority) }
+    var eventDate by remember { mutableStateOf(card.eventDate.orEmpty()) }
+    val dateError = remember(eventDate) { validateQuickEditIsoDate(eventDate) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Quick Edit Notice") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Title") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = eventDate,
+                    onValueChange = { eventDate = it },
+                    label = { Text("Event Date (YYYY-MM-DD or empty)") },
+                    isError = dateError != null,
+                    supportingText = dateError?.let { err -> { Text(err) } },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("Priority", style = MaterialTheme.typography.labelMedium)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    EventPriority.entries.forEach { p ->
+                        FilterChip(
+                            selected = priority == p,
+                            onClick = { priority = p },
+                            label = { Text(formatPriorityLabel(p)) }
+                        )
+                    }
+                }
+                Text("Category", style = MaterialTheme.typography.labelMedium)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    EventCategory.entries.forEach { c ->
+                        FilterChip(
+                            selected = category == c,
+                            onClick = { category = c },
+                            label = { Text(formatCategoryLabel(c)) }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = title.isNotBlank() && dateError == null,
+                onClick = { onSave(title, category, priority, eventDate.takeIf { it.isNotBlank() }) }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            OutlinedButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+internal fun validateQuickEditIsoDate(rawDate: String?): String? {
+    val trimmed = rawDate?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    val isDate = runCatching { java.time.LocalDate.parse(trimmed) }.isSuccess
+    if (isDate) return null
+    val normalized = trimmed.replace(' ', 'T')
+    val isDateTime = runCatching {
+        when (normalized.length) {
+            16 -> java.time.LocalDateTime.parse("$normalized:00")
+            else -> java.time.LocalDateTime.parse(normalized)
+        }
+    }.isSuccess
+    return if (isDateTime) null else "Use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
+}
+
+@Composable
+private fun ContextMessagesDialog(
+    card: EventCard,
+    onLoadContextMessages: suspend () -> Result<WeChatMessageRepository.ContextMessagesResult>,
+    onDismiss: () -> Unit
+) {
+    val contextState by produceState<Result<WeChatMessageRepository.ContextMessagesResult>?>(
+        initialValue = null,
+        key1 = card.id
+    ) {
+        value = onLoadContextMessages()
+    }
+    val formatter = remember {
+        DateTimeFormatter.ofPattern("MM-dd HH:mm").withZone(ZoneId.systemDefault())
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Surrounding Chat Context (±5)") },
+        text = {
+            val loaded = contextState
+            when {
+                loaded == null -> {
+                    Box(
+                        modifier = Modifier.fillMaxWidth().height(120.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                }
+                loaded.isFailure -> {
+                    Text(
+                        text = "Unable to load surrounding messages: ${loaded.exceptionOrNull()?.message ?: "Unknown error"}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                else -> {
+                    val result = loaded.getOrThrow()
+                    if (result.messages.isEmpty()) {
+                        Text(
+                            text = "No surrounding messages found in local WeChat history.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 460.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(
+                                items = result.messages,
+                                key = { msg -> "${msg.timestampSeconds}:${msg.localId}:${msg.senderId}:${msg.rawContent.hashCode()}" }
+                            ) { msg ->
+                                val isAnchor = WeChatMessageRepository.contextKey(msg) in result.anchorFingerprints
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (isAnchor) {
+                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainerLow
+                                    },
+                                    border = if (isAnchor) {
+                                        BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                                    } else {
+                                        null
+                                    }
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                            Text(
+                                                text = msg.senderDisplayName.ifBlank { msg.senderId },
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = formatter.format(Instant.ofEpochSecond(msg.timestampSeconds)),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        Text(
+                                            text = msg.textContent.ifBlank { "[Media/Attachment]" },
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            OutlinedButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
 }
 
 @Composable

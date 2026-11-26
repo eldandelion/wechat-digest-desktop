@@ -3,13 +3,22 @@ package com.wechatdigest.storage
 import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
+import com.wechatdigest.core.sanitizer.ContentFingerprint
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.security.MessageDigest
+import java.sql.Connection
 import java.sql.ResultSet
+
+/** Atomic persistence outcome reporting inserted/amended cards and superseded card IDs. */
+data class ApplyCardsResult(
+    val insertedCards: List<EventCard> = emptyList(),
+    val supersededCardIds: List<String> = emptyList()
+)
 
 class EventCardStore(private val db: AppDatabase) {
 
@@ -25,7 +34,7 @@ class EventCardStore(private val db: AppDatabase) {
         return try {
             upsertOrThrow(cards)
         } catch (e: Exception) {
-            System.err.println("[EventCardStore] Error upserting cards: ${e.message}")
+            System.err.println("[EventCardStore] Error upserting cards: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
             0
         }
     }
@@ -34,69 +43,223 @@ class EventCardStore(private val db: AppDatabase) {
      * Inserts [cards] in a single transaction, throwing on database failures so sync callers avoid advancing checkpoints.
      */
     fun upsertOrThrow(cards: List<EventCard>): Int {
-        if (cards.isEmpty()) return 0
+        return applyUpdateOrInsertOrThrow(cards).insertedCards.size
+    }
 
-        val sql = """
+    private data class SupersededTarget(
+        val id: String,
+        val isStarred: Boolean,
+        val isDismissed: Boolean,
+        val originalSenderId: String
+    )
+
+    /**
+     * Atomically inserts new cards and resolves/supersedes matching prior revisions (`ACTIVE` -> `UPDATED`/`CANCELLED`),
+     * inheriting star state on superseded cards when not already starred.
+     *
+     * To guard against spoofed cancellations/amendments by unrelated group members, auto-dismissing an
+     * existing card requires provenance match when both sender IDs are present (or [roomOwnerId] authority).
+     */
+    fun applyUpdateOrInsert(cards: List<EventCard>, roomOwnerId: String = ""): ApplyCardsResult {
+        return try {
+            applyUpdateOrInsertOrThrow(cards, roomOwnerId)
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error applying card batch: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            ApplyCardsResult()
+        }
+    }
+
+    /**
+     * Transactional variant of [applyUpdateOrInsert] throwing on database errors.
+     */
+    fun applyUpdateOrInsertOrThrow(cards: List<EventCard>, roomOwnerId: String = ""): ApplyCardsResult {
+        if (cards.isEmpty()) return ApplyCardsResult()
+
+        val insertSql = """
             INSERT OR IGNORE INTO event_cards (
                 id, dedupe_key, title, summary, translated_summary, sections, category, priority,
                 event_date, action_items, original_sender, source_room_id,
                 source_room_name, source_messages, translated_source_messages, attachments,
-                timestamp_seconds, is_read, is_starred, is_dismissed, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                timestamp_seconds, is_read, is_starred, is_dismissed,
+                status, supersedes_card_id, original_sender_id, content_fingerprint, source_local_ids,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """.trimIndent()
+        val dismissSupersededSql = "UPDATE event_cards SET is_dismissed = 1 WHERE id = ? AND is_dismissed = 0"
 
-        var insertedCount = 0
+        val insertedCards = mutableListOf<EventCard>()
+        val supersededIds = mutableListOf<String>()
         db.getConnection().use { conn ->
             conn.autoCommit = false
             try {
-                conn.prepareStatement(sql).use { stmt ->
-                    val now = System.currentTimeMillis() / 1000
-                    for (card in cards) {
-                        val dedupeKey = computeDedupeKey(card)
-                        stmt.setString(1, card.id)
-                        stmt.setString(2, dedupeKey)
-                        stmt.setString(3, card.title)
-                        stmt.setString(4, card.summary)
-                        stmt.setString(5, card.translatedSummary)
-                        stmt.setString(6, json.encodeToString(card.sections))
-                        stmt.setString(7, card.category.name)
-                        stmt.setString(8, card.priority.name)
-                        stmt.setString(9, card.eventDate)
-                        stmt.setString(10, "[]")
-                        stmt.setString(11, card.originalSender)
-                        stmt.setString(12, card.sourceRoomId)
-                        stmt.setString(13, card.sourceRoomName)
-                        stmt.setString(14, card.sourceMessages)
-                        stmt.setString(15, card.translatedSourceMessages)
-                        stmt.setString(16, json.encodeToString(card.attachments))
-                        stmt.setLong(17, card.timestampSeconds)
-                        stmt.setInt(18, if (card.isRead) 1 else 0)
-                        stmt.setInt(19, if (card.isStarred) 1 else 0)
-                        stmt.setInt(20, if (card.isDismissed) 1 else 0)
-                        stmt.setLong(21, now)
+                conn.prepareStatement(insertSql).use { insertStmt ->
+                    conn.prepareStatement(dismissSupersededSql).use { dismissStmt ->
+                        val now = System.currentTimeMillis() / 1000
+                        for (card in cards) {
+                            val isLifecycleAmendment = card.status != EventCardStatus.ACTIVE
+                            val supersededMatch = if (isLifecycleAmendment) {
+                                resolveSupersededTarget(conn, card.supersedesCardId, card.sourceRoomId)
+                            } else {
+                                null
+                            }
+                            val canAutoDismissSuperseded = supersededMatch != null && isAuthorizedToSupersede(
+                                incomingSenderId = card.originalSenderId,
+                                targetSenderId = supersededMatch.originalSenderId,
+                                roomOwnerId = roomOwnerId
+                            )
+                            val resolvedSupersedesId = supersededMatch?.id?.takeIf { canAutoDismissSuperseded }
+                            val effectiveStarred = card.isStarred || (canAutoDismissSuperseded && supersededMatch?.isStarred == true)
+                            val resolvedFingerprint = card.contentFingerprint.ifBlank {
+                                ContentFingerprint.compute(card.sourceMessages, card.attachments.map { it.md5 })
+                            }
+                            val resolvedCard = card.copy(
+                                supersedesCardId = resolvedSupersedesId,
+                                isStarred = effectiveStarred,
+                                contentFingerprint = resolvedFingerprint
+                            )
+                            val dedupeKey = computeDedupeKey(resolvedCard)
+                            insertStmt.setString(1, resolvedCard.id)
+                            insertStmt.setString(2, dedupeKey)
+                            insertStmt.setString(3, resolvedCard.title)
+                            insertStmt.setString(4, resolvedCard.summary)
+                            insertStmt.setString(5, resolvedCard.translatedSummary)
+                            insertStmt.setString(6, json.encodeToString(resolvedCard.sections))
+                            insertStmt.setString(7, resolvedCard.category.name)
+                            insertStmt.setString(8, resolvedCard.priority.name)
+                            insertStmt.setString(9, resolvedCard.eventDate)
+                            insertStmt.setString(10, "[]")
+                            insertStmt.setString(11, resolvedCard.originalSender)
+                            insertStmt.setString(12, resolvedCard.sourceRoomId)
+                            insertStmt.setString(13, resolvedCard.sourceRoomName)
+                            insertStmt.setString(14, resolvedCard.sourceMessages)
+                            insertStmt.setString(15, resolvedCard.translatedSourceMessages)
+                            insertStmt.setString(16, json.encodeToString(resolvedCard.attachments))
+                            insertStmt.setLong(17, resolvedCard.timestampSeconds)
+                            insertStmt.setInt(18, if (resolvedCard.isRead) 1 else 0)
+                            insertStmt.setInt(19, if (resolvedCard.isStarred) 1 else 0)
+                            insertStmt.setInt(20, if (resolvedCard.isDismissed) 1 else 0)
+                            insertStmt.setString(21, resolvedCard.status.name)
+                            insertStmt.setString(22, resolvedCard.supersedesCardId)
+                            insertStmt.setString(23, resolvedCard.originalSenderId)
+                            insertStmt.setString(24, resolvedCard.contentFingerprint)
+                            insertStmt.setString(25, json.encodeToString(resolvedCard.sourceLocalIds))
+                            insertStmt.setLong(26, now)
 
-                        if (stmt.executeUpdate() > 0) {
-                            insertedCount++
+                            if (insertStmt.executeUpdate() > 0) {
+                                insertedCards.add(resolvedCard)
+                                if (canAutoDismissSuperseded &&
+                                    supersededMatch?.isDismissed == false &&
+                                    resolvedSupersedesId != null &&
+                                    !resolvedCard.isDismissed
+                                ) {
+                                    dismissStmt.setString(1, resolvedSupersedesId)
+                                    dismissStmt.executeUpdate()
+                                    supersededIds.add(resolvedSupersedesId)
+                                }
+                            }
                         }
                     }
                 }
                 conn.commit()
             } catch (e: Exception) {
-                conn.rollback()
+                runCatching { conn.rollback() }.onFailure { rollbackErr -> e.addSuppressed(rollbackErr) }
                 throw e
             } finally {
-                conn.autoCommit = true
+                runCatching { conn.autoCommit = true }
             }
         }
-        return insertedCount
+        return ApplyCardsResult(
+            insertedCards = insertedCards.toList(),
+            supersededCardIds = supersededIds.distinct()
+        )
+    }
+
+    private fun isAuthorizedToSupersede(
+        incomingSenderId: String,
+        targetSenderId: String,
+        roomOwnerId: String
+    ): Boolean {
+        val cleanIncoming = incomingSenderId.trim()
+        val cleanTarget = targetSenderId.trim()
+        val cleanOwner = roomOwnerId.trim()
+        if (cleanIncoming.isNotBlank() && cleanOwner.isNotBlank() && cleanIncoming == cleanOwner) return true
+        if (cleanTarget.isBlank()) return true
+        if (cleanIncoming.isBlank()) return false
+        return cleanIncoming == cleanTarget
+    }
+
+    private fun resolveSupersededTarget(
+        conn: Connection,
+        rawRef: String?,
+        roomId: String
+    ): SupersededTarget? {
+        if (roomId.isBlank()) return null
+        val cleaned = rawRef
+            ?.trim()
+            ?.removePrefix("[")
+            ?.removeSuffix("]")
+            ?.substringBefore("|")
+            ?.trim()
+            ?.let { token -> if (token.startsWith("card:", ignoreCase = true)) token.substring(5).trim() else token }
+            ?.take(64)
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+
+        // Query across both active and already-superseded targets so re-applying the same amended card keeps dedupe_key identical.
+        val exactSql = "SELECT id, is_starred, is_dismissed, original_sender_id FROM event_cards WHERE id = ? AND source_room_id = ? LIMIT 1"
+        conn.prepareStatement(exactSql).use { stmt ->
+            stmt.setString(1, cleaned)
+            stmt.setString(2, roomId)
+            stmt.executeQuery().use { rs ->
+                if (rs.next()) {
+                    return SupersededTarget(
+                        id = rs.getString("id"),
+                        isStarred = rs.getInt("is_starred") == 1,
+                        isDismissed = rs.getInt("is_dismissed") == 1,
+                        originalSenderId = rs.getString("original_sender_id") ?: ""
+                    )
+                }
+            }
+        }
+        if (cleaned.length < 6) return null
+        val escapedPrefix = cleaned
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        val activePrefixSql = "SELECT id, is_starred, is_dismissed, original_sender_id FROM event_cards WHERE source_room_id = ? AND is_dismissed = 0 AND id LIKE ? ESCAPE '\\' LIMIT 2"
+        findUniquePrefixMatch(conn, activePrefixSql, roomId, "$escapedPrefix%")?.let { return it }
+
+        val anyPrefixSql = "SELECT id, is_starred, is_dismissed, original_sender_id FROM event_cards WHERE source_room_id = ? AND id LIKE ? ESCAPE '\\' LIMIT 2"
+        return findUniquePrefixMatch(conn, anyPrefixSql, roomId, "$escapedPrefix%")
+    }
+
+    private fun findUniquePrefixMatch(
+        conn: Connection,
+        sql: String,
+        roomId: String,
+        likePattern: String
+    ): SupersededTarget? {
+        conn.prepareStatement(sql).use { stmt ->
+            stmt.setString(1, roomId)
+            stmt.setString(2, likePattern)
+            stmt.executeQuery().use { rs ->
+                if (!rs.next()) return null
+                val first = SupersededTarget(
+                    id = rs.getString("id"),
+                    isStarred = rs.getInt("is_starred") == 1,
+                    isDismissed = rs.getInt("is_dismissed") == 1,
+                    originalSenderId = rs.getString("original_sender_id") ?: ""
+                )
+                // Fail closed when short ID prefix is ambiguous across multiple cards
+                if (rs.next()) return null
+                return first
+            }
+        }
     }
 
     fun listActive(): List<EventCard> {
         val sql = """
-            SELECT id, title, summary, translated_summary, sections, category, priority,
-                   event_date, original_sender, source_room_id,
-                   source_room_name, source_messages, translated_source_messages, attachments,
-                   timestamp_seconds, is_read, is_starred, is_dismissed
+            SELECT $CARD_SELECT_COLUMNS
             FROM event_cards
             WHERE is_dismissed = 0
             ORDER BY timestamp_seconds DESC,
@@ -122,7 +285,7 @@ class EventCardStore(private val db: AppDatabase) {
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[EventCardStore] Error listing active cards: ${e.message}")
+            System.err.println("[EventCardStore] Error listing active cards: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
         return results
     }
@@ -130,10 +293,7 @@ class EventCardStore(private val db: AppDatabase) {
     fun listRecentByRoom(roomId: String, limit: Int = 10): List<EventCard> {
         if (roomId.isBlank() || limit <= 0) return emptyList()
         val sql = """
-            SELECT id, title, summary, translated_summary, sections, category, priority,
-                   event_date, original_sender, source_room_id,
-                   source_room_name, source_messages, translated_source_messages, attachments,
-                   timestamp_seconds, is_read, is_starred, is_dismissed
+            SELECT $CARD_SELECT_COLUMNS
             FROM event_cards
             WHERE is_dismissed = 0 AND source_room_id = ?
             ORDER BY timestamp_seconds DESC,
@@ -160,6 +320,50 @@ class EventCardStore(private val db: AppDatabase) {
         return results
     }
 
+    /** Returns normalized SHA-256 content fingerprints for all active non-cancelled cards across rooms. */
+    fun listActiveFingerprints(): Set<String> {
+        val sql = "SELECT DISTINCT content_fingerprint FROM event_cards WHERE is_dismissed = 0 AND status != 'CANCELLED' AND content_fingerprint != ''"
+        val results = HashSet<String>()
+        try {
+            db.getConnection().use { conn ->
+                conn.createStatement().use { stmt ->
+                    stmt.executeQuery(sql).use { rs ->
+                        while (rs.next()) {
+                            val fp = rs.getString("content_fingerprint")?.trim()
+                            if (!fp.isNullOrBlank()) results.add(fp)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error listing active fingerprints: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+        return results
+    }
+
+    /** Finds a card by its exact [id], returning null if absent. */
+    fun findById(id: String): EventCard? {
+        if (id.isBlank()) return null
+        val sql = "SELECT $CARD_SELECT_COLUMNS FROM event_cards WHERE id = ? LIMIT 1"
+        return try {
+            db.getConnection().use { conn ->
+                findByIdWithConn(conn, id, sql)
+            }
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error finding card ${LlmJsonUtils.sanitizeLogMessage(id)}: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            null
+        }
+    }
+
+    private fun findByIdWithConn(conn: Connection, id: String, sql: String = "SELECT $CARD_SELECT_COLUMNS FROM event_cards WHERE id = ? LIMIT 1"): EventCard? {
+        conn.prepareStatement(sql).use { stmt ->
+            stmt.setString(1, id)
+            stmt.executeQuery().use { rs ->
+                return if (rs.next()) mapRowToEventCard(rs) else null
+            }
+        }
+    }
+
     private fun mapRowToEventCard(rs: ResultSet): EventCard {
         val rawSections = rs.getString("sections")
         val decodedSections = if (rawSections.isNullOrBlank()) {
@@ -172,6 +376,12 @@ class EventCardStore(private val db: AppDatabase) {
             emptyList()
         } else {
             runCatching { json.decodeFromString<List<EventAttachment>>(rawAttachments) }.getOrDefault(emptyList())
+        }
+        val rawLocalIds = rs.getString("source_local_ids")
+        val decodedLocalIds = if (rawLocalIds.isNullOrBlank()) {
+            emptyList()
+        } else {
+            runCatching { json.decodeFromString<List<Long>>(rawLocalIds) }.getOrDefault(emptyList())
         }
         return EventCard(
             id = rs.getString("id"),
@@ -191,8 +401,73 @@ class EventCardStore(private val db: AppDatabase) {
             timestampSeconds = rs.getLong("timestamp_seconds"),
             isRead = rs.getInt("is_read") == 1,
             isStarred = rs.getInt("is_starred") == 1,
-            isDismissed = rs.getInt("is_dismissed") == 1
+            isDismissed = rs.getInt("is_dismissed") == 1,
+            status = EventCardStatus.fromString(rs.getString("status")),
+            supersedesCardId = rs.getString("supersedes_card_id")?.takeIf { it.isNotBlank() },
+            originalSenderId = rs.getString("original_sender_id") ?: "",
+            contentFingerprint = rs.getString("content_fingerprint") ?: "",
+            sourceLocalIds = decodedLocalIds
         )
+    }
+
+    /** Updates Quick-Edit fields for card [id] while preserving read/star/source attribution state. */
+    fun updateCardFieldsOrThrow(
+        id: String,
+        title: String,
+        category: EventCategory,
+        priority: EventPriority,
+        eventDate: String?
+    ): EventCard? {
+        val sql = "UPDATE event_cards SET title = ?, category = ?, priority = ?, event_date = ? WHERE id = ? AND is_dismissed = 0"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                stmt.setString(1, title)
+                stmt.setString(2, category.name)
+                stmt.setString(3, priority.name)
+                stmt.setString(4, eventDate)
+                stmt.setString(5, id)
+                if (stmt.executeUpdate() == 0) return null
+            }
+            return findByIdWithConn(conn, id)
+        }
+    }
+
+    /** Replaces extracted fields on an existing card after single-card re-extraction while keeping ID and read/star state. */
+    fun replaceExtractedCardOrThrow(existingId: String, replacement: EventCard): EventCard? {
+        val sql = """
+            UPDATE event_cards
+            SET title = ?,
+                summary = ?,
+                translated_summary = ?,
+                sections = ?,
+                category = ?,
+                priority = ?,
+                event_date = ?,
+                status = ?,
+                supersedes_card_id = ?,
+                content_fingerprint = ?
+            WHERE id = ? AND is_dismissed = 0
+        """.trimIndent()
+        val resolvedFp = replacement.contentFingerprint.ifBlank {
+            ContentFingerprint.compute(replacement.sourceMessages, replacement.attachments.map { it.md5 })
+        }
+        db.getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                stmt.setString(1, replacement.title)
+                stmt.setString(2, replacement.summary)
+                stmt.setString(3, replacement.translatedSummary)
+                stmt.setString(4, json.encodeToString(replacement.sections))
+                stmt.setString(5, replacement.category.name)
+                stmt.setString(6, replacement.priority.name)
+                stmt.setString(7, replacement.eventDate)
+                stmt.setString(8, replacement.status.name)
+                stmt.setString(9, replacement.supersedesCardId)
+                stmt.setString(10, resolvedFp)
+                stmt.setString(11, existingId)
+                if (stmt.executeUpdate() == 0) return null
+            }
+            return findByIdWithConn(conn, existingId)
+        }
     }
 
     fun markRead(id: String) {
@@ -318,13 +593,28 @@ class EventCardStore(private val db: AppDatabase) {
     }
 
     private fun computeDedupeKey(card: EventCard): String {
-        val raw = if (card.sourceMessages.isNotBlank()) {
+        val base = if (card.sourceMessages.isNotBlank()) {
             val normalizedSource = card.sourceMessages.trim().replace(Regex("\\s+"), " ")
             "${card.sourceRoomId}:src:$normalizedSource"
         } else {
             "${card.sourceRoomId}:${card.title}:${card.eventDate.orEmpty()}"
         }
+        val raw = if (card.status != EventCardStatus.ACTIVE) {
+            "$base:${card.status.name}:${card.supersedesCardId.orEmpty()}"
+        } else {
+            base
+        }
         val md = MessageDigest.getInstance("SHA-1")
         return md.digest(raw.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    private companion object {
+        const val CARD_SELECT_COLUMNS = """
+            id, title, summary, translated_summary, sections, category, priority,
+            event_date, original_sender, source_room_id,
+            source_room_name, source_messages, translated_source_messages, attachments,
+            timestamp_seconds, is_read, is_starred, is_dismissed,
+            status, supersedes_card_id, original_sender_id, content_fingerprint, source_local_ids
+        """
     }
 }

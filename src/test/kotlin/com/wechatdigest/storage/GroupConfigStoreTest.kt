@@ -31,12 +31,13 @@ class GroupConfigStoreTest {
     }
 
     @Test
-    fun `save and get round-trips GroupConfig including allowedSenderIds`() {
+    fun `save and get round-trips GroupConfig including allowedSenderIds and mutedSenderIds`() {
         val config = GroupConfig(
             roomId = "10000000001@chatroom",
             customPrompt = "Focus only on Master thesis deadlines. Ignore Bachelor notices.",
             customPersona = "Graduate Student in Computer Science",
             allowedSenderIds = listOf("wxid_teacher1", "wxid_teacher2", "wxid_teacher1", " "),
+            mutedSenderIds = listOf("wxid_spammer", " wxid_spammer ", ""),
             updatedAt = 1731000000L
         )
 
@@ -48,6 +49,7 @@ class GroupConfigStoreTest {
         assertEquals(config.customPrompt, loaded.customPrompt)
         assertEquals(config.customPersona, loaded.customPersona)
         assertEquals(listOf("wxid_teacher1", "wxid_teacher2"), loaded.allowedSenderIds)
+        assertEquals(listOf("wxid_spammer"), loaded.mutedSenderIds)
         assertEquals(config.updatedAt, loaded.updatedAt)
     }
 

@@ -4,8 +4,10 @@ import com.wechatdigest.core.attachment.AttachmentLauncher
 import com.wechatdigest.core.attachment.WeChatAttachmentResolver
 import com.wechatdigest.core.calendar.CalendarLauncher
 import com.wechatdigest.core.db.WeChatDatabaseDriver
+import com.wechatdigest.core.db.WeChatSessionContext
 import com.wechatdigest.core.detector.DiscoveredPath
 import com.wechatdigest.core.detector.WeChatPathDetector
+import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmConfig
@@ -31,13 +33,20 @@ import com.wechatdigest.core.llm.local.ManagedLocalLlmClient
 import com.wechatdigest.core.llm.local.SystemHardwareInfo
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventDetailItemParser
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.GroupChat
 import com.wechatdigest.core.model.GroupConfig
+import com.wechatdigest.core.model.SourceMessageParser
 import com.wechatdigest.core.model.SyncCheckpoint
+import com.wechatdigest.core.model.WeChatMessage
 import com.wechatdigest.core.notification.NotificationDispatcher
 import com.wechatdigest.core.repository.WeChatContactRepository
+import com.wechatdigest.core.repository.WeChatMessageRepository
+import com.wechatdigest.core.sanitizer.MessageSanitizer
+import com.wechatdigest.core.sanitizer.PrefilterMatchType
+import com.wechatdigest.core.sanitizer.PrefilterRule
 import com.wechatdigest.storage.EventCardStore
 import com.wechatdigest.storage.GroupConfigStore
 import com.wechatdigest.storage.SettingsStore
@@ -250,9 +259,16 @@ class AppState(
     /** Card IDs currently converting unstructured bullet sections into structured cards via Pass 4 LLM. */
     val enrichingCardIds: StateFlow<Set<String>> = _enrichingCardIds.asStateFlow()
 
+    private val _reextractingCardIds = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Card IDs currently running single-card LLM re-extraction. */
+    val reextractingCardIds: StateFlow<Set<String>> = _reextractingCardIds.asStateFlow()
+
     private val enrichmentJobs = ConcurrentHashMap<String, Job>()
+    private val reextractJobs = ConcurrentHashMap<String, Job>()
 
     private val settingsMutex = Mutex()
+    private val groupConfigMutex = Mutex()
     private val syncExecutionMutex = Mutex()
     private val eventsDbMutex = Mutex()
     private val eventsMutationEpoch = AtomicLong(0L)
@@ -450,8 +466,10 @@ class AppState(
 
     fun loadGroupConfigs(): Job = scope.launch {
         if (groupConfigStore != null) {
-            val configs = withContext(Dispatchers.IO) {
-                groupConfigStore.getAll()
+            val configs = groupConfigMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    groupConfigStore.getAll()
+                }
             }
             _groupConfigs.value = configs
         }
@@ -459,11 +477,13 @@ class AppState(
 
     fun saveGroupConfig(config: GroupConfig): Job = scope.launch {
         if (groupConfigStore != null) {
-            withContext(Dispatchers.IO) {
-                groupConfigStore.save(config)
-                groupConfigStore.getAll()
-            }.also {
-                _groupConfigs.value = it
+            groupConfigMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    groupConfigStore.save(config)
+                    groupConfigStore.getAll()
+                }.also {
+                    _groupConfigs.value = it
+                }
             }
             _snackbarMessage.emit("Saved rules for room.")
         }
@@ -471,11 +491,13 @@ class AppState(
 
     fun deleteGroupConfig(roomId: String): Job = scope.launch {
         if (groupConfigStore != null) {
-            withContext(Dispatchers.IO) {
-                groupConfigStore.delete(roomId)
-                groupConfigStore.getAll()
-            }.also {
-                _groupConfigs.value = it
+            groupConfigMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    groupConfigStore.delete(roomId)
+                    groupConfigStore.getAll()
+                }.also {
+                    _groupConfigs.value = it
+                }
             }
             _snackbarMessage.emit("Removed rules for room.")
         }
@@ -824,8 +846,10 @@ class AppState(
     }
 
     internal fun mergeStreamedCard(existing: List<EventCard>, incoming: EventCard): List<EventCard> {
-        val withoutDup = existing.filterNot { it.id == incoming.id }
-        return (withoutDup + incoming).sortedWith(
+        val withoutDupOrSuperseded = existing.filterNot { card ->
+            card.id == incoming.id || (incoming.supersedesCardId != null && card.id == incoming.supersedesCardId)
+        }
+        return (withoutDupOrSuperseded + incoming).sortedWith(
             compareByDescending<EventCard> { it.timestampSeconds }
                 .thenBy { it.priority.ordinal }
         )
@@ -960,10 +984,11 @@ class AppState(
      * persists the updated sections to SQLite.
      */
     fun enrichSectionCards(cardId: String, targetSectionIndex: Int? = null): Job {
+        val previous = _enrichingCardIds.getAndUpdate { it + cardId }
+        if (cardId in previous) return Job().apply { complete() }
+
         lateinit var launchedJob: Job
         launchedJob = scope.launch {
-            val previous = _enrichingCardIds.getAndUpdate { it + cardId }
-            if (cardId in previous) return@launch
             try {
                 val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
                 if (card.sections.isEmpty()) return@launch
@@ -1009,15 +1034,299 @@ class AppState(
             }
         }
         enrichmentJobs[cardId] = launchedJob
-        launchedJob.invokeOnCompletion { enrichmentJobs.remove(cardId, launchedJob) }
+        launchedJob.invokeOnCompletion {
+            enrichmentJobs.remove(cardId, launchedJob)
+            _enrichingCardIds.update { it - cardId }
+        }
         return launchedJob
     }
 
-    private fun cancelEnrichmentJobs() {
+    private suspend fun cancelEnrichmentJobs() {
         val jobs = enrichmentJobs.values.toList()
         enrichmentJobs.clear()
-        jobs.forEach { it.cancel() }
+        jobs.forEach { it.cancelAndJoin() }
         _enrichingCardIds.value = emptySet()
+
+        val rxJobs = reextractJobs.values.toList()
+        reextractJobs.clear()
+        rxJobs.forEach { it.cancelAndJoin() }
+        _reextractingCardIds.value = emptySet()
+    }
+
+    /** Validated ISO-8601 date (`YYYY-MM-DD` or `YYYY-MM-DDTHH:MM(:SS)`) check for quick-edit inputs. */
+    internal fun validateQuickEditDate(rawDate: String?): String? {
+        val trimmed = rawDate?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val isIsoDate = runCatching { java.time.LocalDate.parse(trimmed) }.isSuccess
+        if (isIsoDate) return null
+        val normalized = trimmed.replace(' ', 'T')
+        val isIsoDateTime = runCatching {
+            when (normalized.length) {
+                16 -> java.time.LocalDateTime.parse("$normalized:00")
+                else -> java.time.LocalDateTime.parse(normalized)
+            }
+        }.isSuccess
+        return if (isIsoDateTime) null else "Use YYYY-MM-DD or YYYY-MM-DDTHH:MM format (or leave blank)."
+    }
+
+    /**
+     * Updates user-edited summary header fields ([title], [category], [priority], [eventDate]) for [cardId]
+     * in SQLite and live state while preserving read/star/source attribution state.
+     */
+    fun quickEditCard(
+        cardId: String,
+        title: String,
+        category: EventCategory,
+        priority: EventPriority,
+        eventDate: String?
+    ): Job = scope.launch {
+        val cleanTitle = EventDetailItemParser.sanitizeSingleLine(title, EventDetailItemParser.MAX_CARD_TITLE_CHARS)
+        if (cleanTitle.isBlank()) {
+            _snackbarMessage.emit("Title cannot be empty.")
+            return@launch
+        }
+        val cleanDate = eventDate?.trim()?.takeIf { it.isNotBlank() }
+        validateQuickEditDate(cleanDate)?.let { errMsg ->
+            _snackbarMessage.emit(errMsg)
+            return@launch
+        }
+        try {
+            val updated = eventsDbMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    eventCardStore.updateCardFieldsOrThrow(cardId, cleanTitle, category, priority, cleanDate)
+                }?.also { persisted ->
+                    eventsMutationEpoch.incrementAndGet()
+                    _events.update { list -> list.map { if (it.id == cardId) persisted else it } }
+                }
+            }
+            if (updated != null) {
+                _snackbarMessage.emit("Updated '${updated.title}'.")
+            } else {
+                _snackbarMessage.emit("Card is no longer available to edit.")
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Failed to save card edits: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
+    /**
+     * Re-runs extraction on a single [cardId] using its stored source messages (or DB anchors),
+     * replacing its title/summary/sections/category/priority while preserving read/star flags.
+     */
+    fun reextractCard(cardId: String): Job {
+        val currentSettings = _settings.value
+        if (_isSyncing.value && EventExtractor.resolveConcurrencyForConfig(currentSettings.llm) == 1) {
+            return scope.launch {
+                _snackbarMessage.emit("Wait for active local sync to finish before re-extracting.")
+            }
+        }
+        val previous = _reextractingCardIds.getAndUpdate { it + cardId }
+        if (cardId in previous) return Job().apply { complete() }
+
+        lateinit var launchedJob: Job
+        launchedJob = scope.launch {
+            try {
+                val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
+                val messages = withContext(Dispatchers.IO) { resolveMessagesForReextraction(card) }
+                if (messages.isEmpty()) {
+                    _snackbarMessage.emit("No source messages available to re-extract.")
+                    return@launch
+                }
+                val groupConfig = withContext(Dispatchers.IO) { groupConfigStore?.get(card.sourceRoomId) }
+                val effectivePersona = groupConfig?.customPersona?.takeIf { it.isNotBlank() } ?: currentSettings.userPersona
+                val effectiveRules = groupConfig?.customPrompt.orEmpty()
+
+                val extractedResult = withContext(Dispatchers.IO) {
+                    createLlmClient(currentSettings.llm).use { client ->
+                        EventExtractor(llmClient = client, maxConcurrency = 1, enableFastPath = true).extractEventsResult(
+                            messages = messages,
+                            roomId = card.sourceRoomId,
+                            userPersona = effectivePersona,
+                            targetLanguage = currentSettings.targetLanguage,
+                            customRules = effectiveRules,
+                            roomDisplayName = card.sourceRoomName
+                        )
+                    }
+                }
+                val extractedCards = extractedResult.getOrElse { err ->
+                    _snackbarMessage.emit("Re-extraction failed: ${LlmJsonUtils.sanitizeLogMessage(err.message)}")
+                    return@launch
+                }
+                val rawCandidate = extractedCards.firstOrNull()
+                if (rawCandidate == null) {
+                    _snackbarMessage.emit("Re-extraction found no actionable announcement changes.")
+                    return@launch
+                }
+                // Preserve prior lifecycle status & amendment link during single-card re-extract
+                val candidate = rawCandidate.copy(
+                    status = card.status,
+                    supersedesCardId = card.supersedesCardId
+                )
+
+                val saved = eventsDbMutex.withLock {
+                    withContext(Dispatchers.IO) {
+                        eventCardStore.replaceExtractedCardOrThrow(card.id, candidate)
+                    }?.also { persisted ->
+                        eventsMutationEpoch.incrementAndGet()
+                        _events.update { list -> list.map { if (it.id == cardId) persisted else it } }
+                    }
+                }
+                if (saved != null) {
+                    _snackbarMessage.emit("Re-extracted '${saved.title}'.")
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _snackbarMessage.emit("Re-extraction failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+            } finally {
+                _reextractingCardIds.update { it - cardId }
+            }
+        }
+        reextractJobs[cardId] = launchedJob
+        launchedJob.invokeOnCompletion {
+            reextractJobs.remove(cardId, launchedJob)
+            _reextractingCardIds.update { it - cardId }
+        }
+        return launchedJob
+    }
+
+    private fun resolveMessagesForReextraction(card: EventCard): List<WeChatMessage> {
+        val dbMessages = try {
+            val driver = resolveDriverFromSettings()
+            if (driver == null) {
+                emptyList()
+            } else {
+                WeChatSessionContext(driver).use { session ->
+                    val contactRepo = WeChatContactRepository(driver, sessionContext = session)
+                    val attachmentRoot = WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
+                    val attachmentResolver = WeChatAttachmentResolver(driver, explicitAttachmentRootDir = attachmentRoot)
+                    WeChatMessageRepository(driver, contactRepo, attachmentResolver, session)
+                        .findAnchorMessages(card.sourceRoomId, card.sourceLocalIds, card.timestampSeconds)
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (dbMessages.isNotEmpty()) return dbMessages
+
+        val bubbles = SourceMessageParser.parse(card.sourceMessages)
+        return bubbles.mapIndexed { idx, bubble ->
+            val senderLabel = bubble.sender.ifBlank { card.originalSender.ifBlank { "Sender" } }
+            val senderId = card.originalSenderId.ifBlank { senderLabel }
+            WeChatMessage(
+                localId = card.sourceLocalIds.getOrElse(idx) { idx.toLong() + 1L },
+                timestampSeconds = card.timestampSeconds,
+                senderId = senderId,
+                senderDisplayName = senderLabel,
+                rawContent = bubble.body,
+                textContent = bubble.body,
+                isZstdCompressed = false,
+                attachments = if (idx == bubbles.lastIndex) card.attachments else emptyList(),
+                isOwner = bubble.isOwner
+            )
+        }.filter { it.textContent.isNotBlank() || it.attachments.isNotEmpty() }
+    }
+
+    /**
+     * Loads up to [beforeCount] earlier and [afterCount] later messages surrounding [card] directly from
+     * WeChat's SQLite shards on [Dispatchers.IO].
+     */
+    suspend fun loadContextMessages(
+        card: EventCard,
+        beforeCount: Int = 5,
+        afterCount: Int = 5
+    ): Result<WeChatMessageRepository.ContextMessagesResult> {
+        return try {
+            withContext(Dispatchers.IO) {
+                val driver = resolveDriverFromSettings()
+                    ?: return@withContext Result.failure(IllegalStateException("WeChat data directory is not configured or does not exist."))
+                WeChatSessionContext(driver).use { session ->
+                    val contactRepo = WeChatContactRepository(driver, sessionContext = session)
+                    val repo = WeChatMessageRepository(driver, contactRepo, attachmentResolver = null, sessionContext = session)
+                    Result.success(
+                        repo.getContextMessages(
+                            roomId = card.sourceRoomId,
+                            anchorLocalIds = card.sourceLocalIds,
+                            anchorTimestampSeconds = card.timestampSeconds,
+                            beforeCount = beforeCount,
+                            afterCount = afterCount
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            Result.failure(IllegalStateException(LlmJsonUtils.sanitizeLogMessage(e.message)))
+        }
+    }
+
+    /** Dismisses [card] and adds its [EventCard.originalSenderId] to the group's muted sender blocklist. */
+    fun dismissAndMuteSender(card: EventCard): Job = scope.launch {
+        dismiss(card.id).join()
+        val senderId = card.originalSenderId.trim()
+        if (senderId.isBlank() || groupConfigStore == null) {
+            _snackbarMessage.emit("Notice dismissed (sender ID unavailable for muting).")
+            return@launch
+        }
+        try {
+            groupConfigMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    val existing = groupConfigStore.getOrThrow(card.sourceRoomId) ?: GroupConfig(roomId = card.sourceRoomId)
+                    val updated = existing.copy(
+                        mutedSenderIds = (existing.mutedSenderIds + senderId).distinct(),
+                        updatedAt = System.currentTimeMillis() / 1000
+                    )
+                    groupConfigStore.saveOrThrow(updated)
+                    groupConfigStore.getAll()
+                }.also { _groupConfigs.value = it }
+            }
+            _snackbarMessage.emit("Dismissed notice and muted sender in room.")
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Notice dismissed, but failed updating group mute list: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
+    /** Dismisses [card] and appends a validated static [PrefilterRule] so matching noise is dropped pre-LLM. */
+    fun dismissAndAddPrefilterRule(
+        card: EventCard,
+        pattern: String,
+        matchType: PrefilterMatchType = PrefilterMatchType.CONTAINS
+    ): Job = scope.launch {
+        val cleanPattern = pattern.trim()
+        val validationError = MessageSanitizer.validateRulePattern(cleanPattern, matchType)
+        if (validationError != null) {
+            _snackbarMessage.emit(validationError)
+            return@launch
+        }
+        if (_settings.value.prefilter.rules.size >= MAX_PREFILTER_RULES) {
+            _snackbarMessage.emit("Maximum prefilter rules limit ($MAX_PREFILTER_RULES) reached.")
+            return@launch
+        }
+        dismiss(card.id).join()
+        transformSettings { current ->
+            val alreadyExists = current.prefilter.rules.any {
+                it.matchType == matchType && it.pattern.equals(cleanPattern, ignoreCase = true)
+            }
+            if (alreadyExists || current.prefilter.rules.size >= MAX_PREFILTER_RULES) {
+                current
+            } else {
+                val newRule = PrefilterRule(
+                    id = "dismiss-${java.util.UUID.randomUUID().toString().take(8)}",
+                    pattern = cleanPattern,
+                    matchType = matchType,
+                    enabled = true,
+                    label = "Muted from feed"
+                )
+                current.copy(prefilter = current.prefilter.copy(rules = current.prefilter.rules + newRule))
+            }
+        }.join()
+        _snackbarMessage.emit("Dismissed notice and added prefilter rule.")
+    }
+
+    private companion object {
+        const val MAX_PREFILTER_RULES = 200
     }
 
     /**

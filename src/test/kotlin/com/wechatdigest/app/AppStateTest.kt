@@ -771,5 +771,163 @@ class AppStateTest {
 
         appState.close()
     }
+
+    @Test
+    fun `trust loop quickEdit, reextract, loadContextMessages, and dismiss-to-filter flows work end to end`() = runBlocking {
+        val wechatDir = File(tempDir, "trust_wechat").apply { mkdirs() }
+        val room = "trust@chatroom"
+        val table = com.wechatdigest.core.db.WeChatDatabaseDriver.calculateRoomTableName(room)
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(wechatDir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_teacher', 'Prof_Lin', '')")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_stu', 'StudentA', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(wechatDir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                stmt.executeUpdate("INSERT INTO $table VALUES (1, 1794800000, 'wxid_stu', CAST('Hi earlier' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (2, 1794800100, 'wxid_teacher', CAST('Project presentation moved to Room C404 on Dec 18.' AS BLOB))")
+                stmt.executeUpdate("INSERT INTO $table VALUES (3, 1794800200, 'wxid_stu', CAST('Got it thanks!' AS BLOB))")
+            }
+        }
+
+        val card = EventCard(
+            id = "trust-card-1",
+            title = "Presentation",
+            summary = "Old summary",
+            translatedSummary = "Old summary",
+            category = EventCategory.NOTICE,
+            priority = EventPriority.NORMAL,
+            originalSender = "Prof_Lin",
+            originalSenderId = "wxid_teacher",
+            sourceRoomId = room,
+            sourceMessages = "[2026-11-26 10:00:00] Prof_Lin: Project presentation moved to Room C404 on Dec 18.",
+            sourceLocalIds = listOf(2L),
+            timestampSeconds = 1794800100L,
+            isRead = true,
+            isStarred = true
+        )
+        val muteTargetCard = card.copy(
+            id = "trust-card-2",
+            title = "Noisy Forward",
+            originalSender = "StudentA",
+            originalSenderId = "wxid_stu",
+            timestampSeconds = 1794800300L
+        )
+        val filterTargetCard = card.copy(
+            id = "trust-card-3",
+            title = "Campus Promo",
+            timestampSeconds = 1794800400L
+        )
+        eventCardStore.upsert(listOf(card, muteTargetCard, filterTargetCard))
+
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            groupConfigStore = groupConfigStore,
+            scope = testScope,
+            llmClientFactory = { cfg ->
+                val engine = MockEngine {
+                    val content = """{"is_relevant":true,"events":[{"title":"Presentation Room C404","summary":"Project presentation moved to Room C404 on Dec 18.","translated_summary":"Project presentation moved to Room C404 on Dec 18.","category":"DEADLINE","priority":"IMPORTANT","event_date":"2026-12-18","source_message_ids":[2]}]}"""
+                    respond(
+                        """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer(), content)}}}]}""",
+                        HttpStatusCode.OK,
+                        headersOf(HttpHeaders.ContentType, "application/json")
+                    )
+                }
+                KtorLlmClient(cfg.copy(apiKey = "test-key"), engine)
+            }
+        )
+        appState.updateSettings(appState.settings.value.copy(wechatDataDir = wechatDir.absolutePath)).join()
+        appState.loadEvents().join()
+
+        // Quick edit preserves read/starred
+        appState.quickEditCard("trust-card-1", "Edited Title", EventCategory.EXAM, EventPriority.CRITICAL, "2026-12-19").join()
+        val edited = appState.events.value.first { it.id == "trust-card-1" }
+        assertEquals("Edited Title", edited.title)
+        assertEquals(EventCategory.EXAM, edited.category)
+        assertTrue(edited.isRead && edited.isStarred)
+
+        // Single-card re-extract hits MockEngine using DB anchor message
+        appState.reextractCard("trust-card-1").join()
+        val reextracted = appState.events.value.first { it.id == "trust-card-1" }
+        assertEquals("Presentation Room C404", reextracted.title)
+        assertEquals(EventPriority.IMPORTANT, reextracted.priority)
+        assertTrue(reextracted.isStarred)
+
+        // Context jump returns ±5 surrounding messages including casual chatter
+        val ctxResult = appState.loadContextMessages(reextracted, beforeCount = 5, afterCount = 5)
+        assertTrue(ctxResult.isSuccess)
+        assertEquals(listOf("Hi earlier", "Project presentation moved to Room C404 on Dec 18.", "Got it thanks!"), ctxResult.getOrThrow().messages.map { it.textContent })
+
+        // Dismiss & Mute Sender adds wxid_stu to mutedSenderIds
+        appState.dismissAndMuteSender(muteTargetCard).join()
+        assertTrue(appState.events.value.none { it.id == "trust-card-2" })
+        assertEquals(listOf("wxid_stu"), groupConfigStore.get(room)?.mutedSenderIds)
+
+        // Dismiss & Add Prefilter Rule saves new static rule
+        appState.dismissAndAddPrefilterRule(filterTargetCard, "Campus Promo", com.wechatdigest.core.sanitizer.PrefilterMatchType.CONTAINS).join()
+        assertTrue(appState.events.value.none { it.id == "trust-card-3" })
+        assertTrue(appState.settings.value.prefilter.rules.any { it.pattern == "Campus Promo" })
+
+        // Security regression: regex with trailing escaped space fails trim-before-validate without dismissing or saving bad rule
+        val rulesCountBefore = appState.settings.value.prefilter.rules.size
+        appState.dismissAndAddPrefilterRule(card, "bad\\ ", com.wechatdigest.core.sanitizer.PrefilterMatchType.REGEX).join()
+        assertEquals(rulesCountBefore, appState.settings.value.prefilter.rules.size)
+        assertTrue(appState.events.value.any { it.id == card.id })
+
+        // Validation guards: invalid quickEdit date and blank title do not alter store
+        appState.quickEditCard("trust-card-1", "   ", EventCategory.EXAM, EventPriority.CRITICAL, "2026-12-19").join()
+        appState.quickEditCard("trust-card-1", "Valid Title", EventCategory.EXAM, EventPriority.CRITICAL, "TBD").join()
+        assertEquals("Presentation Room C404", appState.events.value.first { it.id == "trust-card-1" }.title)
+
+        // Fallback reextractCard when WeChat DB is unavailable + blank originalSenderId mute fallback
+        appState.updateSettings(appState.settings.value.copy(wechatDataDir = "")).join()
+        val ctxFail = appState.loadContextMessages(card)
+        assertTrue(ctxFail.isFailure)
+
+        val priorCard = EventCard(
+            id = "prior-id-1",
+            title = "Initial Schedule",
+            summary = "Initial",
+            translatedSummary = "Initial",
+            category = EventCategory.NOTICE,
+            priority = EventPriority.NORMAL,
+            originalSender = "Prof",
+            sourceRoomId = room,
+            sourceMessages = "[2026-11-25 10:00:00] Prof: Initial presentation notice.",
+            timestampSeconds = 1794700000L
+        )
+        val amendedCard = EventCard(
+            id = "fallback-reextract-card",
+            title = "Legacy Card",
+            summary = "Old",
+            translatedSummary = "Old",
+            category = EventCategory.NOTICE,
+            priority = EventPriority.NORMAL,
+            originalSender = "Prof",
+            originalSenderId = "",
+            sourceRoomId = room,
+            sourceMessages = "[2026-11-26 10:00:00] Prof: Project presentation moved to Room C404 on Dec 18.",
+            timestampSeconds = 1794800500L,
+            status = com.wechatdigest.core.model.EventCardStatus.UPDATED,
+            supersedesCardId = priorCard.id
+        )
+        eventCardStore.upsert(listOf(priorCard, amendedCard))
+        appState.loadEvents().join()
+        appState.reextractCard(amendedCard.id).join()
+        val postFallback = appState.events.value.first { it.id == amendedCard.id }
+        assertEquals("Presentation Room C404", postFallback.title)
+        assertEquals(com.wechatdigest.core.model.EventCardStatus.UPDATED, postFallback.status, "Single-card re-extract must preserve amendment status")
+        assertEquals("prior-id-1", postFallback.supersedesCardId)
+
+        appState.dismissAndMuteSender(postFallback).join()
+        assertTrue(appState.events.value.none { it.id == amendedCard.id })
+
+        appState.close()
+    }
 }
 

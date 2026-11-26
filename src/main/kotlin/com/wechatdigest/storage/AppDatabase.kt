@@ -46,11 +46,13 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                         custom_prompt TEXT NOT NULL,
                         custom_persona TEXT NOT NULL,
                         allowed_sender_ids TEXT NOT NULL DEFAULT '[]',
+                        muted_sender_ids TEXT NOT NULL DEFAULT '[]',
                         updated_at INTEGER NOT NULL
                     );
                     """.trimIndent()
                 )
                 ensureColumnExists(stmt, "group_configs", "allowed_sender_ids", "TEXT NOT NULL DEFAULT '[]'")
+                ensureColumnExists(stmt, "group_configs", "muted_sender_ids", "TEXT NOT NULL DEFAULT '[]'")
 
                 stmt.execute(
                     """
@@ -75,6 +77,11 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                         is_read INTEGER DEFAULT 0,
                         is_starred INTEGER DEFAULT 0,
                         is_dismissed INTEGER DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'ACTIVE',
+                        supersedes_card_id TEXT,
+                        original_sender_id TEXT NOT NULL DEFAULT '',
+                        content_fingerprint TEXT NOT NULL DEFAULT '',
+                        source_local_ids TEXT NOT NULL DEFAULT '[]',
                         created_at INTEGER NOT NULL
                     );
                     """.trimIndent()
@@ -87,6 +94,14 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                 ensureColumnExists(stmt, "event_cards", "sections", "TEXT DEFAULT '[]'")
                 ensureColumnExists(stmt, "event_cards", "is_starred", "INTEGER DEFAULT 0")
                 ensureColumnExists(stmt, "event_cards", "attachments", "TEXT DEFAULT '[]'")
+                ensureColumnExists(stmt, "event_cards", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'")
+                ensureColumnExists(stmt, "event_cards", "supersedes_card_id", "TEXT")
+                ensureColumnExists(stmt, "event_cards", "original_sender_id", "TEXT NOT NULL DEFAULT ''")
+                ensureColumnExists(stmt, "event_cards", "content_fingerprint", "TEXT NOT NULL DEFAULT ''")
+                ensureColumnExists(stmt, "event_cards", "source_local_ids", "TEXT NOT NULL DEFAULT '[]'")
+
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_content_fingerprint ON event_cards(content_fingerprint)")
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_status_dismissed ON event_cards(status, is_dismissed)")
 
                 stmt.execute(
                     """

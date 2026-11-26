@@ -719,4 +719,61 @@ class MultiPassExtractionTest {
         assertTrue(annCards.isEmpty(), "Stale roomAnnouncement card without explicit source_message_ids must not hijack unrelated message")
         annClient.close()
     }
+
+    @Test
+    fun `resolves lifecycle amendment and cancellation refs and skips cross-room fingerprints pre-LLM`() = runBlocking {
+        val existingCard = EventCard(
+            id = "ab12cd34-1111-2222-3333-444455556666",
+            title = "Algorithm Exam",
+            summary = "Held in Hall A.",
+            translatedSummary = "Held in Hall A.",
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Prof",
+            sourceRoomId = "r@chatroom",
+            timestampSeconds = 1700000000L
+        )
+        var capturedPass3Prompt = ""
+        var calls = 0
+        val engine = MockEngine { req ->
+            calls++
+            val bodyText = (req.body as io.ktor.http.content.TextContent).text
+            capturedPass3Prompt = bodyText
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"{\"is_relevant\":true,\"events\":[{\"title\":\"Algorithm Exam Moved\",\"summary\":\"Moved to Hall B.\",\"translated_summary\":\"Moved to Hall B.\",\"category\":\"EXAM\",\"priority\":\"CRITICAL\",\"event_date\":\"2026-12-20\",\"source_message_ids\":[1],\"status\":\"UPDATED\",\"supersedes_card_id\":\"ab12cd34\"}]}"}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            )
+        }
+        val client = KtorLlmClient(LlmConfig(apiKey = "test-key"), engine)
+        val extractor = EventExtractor(client, enableFastPath = true)
+
+        val noticeText = "Correction: Algorithm Final Exam moved from Hall A to Hall B on Dec 20."
+        val msg = WeChatMessage(1L, 1700000500L, "wxid_prof", "Prof", noticeText, noticeText, false)
+
+        // With empty crossRoomFingerprints, extracts and resolves 8-char supersedesCardId
+        val updatedCards = extractor.extractEventsResult(
+            messages = listOf(msg),
+            roomId = "r@chatroom",
+            recentRoomCards = listOf(existingCard)
+        ).getOrThrow()
+        assertEquals(1, updatedCards.size)
+        assertEquals(1, calls)
+        assertTrue(capturedPass3Prompt.contains("[card:ab12cd34 | ACTIVE]"))
+        assertEquals(com.wechatdigest.core.model.EventCardStatus.UPDATED, updatedCards.single().status)
+        assertEquals(existingCard.id, updatedCards.single().supersedesCardId)
+        assertEquals("wxid_prof", updatedCards.single().originalSenderId)
+        assertEquals(listOf(1L), updatedCards.single().sourceLocalIds)
+        assertTrue(updatedCards.single().contentFingerprint.isNotBlank())
+
+        // Forwarding same message into another room with matching crossRoomFingerprints makes 0 LLM calls
+        val deduped = extractor.extractEventsResult(
+            messages = listOf(msg),
+            roomId = "other@chatroom",
+            crossRoomFingerprints = setOf(updatedCards.single().contentFingerprint)
+        ).getOrThrow()
+        assertTrue(deduped.isEmpty())
+        assertEquals(1, calls)
+        client.close()
+    }
 }

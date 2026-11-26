@@ -191,6 +191,9 @@ object EvalRunner {
                 zoneId = ZoneOffset.UTC,
                 observer = observer
             )
+            val crossRoomFingerprints = scenario.crossRoomDedupTexts
+                .mapNotNull { txt -> com.wechatdigest.core.sanitizer.ContentFingerprint.compute(txt).takeIf { it.isNotBlank() } }
+                .toSet()
             val res = extractor.extractEventsResult(
                 messages = allowlistFiltered,
                 roomId = scenario.roomId,
@@ -199,7 +202,8 @@ object EvalRunner {
                 customRules = scenario.customRules,
                 roomDisplayName = scenario.roomDisplayName,
                 prefilterConfig = scenario.prefilter,
-                recentRoomCards = scenario.recentRoomCards
+                recentRoomCards = scenario.recentRoomCards,
+                crossRoomFingerprints = crossRoomFingerprints
             )
             recordedCalls = tracingClient.snapshotCalls()
             res

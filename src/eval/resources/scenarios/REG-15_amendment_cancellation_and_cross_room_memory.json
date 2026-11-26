@@ -1,0 +1,81 @@
+{
+  "id": "REG-15_amendment_cancellation_and_cross_room_memory",
+  "description": "Emits UPDATED and CANCELLED statuses with resolved supersedesCardId against existing room cards while suppressing a cross-room forwarded notice before invoking the LLM.",
+  "track": "REGRESSION",
+  "roomId": "room_eval@chatroom",
+  "roomDisplayName": "Eval Study Group",
+  "targetLanguage": "en",
+  "crossRoomDedupTexts": [
+    "Campus Shuttle Route B departs from North Gate every 20 minutes starting Nov 28."
+  ],
+  "recentRoomCards": [
+    {
+      "id": "exam1111-2222-3333-4444-555566667777",
+      "title": "Algorithm Final Exam",
+      "summary": "Held in Hall A on Dec 20 at 09:00.",
+      "translatedSummary": "Held in Hall A on Dec 20 at 09:00.",
+      "category": "EXAM",
+      "priority": "CRITICAL",
+      "eventDate": "2026-12-20",
+      "originalSender": "Prof_Wang",
+      "sourceRoomId": "room_eval@chatroom",
+      "timestampSeconds": 1779000000
+    },
+    {
+      "id": "work2222-3333-4444-5555-666677778888",
+      "title": "Career Resume Clinic",
+      "summary": "Scheduled for Nov 29 in Room 204.",
+      "translatedSummary": "Scheduled for Nov 29 in Room 204.",
+      "category": "ACTIVITY",
+      "priority": "NORMAL",
+      "eventDate": "2026-11-29",
+      "originalSender": "Career_Office",
+      "sourceRoomId": "room_eval@chatroom",
+      "timestampSeconds": 1779001000
+    }
+  ],
+  "messages": [
+    {
+      "localId": 1501,
+      "timestampSeconds": 1779020000,
+      "senderId": "wxid_ta_fwd",
+      "senderDisplayName": "TA_Forwarder",
+      "content": "@All Campus Shuttle Route B departs from North Gate every 20 minutes starting Nov 28."
+    },
+    {
+      "localId": 1502,
+      "timestampSeconds": 1779020060,
+      "senderId": "wxid_prof_wang",
+      "senderDisplayName": "Prof_Wang",
+      "content": "Update: Algorithm Final Exam has been moved from Hall A to Hall C301 on Dec 20 at 09:00."
+    },
+    {
+      "localId": 1503,
+      "timestampSeconds": 1779020120,
+      "senderId": "wxid_career",
+      "senderDisplayName": "Career_Office",
+      "content": "Cancellation notice: Career Resume Clinic scheduled for Nov 29 in Room 204 is cancelled due to speaker illness."
+    }
+  ],
+  "expectations": {
+    "minCards": 2,
+    "maxCards": 2,
+    "minSurvivingPrefilter": 2,
+    "maxSurvivingPrefilter": 2,
+    "expectedTitles": ["Algorithm Final Exam", "Career Resume Clinic"],
+    "expectedStatuses": ["UPDATED", "CANCELLED"],
+    "expectedSupersedesIds": [
+      "exam1111-2222-3333-4444-555566667777",
+      "work2222-3333-4444-5555-666677778888"
+    ],
+    "mustContainFacts": ["Hall C301", "cancelled"],
+    "forbiddenTitleSubstrings": ["Shuttle"],
+    "forbiddenContentSubstrings": ["North Gate"],
+    "allowSlashMergedTitles": false,
+    "maxLlmCalls": 1,
+    "requireValidEventDates": true,
+    "minDatedCards": 2,
+    "requireLanguageCompliance": true,
+    "requireZeroJsonParseFailures": true
+  }
+}

@@ -24,13 +24,14 @@ internal object ExtractionPrompts {
     fun formatRecentCardsContext(recentRoomCards: List<EventCard>): String {
         if (recentRoomCards.isEmpty()) return ""
         val formatted = recentRoomCards.take(10).joinToString("\n") { card ->
+            val shortRef = card.id.take(8)
             val safeDate = card.eventDate?.trim()?.takeIf { it.isNotBlank() }?.let { sanitizeInline(it, 32) }
             val datePart = if (!safeDate.isNullOrBlank()) " | Date: $safeDate" else ""
             val title = sanitizeInline(card.title, 100)
             val snippet = sanitizeInline(card.translatedSummary.ifBlank { card.summary }, 140)
-            "- $title$datePart: $snippet"
+            "- [card:$shortRef | ${card.status.name}] $title$datePart: $snippet"
         }
-        return "EXISTING RECENT CARDS IN THIS ROOM (DO NOT DUPLICATE):\n$formatted\nDo not re-create chunks or cards for notices already covered above unless new messages introduce genuinely new events or deadlines."
+        return "EXISTING RECENT CARDS IN THIS ROOM (UPDATE OR DO NOT DUPLICATE):\n$formatted\nIf new messages modify, reschedule, or cancel one of the cards above, include it (set status=\"UPDATED\" or \"CANCELLED\" and supersedes_card_id to its 8-char ID prefix). Otherwise do not re-create chunks or cards for notices already covered above."
     }
 
     fun buildTriageUserPrompt(
@@ -69,10 +70,20 @@ internal object ExtractionPrompts {
         return "Inspect each indexed candidate chunk below independently and return one verdict per chunk_index:\n\n$chunksBlock"
     }
 
-    fun buildSynthesisUserPrompt(chunkTopic: String, transcript: String): String {
+    fun buildSynthesisUserPrompt(
+        chunkTopic: String,
+        transcript: String,
+        recentRoomCards: List<EventCard> = emptyList()
+    ): String {
         val safeTopic = sanitizeInline(chunkTopic, 120)
         val topicLine = if (safeTopic.isNotBlank()) "Candidate topic hint: $safeTopic\n\n" else ""
-        return "Summarize this single verified notice chunk into ONE detailed card:\n\n<untrusted_chat_data>\n$topicLine$transcript\n</untrusted_chat_data>"
+        val recentBlock = formatRecentCardsContext(recentRoomCards)
+        val existingSection = if (recentBlock.isNotBlank()) {
+            "\n\n<existing_cards>\n$recentBlock\n</existing_cards>"
+        } else {
+            ""
+        }
+        return "Summarize this single verified notice chunk into ONE detailed card:\n\n<untrusted_chat_data>\n$topicLine$transcript\n</untrusted_chat_data>$existingSection"
     }
 
     fun buildFastPathSynthesisUserPrompt(
@@ -217,7 +228,8 @@ OUTPUT SCHEMA (Pure JSON object with one item per input chunk_index):
     fun buildSystemPrompt(
         userPersona: String,
         targetLanguage: String,
-        customRules: String = ""
+        customRules: String = "",
+        includeLifecycleFields: Boolean = false
     ): String {
         val targetLangName = LanguageHelper.resolveTargetLanguageName(targetLanguage)
         val contextBlock = buildString {
@@ -228,6 +240,11 @@ OUTPUT SCHEMA (Pure JSON object with one item per input chunk_index):
                 append("\nUSER CONTEXT / PREFERENCES:\n").append(userPersona).append('\n')
             }
         }.trimEnd()
+        val lifecycleInstructions = if (includeLifecycleFields) {
+            "\n- LIFECYCLE & AMENDMENTS: When <existing_cards> is present and the message updates, reschedules, or corrects an existing card, set \"status\": \"UPDATED\" and \"supersedes_card_id\" to that card's 8-char ID prefix; if it cancels an existing event/deadline, set \"status\": \"CANCELLED\" and \"supersedes_card_id\"; otherwise set \"status\": \"ACTIVE\" and \"supersedes_card_id\": null."
+        } else {
+            ""
+        }
         val dynamicSuffix = if (contextBlock.isNotBlank()) "\n$contextBlock" else ""
         return """
 You are Pass 3 (Grounded Card Summarizer) monitoring a busy WeChat group chat.
@@ -250,9 +267,9 @@ ONE-CARD CONSOLIDATION & CONCRETE DETAILS REQUIREMENT:
 SOURCE MESSAGE IDENTIFIERS & CATEGORIES:
 - Populate "source_message_ids" with the exact integer ID(s) of the message(s) provided (e.g. [101] or [101, 102]). Do NOT copy raw chat logs verbatim.
 - Categories: EXAM, DEADLINE, NOTICE, ACTIVITY, PROMOTION, OTHER.
-- Priorities: CRITICAL (urgent deadlines today/tomorrow, mandatory gov/visa/passport deadlines, explicitly named exams), IMPORTANT (academic schedule/submission/thesis deadlines), NORMAL (campus activities, conferences, registrations), LOW (general advisories).
+- Priorities: CRITICAL (urgent deadlines today/tomorrow, mandatory gov/visa/passport deadlines, explicitly named exams), IMPORTANT (academic schedule/submission/thesis deadlines), NORMAL (campus activities, conferences, registrations), LOW (general advisories).$lifecycleInstructions
 
-${buildSynthesisSchema(targetLangName)}$dynamicSuffix
+${buildSynthesisSchema(targetLangName, includeLifecycleFields)}$dynamicSuffix
         """.trimIndent()
     }
 
@@ -274,7 +291,16 @@ ${buildSynthesisSchema(targetLangName)}$dynamicSuffix
         }
     }
 
-    private fun buildSynthesisSchema(targetLangName: String): String = """
+    private fun buildSynthesisSchema(
+        targetLangName: String,
+        includeLifecycleFields: Boolean = false
+    ): String {
+        val lifecycleJson = if (includeLifecycleFields) {
+            ",\n      \"status\": \"ACTIVE | UPDATED | CANCELLED\",\n      \"supersedes_card_id\": \"8-char ID prefix of existing card being updated/cancelled or null\""
+        } else {
+            ""
+        }
+        return """
 OUTPUT SCHEMA (Must be pure JSON object):
 {
   "is_relevant": true,
@@ -303,7 +329,7 @@ OUTPUT SCHEMA (Must be pure JSON object):
       "category": "NOTICE | EXAM | DEADLINE | ACTIVITY | PROMOTION",
       "priority": "CRITICAL | IMPORTANT | NORMAL | LOW",
       "event_date": "YYYY-MM-DDTHH:MM:SS or null if no specific event time",
-      "source_message_ids": [101, 102]
+      "source_message_ids": [101, 102]$lifecycleJson
     }
   ]
 }
@@ -314,6 +340,7 @@ If the chunk does not contain an actionable announcement after applying rules, r
   "events": []
 }
     """.trimIndent()
+    }
 
     internal fun sanitizeInline(raw: String, maxLength: Int): String {
         return raw.replace(unsafePromptControlRegex, "")

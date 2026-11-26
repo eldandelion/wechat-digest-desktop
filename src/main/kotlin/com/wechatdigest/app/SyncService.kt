@@ -10,6 +10,7 @@ import com.wechatdigest.core.llm.LlmClient
 import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventDetailItemParser
 import com.wechatdigest.core.model.GroupConfig
 import com.wechatdigest.core.model.SyncCheckpoint
@@ -124,6 +125,15 @@ class SyncService(
                 emptyMap()
             }
 
+            val activeFingerprints = java.util.Collections.synchronizedSet(
+                eventCardStore.listActiveFingerprints().toMutableSet()
+            )
+            val roomOwnersMap = try {
+                contactRepo.loadRoomOwnersMap()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                emptyMap()
+            }
             llmClientFactory(settings.llm).use { llmClient ->
                 val extractor = EventExtractor(
                     llmClient = llmClient,
@@ -140,6 +150,8 @@ class SyncService(
                         extractor = extractor,
                         roomDisplayName = roomMeta?.displayName.orEmpty(),
                         roomAnnouncement = roomMeta?.announcement.orEmpty(),
+                        roomOwnerId = roomOwnersMap[roomId].orEmpty(),
+                        activeFingerprints = activeFingerprints,
                         totalInsertedCounter = totalInsertedCounter,
                         callbackMutex = callbackMutex,
                         onCardPersisted = onCardPersisted,
@@ -190,6 +202,8 @@ class SyncService(
         extractor: EventExtractor,
         roomDisplayName: String,
         roomAnnouncement: String,
+        roomOwnerId: String,
+        activeFingerprints: MutableSet<String>,
         totalInsertedCounter: AtomicInteger,
         callbackMutex: Mutex,
         onCardPersisted: (suspend (EventCard) -> Unit)?,
@@ -218,7 +232,7 @@ class SyncService(
             scannedInRoom = rawMessages.size
             val groupConfig = groupConfigStore?.getOrThrow(roomId)
             val recallCleaned = MessageSanitizer.suppressSystemAndRecalledMessages(rawMessages)
-            val senderFiltered = applySenderAllowlist(recallCleaned, groupConfig)
+            val senderFiltered = applySenderFilters(recallCleaned, groupConfig)
             val substantive = MessageSanitizer.filterSubstantiveMessages(senderFiltered, settings.prefilter)
 
             if (substantive.isNotEmpty()) {
@@ -229,10 +243,12 @@ class SyncService(
                     totalRooms = totalRooms,
                     roomDisplayName = roomDisplayName,
                     roomAnnouncement = roomAnnouncement,
+                    roomOwnerId = roomOwnerId,
                     roomLabel = roomLabel,
                     settings = settings,
                     groupConfig = groupConfig,
                     extractor = extractor,
+                    activeFingerprints = activeFingerprints,
                     totalInsertedCounter = totalInsertedCounter,
                     callbackMutex = callbackMutex,
                     onCardPersisted = onCardPersisted,
@@ -257,7 +273,7 @@ class SyncService(
         }
     }
 
-    private fun applySenderAllowlist(
+    private fun applySenderFilters(
         messages: List<com.wechatdigest.core.model.WeChatMessage>,
         groupConfig: GroupConfig?
     ): List<com.wechatdigest.core.model.WeChatMessage> {
@@ -266,7 +282,13 @@ class SyncService(
             ?.filter { it.isNotBlank() }
             ?.toSet()
             .orEmpty()
-        return if (allowed.isNotEmpty()) messages.filter { it.senderId in allowed } else messages
+        val muted = groupConfig?.mutedSenderIds
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            .orEmpty()
+        val allowFiltered = if (allowed.isNotEmpty()) messages.filter { it.senderId in allowed } else messages
+        return if (muted.isNotEmpty()) allowFiltered.filterNot { it.senderId in muted } else allowFiltered
     }
 
     private suspend fun extractAndPersistRoomEvents(
@@ -276,10 +298,12 @@ class SyncService(
         totalRooms: Int,
         roomDisplayName: String,
         roomAnnouncement: String,
+        roomOwnerId: String,
         roomLabel: String,
         settings: AppSettings,
         groupConfig: GroupConfig?,
         extractor: EventExtractor,
+        activeFingerprints: MutableSet<String>,
         totalInsertedCounter: AtomicInteger,
         callbackMutex: Mutex,
         onCardPersisted: (suspend (EventCard) -> Unit)?,
@@ -288,6 +312,7 @@ class SyncService(
         val effectiveRules = groupConfig?.customPrompt.orEmpty()
         val effectivePersona = groupConfig?.customPersona?.takeIf { it.isNotBlank() } ?: settings.userPersona
         val recentRoomCards = eventCardStore.listRecentByRoom(roomId, limit = 10)
+        val hasScopedPolicy = effectiveRules.isNotBlank() || !groupConfig?.allowedSenderIds.isNullOrEmpty()
         val preparedMessages = if (settings.parseAttachmentContents) {
             enrichMessagesWithAttachmentPreviews(
                 messages = substantive,
@@ -295,6 +320,12 @@ class SyncService(
             )
         } else {
             substantive
+        }
+        // Do not let unrestricted rooms suppress messages in rooms that define custom rules or allowlists.
+        val fingerprintSnapshot = if (hasScopedPolicy) {
+            emptySet()
+        } else {
+            synchronized(activeFingerprints) { activeFingerprints.toSet() }
         }
 
         val dbWriteMutex = Mutex()
@@ -308,13 +339,27 @@ class SyncService(
             prefilterConfig = settings.prefilter,
             recentRoomCards = recentRoomCards,
             roomAnnouncement = roomAnnouncement,
+            crossRoomFingerprints = fingerprintSnapshot,
             onCardReady = { card ->
-                val inserted = dbWriteMutex.withLock {
-                    eventCardStore.upsertOrThrow(listOf(card))
+                val applyResult = dbWriteMutex.withLock {
+                    val outcome = eventCardStore.applyUpdateOrInsertOrThrow(listOf(card), roomOwnerId = roomOwnerId)
+                    if (outcome.supersededCardIds.isNotEmpty()) {
+                        val refreshedActive = eventCardStore.listActiveFingerprints()
+                        synchronized(activeFingerprints) {
+                            activeFingerprints.clear()
+                            activeFingerprints.addAll(refreshedActive)
+                        }
+                    }
+                    outcome
                 }
-                if (inserted > 0) {
-                    totalInsertedCounter.addAndGet(inserted)
-                    notifyCardPersistedSafely(callbackMutex, onCardPersisted, card)
+                if (applyResult.insertedCards.isNotEmpty()) {
+                    for (persisted in applyResult.insertedCards) {
+                        if (persisted.contentFingerprint.isNotBlank() && persisted.status != EventCardStatus.CANCELLED) {
+                            activeFingerprints.add(persisted.contentFingerprint)
+                        }
+                        totalInsertedCounter.incrementAndGet()
+                        notifyCardPersistedSafely(callbackMutex, onCardPersisted, persisted)
+                    }
                 }
             },
             onProgress = { stage, _, _ ->

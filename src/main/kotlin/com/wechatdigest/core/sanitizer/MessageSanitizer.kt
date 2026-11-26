@@ -8,6 +8,7 @@ object MessageSanitizer {
     private const val MAX_REGEX_CACHE_SIZE = 256
     private const val MAX_REGEX_INPUT_LENGTH = 8_192
     private const val MAX_REGEX_CHAR_ACCESSES = 200_000
+    private const val MAX_RULE_PATTERN_LENGTH = 256
 
     private val EDGE_PUNCTUATION = setOf(
         '.', ',', '!', '?', ';', ':', '~',
@@ -88,11 +89,18 @@ object MessageSanitizer {
      * Validates a candidate rule pattern before saving; returns null if valid or a user-facing error message.
      */
     fun validateRulePattern(pattern: String, matchType: PrefilterMatchType): String? {
-        if (pattern.isBlank()) {
+        val trimmed = pattern.trim()
+        if (trimmed.isEmpty()) {
             return "Pattern cannot be empty."
         }
+        if (trimmed.length > MAX_RULE_PATTERN_LENGTH) {
+            return "Pattern is too long (max $MAX_RULE_PATTERN_LENGTH characters)."
+        }
+        if (matchType == PrefilterMatchType.CONTAINS && trimmed.length < 2) {
+            return "Contains pattern must be at least 2 characters."
+        }
         if (matchType == PrefilterMatchType.REGEX) {
-            val error = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.exceptionOrNull()
+            val error = runCatching { Regex(trimmed, RegexOption.IGNORE_CASE) }.exceptionOrNull()
             if (error != null) {
                 return "Invalid regex: ${error.message ?: "syntax error"}"
             }

@@ -3,6 +3,7 @@ package com.wechatdigest.eval
 import com.wechatdigest.core.calendar.IcsCalendarGenerator
 import com.wechatdigest.core.llm.LanguageHelper
 import com.wechatdigest.core.model.EventCard
+import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
 import java.util.Locale
@@ -155,6 +156,32 @@ object EvalGraders {
                     grader = "expected_titles",
                     passed = matches,
                     message = "Titles=$actualTitles, expected substrings ${exp.expectedTitles}"
+                )
+            )
+        }
+
+        if (exp.expectedStatuses.isNotEmpty()) {
+            val actualStatuses = cards.map { it.status.name }
+            val matches = exp.expectedStatuses.all { expected ->
+                EventCardStatus.fromString(expected).name in actualStatuses
+            }
+            findings.add(
+                GraderFinding(
+                    grader = "expected_statuses",
+                    passed = matches,
+                    message = "Statuses=$actualStatuses, expected to include ${exp.expectedStatuses}"
+                )
+            )
+        }
+
+        if (exp.expectedSupersedesIds.isNotEmpty()) {
+            val actualRefs = cards.mapNotNull { it.supersedesCardId }
+            val matches = exp.expectedSupersedesIds.all { expected -> expected in actualRefs }
+            findings.add(
+                GraderFinding(
+                    grader = "expected_supersedes_ids",
+                    passed = matches,
+                    message = "Supersedes=$actualRefs, expected to include ${exp.expectedSupersedesIds}"
                 )
             )
         }

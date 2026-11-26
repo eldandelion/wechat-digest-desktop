@@ -9,6 +9,7 @@ import com.wechatdigest.core.db.WeChatSessionContext
 import com.wechatdigest.core.decompress.ZstdDecompressor
 import com.wechatdigest.core.model.SyncCheckpoint
 import com.wechatdigest.core.model.WeChatMessage
+import com.wechatdigest.core.sanitizer.MessageSanitizer
 import java.io.File
 import java.io.FileNotFoundException
 import java.util.concurrent.CancellationException
@@ -26,6 +27,12 @@ class WeChatMessageRepository(
         val latestShardName: String,
         val latestLocalId: Long,
         val latestCreateTime: Long
+    )
+
+    /** Result of loading a bounded surrounding conversation window around an extracted card's messages. */
+    data class ContextMessagesResult(
+        val messages: List<WeChatMessage>,
+        val anchorFingerprints: Set<String>
     )
 
     private data class RoomShard(
@@ -542,6 +549,363 @@ class WeChatMessageRepository(
         return messages
     }
 
+    /**
+     * Loads up to [beforeCount] prior messages and [afterCount] subsequent messages surrounding an anchored event card
+     * across chronological shards for [roomId], suppressing recalled/system rows while leaving casual chatter visible.
+     */
+    fun getContextMessages(
+        roomId: String,
+        anchorLocalIds: List<Long>,
+        anchorTimestampSeconds: Long,
+        beforeCount: Int = 5,
+        afterCount: Int = 5
+    ): ContextMessagesResult {
+        val safeBefore = beforeCount.coerceIn(0, MAX_CONTEXT_WINDOW_COUNT)
+        val safeAfter = afterCount.coerceIn(0, MAX_CONTEXT_WINDOW_COUNT)
+        val tableName = WeChatDatabaseDriver.calculateRoomTableName(roomId)
+        val nonEmptyShards = findShardsForTable(tableName)
+            .filter { it.bounds.maxLocalId > 0L }
+            .sortedWith(chronologicalShardComparator())
+        if (nonEmptyShards.isEmpty()) return ContextMessagesResult(emptyList(), emptySet())
+
+        val contactsMap = contactRepository.loadContactsMap()
+        val roomOwnerUsername = loadRoomOwnerUsername(roomId)
+        val (anchorShardIdx, rawAnchors) = locateAndResolveAnchorMessages(
+            orderedShards = nonEmptyShards,
+            tableName = tableName,
+            anchorLocalIds = anchorLocalIds,
+            anchorTimestampSeconds = anchorTimestampSeconds,
+            contactsMap = contactsMap,
+            roomOwnerUsername = roomOwnerUsername
+        )
+        val anchors = MessageSanitizer.suppressSystemAndRecalledMessages(rawAnchors)
+        val anchorReference = rawAnchors.firstOrNull() ?: anchors.firstOrNull()
+            ?: return ContextMessagesResult(emptyList(), emptySet())
+        val anchorLast = rawAnchors.lastOrNull() ?: anchors.lastOrNull() ?: anchorReference
+
+        val seen = HashSet<CrossShardFingerprint>()
+        val anchorFps = HashSet<String>()
+        anchors.forEach { msg ->
+            seen.add(CrossShardFingerprint(msg.timestampSeconds, msg.senderId, msg.rawContent))
+            anchorFps.add(contextKey(msg))
+        }
+
+        val beforeCollected = collectMessagesBackward(
+            orderedShards = nonEmptyShards,
+            startShardIdx = anchorShardIdx,
+            startCreateTime = anchorReference.timestampSeconds,
+            startLocalId = anchorReference.localId,
+            tableName = tableName,
+            contactsMap = contactsMap,
+            roomOwnerUsername = roomOwnerUsername,
+            neededCount = safeBefore,
+            seen = seen
+        )
+        val afterCollected = collectMessagesForward(
+            orderedShards = nonEmptyShards,
+            startShardIdx = anchorShardIdx,
+            startCreateTime = anchorLast.timestampSeconds,
+            startLocalId = anchorLast.localId,
+            tableName = tableName,
+            contactsMap = contactsMap,
+            roomOwnerUsername = roomOwnerUsername,
+            neededCount = safeAfter,
+            seen = seen
+        )
+
+        return ContextMessagesResult(
+            messages = beforeCollected + anchors + afterCollected,
+            anchorFingerprints = anchorFps
+        )
+    }
+
+    /** Looks up anchored messages for single-card re-extraction using stored local IDs and timestamp bounds. */
+    fun findAnchorMessages(
+        roomId: String,
+        anchorLocalIds: List<Long>,
+        anchorTimestampSeconds: Long
+    ): List<WeChatMessage> {
+        val tableName = WeChatDatabaseDriver.calculateRoomTableName(roomId)
+        val nonEmptyShards = findShardsForTable(tableName)
+            .filter { it.bounds.maxLocalId > 0L }
+            .sortedWith(chronologicalShardComparator())
+        if (nonEmptyShards.isEmpty()) return emptyList()
+        val contactsMap = contactRepository.loadContactsMap()
+        val roomOwnerUsername = loadRoomOwnerUsername(roomId)
+        val (_, raw) = locateAndResolveAnchorMessages(
+            orderedShards = nonEmptyShards,
+            tableName = tableName,
+            anchorLocalIds = anchorLocalIds,
+            anchorTimestampSeconds = anchorTimestampSeconds,
+            contactsMap = contactsMap,
+            roomOwnerUsername = roomOwnerUsername
+        )
+        return MessageSanitizer.suppressSystemAndRecalledMessages(raw)
+    }
+
+    private fun locateAndResolveAnchorMessages(
+        orderedShards: List<RoomShard>,
+        tableName: String,
+        anchorLocalIds: List<Long>,
+        anchorTimestampSeconds: Long,
+        contactsMap: Map<String, String>,
+        roomOwnerUsername: String
+    ): Pair<Int, List<WeChatMessage>> {
+        if (anchorTimestampSeconds <= 0L) {
+            val lastIdx = orderedShards.lastIndex
+            return lastIdx to resolveAnchorMessagesInShard(
+                shard = orderedShards[lastIdx],
+                tableName = tableName,
+                anchorLocalIds = anchorLocalIds,
+                anchorTimestampSeconds = anchorTimestampSeconds,
+                contactsMap = contactsMap,
+                roomOwnerUsername = roomOwnerUsername
+            )
+        }
+        val overlappingIndices = orderedShards.indices.filter { idx ->
+            val bounds = orderedShards[idx].bounds
+            anchorTimestampSeconds >= bounds.minCreateTime && anchorTimestampSeconds <= bounds.maxCreateTime
+        }
+        val candidateIndices = overlappingIndices.ifEmpty {
+            val nextIdx = orderedShards.indexOfFirst { it.bounds.maxCreateTime >= anchorTimestampSeconds }
+            listOf(if (nextIdx >= 0) nextIdx else orderedShards.lastIndex)
+        }
+
+        // First scan all candidate shards for an explicit (local_id, close-timestamp) hit on same-second rollovers/overlaps.
+        val distinctIds = anchorLocalIds.distinct().take(20)
+        if (distinctIds.isNotEmpty()) {
+            var bestLocalIdHit: Pair<Int, List<WeChatMessage>>? = null
+            var bestTimeDelta = Long.MAX_VALUE
+            val placeholders = distinctIds.joinToString(",") { "?" }
+            for (idx in candidateIndices) {
+                val hits = queryShardMessages(
+                    shard = orderedShards[idx],
+                    tableName = tableName,
+                    contactsMap = contactsMap,
+                    whereClause = "WHERE local_id IN ($placeholders)",
+                    orderBy = "create_time ASC, local_id ASC",
+                    limit = distinctIds.size,
+                    bindParams = distinctIds,
+                    roomOwnerUsername = roomOwnerUsername
+                ).filter { kotlin.math.abs(it.timestampSeconds - anchorTimestampSeconds) <= ANCHOR_LOCAL_ID_MAX_DRIFT_SECONDS }
+                if (hits.isNotEmpty()) {
+                    val delta = hits.minOf { kotlin.math.abs(it.timestampSeconds - anchorTimestampSeconds) }
+                    if (delta < bestTimeDelta) {
+                        bestTimeDelta = delta
+                        bestLocalIdHit = idx to hits
+                    }
+                }
+            }
+            if (bestLocalIdHit != null) return bestLocalIdHit
+        }
+
+        var bestFallback: Pair<Int, List<WeChatMessage>>? = null
+        var bestFallbackDelta = Long.MAX_VALUE
+        for (idx in candidateIndices) {
+            val msgs = resolveTimestampFallbackInShard(
+                shard = orderedShards[idx],
+                tableName = tableName,
+                anchorTimestampSeconds = anchorTimestampSeconds,
+                contactsMap = contactsMap,
+                roomOwnerUsername = roomOwnerUsername
+            )
+            if (msgs.isNotEmpty()) {
+                val delta = kotlin.math.abs(msgs.first().timestampSeconds - anchorTimestampSeconds)
+                if (delta < bestFallbackDelta) {
+                    bestFallbackDelta = delta
+                    bestFallback = idx to msgs
+                }
+            }
+        }
+        return bestFallback ?: (candidateIndices.first() to emptyList())
+    }
+
+    private fun resolveAnchorMessagesInShard(
+        shard: RoomShard,
+        tableName: String,
+        anchorLocalIds: List<Long>,
+        anchorTimestampSeconds: Long,
+        contactsMap: Map<String, String>,
+        roomOwnerUsername: String
+    ): List<WeChatMessage> {
+        val distinctIds = anchorLocalIds.distinct().take(20)
+        if (distinctIds.isNotEmpty()) {
+            val placeholders = distinctIds.joinToString(",") { "?" }
+            val byIds = queryShardMessages(
+                shard = shard,
+                tableName = tableName,
+                contactsMap = contactsMap,
+                whereClause = "WHERE local_id IN ($placeholders)",
+                orderBy = "create_time ASC, local_id ASC",
+                limit = distinctIds.size,
+                bindParams = distinctIds,
+                roomOwnerUsername = roomOwnerUsername
+            )
+            if (byIds.isNotEmpty()) return byIds
+        }
+        return resolveTimestampFallbackInShard(shard, tableName, anchorTimestampSeconds, contactsMap, roomOwnerUsername)
+    }
+
+    private fun resolveTimestampFallbackInShard(
+        shard: RoomShard,
+        tableName: String,
+        anchorTimestampSeconds: Long,
+        contactsMap: Map<String, String>,
+        roomOwnerUsername: String
+    ): List<WeChatMessage> {
+        val atOrBefore = queryShardMessages(
+            shard = shard,
+            tableName = tableName,
+            contactsMap = contactsMap,
+            whereClause = "WHERE create_time <= ?",
+            orderBy = "create_time DESC, local_id DESC",
+            limit = 1,
+            bindParams = listOf(anchorTimestampSeconds),
+            roomOwnerUsername = roomOwnerUsername
+        )
+        if (atOrBefore.isNotEmpty()) return atOrBefore
+        return queryShardMessages(
+            shard = shard,
+            tableName = tableName,
+            contactsMap = contactsMap,
+            whereClause = "WHERE create_time >= ?",
+            orderBy = "create_time ASC, local_id ASC",
+            limit = 1,
+            bindParams = listOf(anchorTimestampSeconds),
+            roomOwnerUsername = roomOwnerUsername
+        )
+    }
+
+    private fun collectMessagesBackward(
+        orderedShards: List<RoomShard>,
+        startShardIdx: Int,
+        startCreateTime: Long,
+        startLocalId: Long,
+        tableName: String,
+        contactsMap: Map<String, String>,
+        roomOwnerUsername: String,
+        neededCount: Int,
+        seen: MutableSet<CrossShardFingerprint>
+    ): List<WeChatMessage> {
+        if (neededCount <= 0) return emptyList()
+        val descendingCollected = mutableListOf<WeChatMessage>()
+        var idx = startShardIdx
+        var useCursor = true
+        var curTime = startCreateTime
+        var curLocalId = startLocalId
+        while (idx >= 0 && descendingCollected.size < neededCount) {
+            val shard = orderedShards[idx]
+            while (descendingCollected.size < neededCount) {
+                val batchLimit = (neededCount - descendingCollected.size) * 2 + 4
+                val batchDesc = if (useCursor) {
+                    queryShardMessages(
+                        shard = shard,
+                        tableName = tableName,
+                        contactsMap = contactsMap,
+                        whereClause = "WHERE (create_time < ? OR (create_time = ? AND local_id < ?))",
+                        orderBy = "create_time DESC, local_id DESC",
+                        limit = batchLimit,
+                        bindParams = listOf(curTime, curTime, curLocalId),
+                        roomOwnerUsername = roomOwnerUsername
+                    )
+                } else {
+                    queryShardMessages(
+                        shard = shard,
+                        tableName = tableName,
+                        contactsMap = contactsMap,
+                        whereClause = "WHERE create_time <= ?",
+                        orderBy = "create_time DESC, local_id DESC",
+                        limit = batchLimit,
+                        bindParams = listOf(curTime),
+                        roomOwnerUsername = roomOwnerUsername
+                    )
+                }
+                if (batchDesc.isEmpty()) break
+                val cleanedDesc = MessageSanitizer.suppressSystemAndRecalledMessages(batchDesc.reversed()).reversed()
+                for (msg in cleanedDesc) {
+                    if (descendingCollected.size >= neededCount) break
+                    val fp = CrossShardFingerprint(msg.timestampSeconds, msg.senderId, msg.rawContent)
+                    if (seen.add(fp)) {
+                        descendingCollected.add(msg)
+                    }
+                }
+                val oldestInBatch = batchDesc.last()
+                curTime = oldestInBatch.timestampSeconds
+                curLocalId = oldestInBatch.localId
+                useCursor = true
+                if (batchDesc.size < batchLimit) break
+            }
+            useCursor = false
+            idx--
+        }
+        return descendingCollected.reversed()
+    }
+
+    private fun collectMessagesForward(
+        orderedShards: List<RoomShard>,
+        startShardIdx: Int,
+        startCreateTime: Long,
+        startLocalId: Long,
+        tableName: String,
+        contactsMap: Map<String, String>,
+        roomOwnerUsername: String,
+        neededCount: Int,
+        seen: MutableSet<CrossShardFingerprint>
+    ): List<WeChatMessage> {
+        if (neededCount <= 0) return emptyList()
+        val collected = mutableListOf<WeChatMessage>()
+        var idx = startShardIdx
+        var useCursor = true
+        var curTime = startCreateTime
+        var curLocalId = startLocalId
+        while (idx < orderedShards.size && collected.size < neededCount) {
+            val shard = orderedShards[idx]
+            while (collected.size < neededCount) {
+                val batchLimit = (neededCount - collected.size) * 2 + 4
+                val batch = if (useCursor) {
+                    queryShardMessages(
+                        shard = shard,
+                        tableName = tableName,
+                        contactsMap = contactsMap,
+                        whereClause = "WHERE (create_time > ? OR (create_time = ? AND local_id > ?))",
+                        orderBy = "create_time ASC, local_id ASC",
+                        limit = batchLimit,
+                        bindParams = listOf(curTime, curTime, curLocalId),
+                        roomOwnerUsername = roomOwnerUsername
+                    )
+                } else {
+                    queryShardMessages(
+                        shard = shard,
+                        tableName = tableName,
+                        contactsMap = contactsMap,
+                        whereClause = "WHERE create_time >= ?",
+                        orderBy = "create_time ASC, local_id ASC",
+                        limit = batchLimit,
+                        bindParams = listOf(curTime),
+                        roomOwnerUsername = roomOwnerUsername
+                    )
+                }
+                if (batch.isEmpty()) break
+                val cleaned = MessageSanitizer.suppressSystemAndRecalledMessages(batch)
+                for (msg in cleaned) {
+                    if (collected.size >= neededCount) break
+                    val fp = CrossShardFingerprint(msg.timestampSeconds, msg.senderId, msg.rawContent)
+                    if (seen.add(fp)) {
+                        collected.add(msg)
+                    }
+                }
+                val newestInBatch = batch.last()
+                curTime = newestInBatch.timestampSeconds
+                curLocalId = newestInBatch.localId
+                useCursor = true
+                if (batch.size < batchLimit) break
+            }
+            useCursor = false
+            idx++
+        }
+        return collected
+    }
+
     private fun loadShardNameToIdMap(conn: java.sql.Connection): Map<Long, String> {
         val hasName2Id = conn.createStatement().use { stmt ->
             stmt.executeQuery("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'").use { rs -> rs.next() }
@@ -656,6 +1020,12 @@ class WeChatMessageRepository(
     }
 
     companion object {
+        private const val MAX_CONTEXT_WINDOW_COUNT = 200
+        private const val ANCHOR_LOCAL_ID_MAX_DRIFT_SECONDS = 300L
+
+        fun contextKey(msg: WeChatMessage): String =
+            "${msg.timestampSeconds}:${msg.senderId}:${msg.rawContent.hashCode()}"
+
         private val WECHAT_ID_REGEX = Regex("^[A-Za-z0-9_@.-]{3,64}$")
         private val MSG_TABLE_REGEX = Regex("^Msg_[0-9a-fA-F]+$")
         private val SHARD_FILE_REGEX = Regex("^message_\\d+\\.db$")

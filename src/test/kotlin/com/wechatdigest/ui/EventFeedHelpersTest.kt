@@ -122,6 +122,13 @@ class EventFeedHelpersTest {
     }
 
     @Test
+    fun `formatStatusLabel formats all EventCardStatus entries`() {
+        assertEquals("Active", formatStatusLabel(com.wechatdigest.core.model.EventCardStatus.ACTIVE))
+        assertEquals("Updated", formatStatusLabel(com.wechatdigest.core.model.EventCardStatus.UPDATED))
+        assertEquals("Cancelled", formatStatusLabel(com.wechatdigest.core.model.EventCardStatus.CANCELLED))
+    }
+
+    @Test
     fun `formatCategoryLabel formats all EventCategory entries with only first letter capitalized`() {
         assertEquals("Exam", formatCategoryLabel(EventCategory.EXAM))
         assertEquals("Deadline", formatCategoryLabel(EventCategory.DEADLINE))
@@ -177,5 +184,14 @@ class EventFeedHelpersTest {
         assertEquals("Nov 25, 2026 • 15:30", formatEventDateLabel("2026-11-25 15:30:00.123"))
         assertEquals("Nov 25, 2026", formatEventDateLabel("2026-11-25"))
         assertEquals("2026-11-25 15:30 (Room 302)", formatEventDateLabel("2026-11-25T15:30 (Room 302)"))
+    }
+
+    @Test
+    fun `validateQuickEditIsoDate validates ISO dates and rejects malformed strings`() {
+        assertEquals(null, validateQuickEditIsoDate(""))
+        assertEquals(null, validateQuickEditIsoDate("2026-12-01"))
+        assertEquals(null, validateQuickEditIsoDate("2026-12-01T14:30"))
+        assertEquals(null, validateQuickEditIsoDate("2026-12-01 14:30:00"))
+        assertTrue(validateQuickEditIsoDate("TBD") != null)
     }
 }

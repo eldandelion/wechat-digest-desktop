@@ -65,6 +65,9 @@ fun GroupRuleDialog(
     var selectedSenderIds by remember(room.roomId, initialConfig) {
         mutableStateOf(initialConfig?.allowedSenderIds?.toSet().orEmpty())
     }
+    val mutedSenderIds = remember(room.roomId, initialConfig) {
+        initialConfig?.mutedSenderIds.orEmpty()
+    }
     var members by remember(room.roomId) { mutableStateOf<List<GroupMember>>(emptyList()) }
     var isLoadingMembers by remember(room.roomId) { mutableStateOf(true) }
     var memberSearchQuery by remember(room.roomId) { mutableStateOf("") }
@@ -162,7 +165,8 @@ fun GroupRuleDialog(
                 val hasExistingConfig = initialConfig != null && (
                     initialConfig.customPrompt.isNotBlank() ||
                         initialConfig.customPersona.isNotBlank() ||
-                        initialConfig.allowedSenderIds.isNotEmpty()
+                        initialConfig.allowedSenderIds.isNotEmpty() ||
+                        initialConfig.mutedSenderIds.isNotEmpty()
                     )
                 if (hasExistingConfig) {
                     TextButton(onClick = onDelete) {
@@ -177,7 +181,8 @@ fun GroupRuleDialog(
                                 roomId = room.roomId,
                                 customPrompt = customPrompt.trim(),
                                 customPersona = customPersona.trim(),
-                                allowedSenderIds = sortedSelectedIds.map { it.trim() }.filter { it.isNotBlank() }
+                                allowedSenderIds = sortedSelectedIds.map { it.trim() }.filter { it.isNotBlank() },
+                                mutedSenderIds = mutedSenderIds.map { it.trim() }.filter { it.isNotBlank() }.distinct()
                             )
                         )
                     }

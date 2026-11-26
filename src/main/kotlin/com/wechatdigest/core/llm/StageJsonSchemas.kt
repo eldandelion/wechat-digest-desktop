@@ -22,6 +22,7 @@ internal object StageJsonSchemas {
 
     private val eventCategories = listOf("NOTICE", "EXAM", "DEADLINE", "ACTIVITY", "PROMOTION", "OTHER")
     private val eventPriorities = listOf("CRITICAL", "IMPORTANT", "NORMAL", "LOW")
+    private val cardStatuses = listOf("ACTIVE", "UPDATED", "CANCELLED")
     private val detailKinds = listOf(
         "DATE", "TIME", "DEADLINE", "LOCATION", "DOCUMENT", "COPIES", "FORMAT",
         "ELIGIBILITY", "EXAM", "CONTACT", "PERSON", "AUDIENCE", "LINK", "ACTION",
@@ -113,33 +114,39 @@ internal object StageJsonSchemas {
         )
     )
 
-    val pass3SynthesisSchema: JsonObject = objectSchema(
-        mapOf(
-            "is_relevant" to booleanSchema,
-            "events" to arrayOfSchema(
+    private fun buildPass3SynthesisSchema(includeLifecycleFields: Boolean): JsonObject {
+        val eventProps = linkedMapOf<String, JsonObject>(
+            "title" to stringSchema,
+            "summary" to stringSchema,
+            "sections" to arrayOfSchema(
                 objectSchema(
                     mapOf(
-                        "title" to stringSchema,
-                        "summary" to stringSchema,
-                        "sections" to arrayOfSchema(
-                            objectSchema(
-                                mapOf(
-                                    "heading" to stringSchema,
-                                    "bullets" to stringArraySchema,
-                                    "items" to arrayOfSchema(detailItemSchema(includeIcon = true)),
-                                    "content" to stringSchema
-                                )
-                            )
-                        ),
-                        "category" to enumStringSchema(eventCategories),
-                        "priority" to enumStringSchema(eventPriorities),
-                        "event_date" to nullableStringSchema,
-                        "source_message_ids" to integerArraySchema
+                        "heading" to stringSchema,
+                        "bullets" to stringArraySchema,
+                        "items" to arrayOfSchema(detailItemSchema(includeIcon = true)),
+                        "content" to stringSchema
                     )
                 )
+            ),
+            "category" to enumStringSchema(eventCategories),
+            "priority" to enumStringSchema(eventPriorities),
+            "event_date" to nullableStringSchema,
+            "source_message_ids" to integerArraySchema
+        )
+        if (includeLifecycleFields) {
+            eventProps["status"] = enumStringSchema(cardStatuses)
+            eventProps["supersedes_card_id"] = nullableStringSchema
+        }
+        return objectSchema(
+            mapOf(
+                "is_relevant" to booleanSchema,
+                "events" to arrayOfSchema(objectSchema(eventProps))
             )
         )
-    )
+    }
+
+    val pass3SynthesisSchema: JsonObject = buildPass3SynthesisSchema(includeLifecycleFields = false)
+    val pass3SynthesisLifecycleSchema: JsonObject = buildPass3SynthesisSchema(includeLifecycleFields = true)
 
     val cardTranslationSchema: JsonObject = objectSchema(
         mapOf(
@@ -193,9 +200,9 @@ internal object StageJsonSchemas {
         maxTokens = MAX_TOKENS_PASS2_GATEKEEPER
     )
 
-    fun pass3SynthesisOptions() = LlmCompletionOptions(
-        responseSchema = pass3SynthesisSchema,
-        schemaName = "pass3_synthesis",
+    fun pass3SynthesisOptions(includeLifecycleFields: Boolean = false) = LlmCompletionOptions(
+        responseSchema = if (includeLifecycleFields) pass3SynthesisLifecycleSchema else pass3SynthesisSchema,
+        schemaName = if (includeLifecycleFields) "pass3_synthesis_lifecycle" else "pass3_synthesis",
         maxTokens = MAX_TOKENS_PASS3_SYNTHESIS
     )
 
