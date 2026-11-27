@@ -49,6 +49,27 @@ internal object ExtractionCardConsolidator {
         return clusters.map { it.toList() }
     }
 
+    internal fun mergeAttachmentsByKey(attachments: List<EventAttachment>): List<EventAttachment> {
+        if (attachments.size <= 1) return attachments
+        return attachments
+            .groupBy { it.previewKey() }
+            .values
+            .map { group ->
+                val primary = group.first()
+                if (group.size == 1) {
+                    primary
+                } else {
+                    primary.copy(
+                        localPath = group.firstNotNullOfOrNull { it.localPath?.takeIf(String::isNotBlank) },
+                        fileSizeBytes = group.maxOf { it.fileSizeBytes },
+                        md5 = group.firstOrNull { it.md5.isNotBlank() }?.md5 ?: primary.md5,
+                        mediaExpireAtSeconds = group.firstNotNullOfOrNull { it.mediaExpireAtSeconds?.takeIf { exp -> exp > 0L } },
+                        wasAnalyzedByAi = group.any { it.wasAnalyzedByAi }
+                    )
+                }
+            }
+    }
+
     private fun mergeCluster(
         clusters: MutableList<MutableList<ResolvedExtraction>>,
         clusterIds: MutableList<MutableSet<Long>>,
@@ -80,7 +101,7 @@ internal object ExtractionCardConsolidator {
         contentFingerprint: String = "",
         recentRoomCards: List<EventCard> = emptyList()
     ): EventCard {
-        val deduplicatedAttachments = sourceAttachments.distinctBy { it.previewKey() }
+        val deduplicatedAttachments = mergeAttachmentsByKey(sourceAttachments)
         if (extractedEvents.size == 1) {
             return buildSingleEventCard(
                 extractedEvents.first(), fallbackTitle, eventSender, roomId, roomDisplayName,

@@ -467,6 +467,8 @@ private fun EventDetailHost(
         isEnrichingSections = selectedCard.id in enrichingCardIds,
         isReextracting = selectedCard.id in reextractingCardIds,
         canReextract = canReextract,
+        parseAttachmentContents = settings.parseAttachmentContents,
+        enableVisualOcr = settings.enableVisualOcr,
         onTranslateSourceMessages = { appState.translateSourceMessages(selectedCard.id) },
         onEnrichSections = { targetSectionIdx -> appState.enrichSectionCards(selectedCard.id, targetSectionIdx) },
         onReextractCard = { appState.reextractCard(selectedCard.id) },

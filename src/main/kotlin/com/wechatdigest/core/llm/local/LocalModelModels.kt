@@ -9,6 +9,7 @@ import java.lang.management.ManagementFactory
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.Locale
 
@@ -314,17 +315,48 @@ class LocalModelPaths(val baseDir: File = defaultBaseDir()) {
     fun runtimeTagDir(tag: String): File = File(runtimeDir, tag)
 
     companion object {
+        private val OWNER_RW_ATTR = runCatching {
+            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
+        }.getOrNull()
+
+        private val OWNER_RWX_ATTR = runCatching {
+            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"))
+        }.getOrNull()
+
         fun defaultBaseDir(): File {
             val userHome = System.getProperty("user.home") ?: "."
             return File(userHome, "Library/Application Support/WeChatDigest")
         }
 
         fun ensureOwnerOnlyDirectory(dir: File): File {
+            if (dir.exists() && Files.isSymbolicLink(dir.toPath())) {
+                throw IllegalStateException("Refusing symlinked storage directory")
+            }
             if (!dir.exists()) {
                 dir.mkdirs()
             }
             setOwnerOnlyPermissions(dir, isDirectory = true)
             return dir
+        }
+
+        fun createOwnerOnlyTempDirectory(prefix: String): File {
+            val dir = if (OWNER_RWX_ATTR != null) {
+                Files.createTempDirectory(prefix, OWNER_RWX_ATTR).toFile()
+            } else {
+                Files.createTempDirectory(prefix).toFile()
+            }
+            setOwnerOnlyPermissions(dir, isDirectory = true)
+            return dir
+        }
+
+        fun createOwnerOnlyTempFile(dir: File, prefix: String, suffix: String): File {
+            val file = if (OWNER_RW_ATTR != null) {
+                Files.createTempFile(dir.toPath(), prefix, suffix, OWNER_RW_ATTR).toFile()
+            } else {
+                Files.createTempFile(dir.toPath(), prefix, suffix).toFile()
+            }
+            setOwnerOnlyPermissions(file, isDirectory = false)
+            return file
         }
 
         fun setOwnerOnlyPermissions(path: File, isDirectory: Boolean, executable: Boolean = false) {

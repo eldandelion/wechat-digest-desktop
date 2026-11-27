@@ -334,7 +334,8 @@ class SyncService(
         val preparedMessages = if (settings.parseAttachmentContents) {
             enrichMessagesWithAttachmentPreviews(
                 messages = substantive,
-                focusHints = extractFocusHints(effectivePersona, effectiveRules)
+                focusHints = extractFocusHints(effectivePersona, effectiveRules),
+                enableVisualOcr = settings.enableVisualOcr
             )
         } else {
             substantive
@@ -428,28 +429,44 @@ class SyncService(
         }
     }
 
-    private fun enrichMessagesWithAttachmentPreviews(
+    internal fun enrichMessagesWithAttachmentPreviews(
         messages: List<WeChatMessage>,
-        focusHints: Set<String>
+        focusHints: Set<String>,
+        enableVisualOcr: Boolean = true,
+        ocrService: com.wechatdigest.core.attachment.LocalVisionOcrService? = AttachmentContentExtractor.defaultOcrService
     ): List<WeChatMessage> {
         return messages.map { msg ->
             if (msg.attachments.isEmpty()) return@map msg
-            val previews = buildMap<String, String> {
-                for (att in msg.attachments) {
-                    val path = att.localPath?.takeIf { it.isNotBlank() } ?: continue
-                    val file = File(path)
-                    if (!file.isFile) continue
-                    val extracted = AttachmentContentExtractor.extractBoundedPreview(file, focusHints)
-                    if (!extracted.isNullOrBlank()) {
-                        put(att.previewKey(), extracted)
-                    }
+            val previews = linkedMapOf<String, String>()
+            val updatedAttachments = msg.attachments.map { att ->
+                val path = att.localPath?.takeIf { it.isNotBlank() } ?: return@map att
+                val file = File(path)
+                if (!file.isFile) return@map att
+                val outcome = AttachmentContentExtractor.extractWithStatus(
+                    file = file,
+                    focusHints = focusHints,
+                    enableVisualOcr = enableVisualOcr,
+                    ocrService = ocrService,
+                    extensionOverride = att.fileExtension
+                )
+                if (!outcome.preview.isNullOrBlank()) {
+                    previews[att.previewKey()] = outcome.preview
+                }
+                if (outcome.analyzedByAi && !att.wasAnalyzedByAi) {
+                    att.copy(wasAnalyzedByAi = true)
+                } else {
+                    att
                 }
             }
-            if (previews.isEmpty()) msg else msg.copy(attachmentPreviews = previews)
+            if (previews.isEmpty() && updatedAttachments == msg.attachments) {
+                msg
+            } else {
+                msg.copy(attachments = updatedAttachments, attachmentPreviews = previews)
+            }
         }
     }
 
-    private fun extractFocusHints(persona: String, customRules: String): Set<String> {
+    internal fun extractFocusHints(persona: String, customRules: String): Set<String> {
         return "$persona $customRules"
             .split(Regex("[\\s,.;:!?/\\\\|()\\[\\]{}\"']+"))
             .asSequence()

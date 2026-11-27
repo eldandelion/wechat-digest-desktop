@@ -158,6 +158,7 @@ internal fun WeChatStorageSettingsCard(
     attachmentRootDir: String,
     messagesPerSync: String,
     parseAttachmentContents: Boolean,
+    enableVisualOcr: Boolean,
     isAutoDetecting: Boolean,
     autoDetectFeedback: String?,
     onAutoDetect: () -> Unit,
@@ -169,7 +170,8 @@ internal fun WeChatStorageSettingsCard(
     onKeysPathChange: (String) -> Unit,
     onAttachmentRootDirChange: (String) -> Unit,
     onMessagesPerSyncChange: (String) -> Unit,
-    onParseAttachmentContentsChange: (Boolean) -> Unit
+    onParseAttachmentContentsChange: (Boolean) -> Unit,
+    onEnableVisualOcrChange: (Boolean) -> Unit
 ) {
     SettingsSectionCard {
         Text(text = "WeChat Ingestion & Storage", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -230,10 +232,18 @@ internal fun WeChatStorageSettingsCard(
         )
         SettingsSwitchRow(
             title = "Parse Downloaded Attachments for AI Summary",
-            subtitle = "Read bounded previews from downloaded Excel, PDF, and Word files when summarizing notices",
+            subtitle = "Read bounded previews from downloaded Excel, Word, PowerPoint, PDF, and text files when summarizing notices",
             checked = parseAttachmentContents,
             onCheckedChange = onParseAttachmentContentsChange
         )
+        if (parseAttachmentContents) {
+            SettingsSwitchRow(
+                title = "Use Apple Vision OCR for Images & Scanned PDFs",
+                subtitle = "Locally extract Chinese & English text and QR links from images and scanned PDFs on macOS",
+                checked = enableVisualOcr,
+                onCheckedChange = onEnableVisualOcrChange
+            )
+        }
     }
 }
 

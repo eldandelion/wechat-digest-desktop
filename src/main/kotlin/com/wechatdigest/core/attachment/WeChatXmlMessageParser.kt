@@ -18,6 +18,11 @@ sealed interface ParsedWeChatMessage {
         val markerText: String
     ) : ParsedWeChatMessage
 
+    data class ImageAttachment(
+        val attachment: EventAttachment,
+        val markerText: String
+    ) : ParsedWeChatMessage
+
     data class QuoteReply(
         val replyText: String,
         val quoteSummary: String,
@@ -70,6 +75,7 @@ sealed interface ParsedWeChatMessage {
 
     fun toMessageFields(fallbackText: String): ResolvedXmlFields = when (this) {
         is FileAttachment -> ResolvedXmlFields(textContent = markerText, attachments = listOf(attachment))
+        is ImageAttachment -> ResolvedXmlFields(textContent = markerText, attachments = listOf(attachment))
         is QuoteReply -> ResolvedXmlFields(textContent = replyText, quoteContext = quoteSummary)
         is LinkCard -> ResolvedXmlFields(textContent = displayText, extractedUrls = listOfNotNull(url))
         is MiniProgram -> ResolvedXmlFields(textContent = displayText)
@@ -87,6 +93,7 @@ sealed interface ParsedWeChatMessage {
  */
 object WeChatXmlMessageParser {
 
+    const val LOCAL_TYPE_IMAGE = 3L
     const val BASE_TYPE_APPMSG = 49L
     const val APPMSG_SUBTYPE_LINK = 5L
     const val APPMSG_SUBTYPE_FILE = 6L
@@ -136,6 +143,20 @@ object WeChatXmlMessageParser {
             trimmed.contains("<type>6</type>", ignoreCase = true)
     }
 
+    /** Checks whether a row carries a `local_type=3` image XML payload. */
+    fun isCandidateImageMessage(
+        localType: Long,
+        content: String,
+        allowLegacyXmlFallback: Boolean = false
+    ): Boolean {
+        val baseType = localType and 0xFFFFFFFFL
+        if (baseType == LOCAL_TYPE_IMAGE) return true
+        if (!allowLegacyXmlFallback) return false
+        val trimmed = content.trimStart()
+        return (trimmed.startsWith("<msg") || trimmed.startsWith("<?xml")) &&
+            trimmed.contains("<img", ignoreCase = true)
+    }
+
     /** Parses a `type=6` file message into [EventAttachment], returning `null` for all other subtypes. */
     fun parseFileMessage(rawContent: String, timestampSeconds: Long): EventAttachment? {
         return (parseAppMsgInternal(rawContent, localType = BASE_TYPE_APPMSG, timestampSeconds = timestampSeconds, allowLegacyXmlFallback = true, depth = 0, fileOnly = true)
@@ -159,12 +180,22 @@ object WeChatXmlMessageParser {
         if (baseType == LOCAL_TYPE_REVOKE_SYSMSG) {
             return parseSysMsg(rawContent) ?: ParsedWeChatMessage.IgnoredSysMsg
         }
+        if (baseType == LOCAL_TYPE_IMAGE) {
+            return parseImageMessage(rawContent, timestampSeconds)
+        }
         if (baseType != BASE_TYPE_APPMSG && !allowLegacyXmlFallback) {
             return null
         }
         val trimmed = rawContent.trimStart()
         if (allowLegacyXmlFallback && trimmed.startsWith("<sysmsg", ignoreCase = true)) {
             return parseSysMsg(trimmed) ?: ParsedWeChatMessage.IgnoredSysMsg
+        }
+        if (allowLegacyXmlFallback &&
+            (trimmed.startsWith("<msg", ignoreCase = true) || trimmed.startsWith("<?xml", ignoreCase = true)) &&
+            trimmed.contains("<img", ignoreCase = true) &&
+            !trimmed.contains("<appmsg", ignoreCase = true)
+        ) {
+            parseImageMessage(rawContent, timestampSeconds)?.let { return it }
         }
         return parseAppMsgInternal(
             rawContent = rawContent,
@@ -300,6 +331,7 @@ object WeChatXmlMessageParser {
             )
             val nestedSummary = when (nested) {
                 is ParsedWeChatMessage.FileAttachment -> nested.markerText
+                is ParsedWeChatMessage.ImageAttachment -> nested.markerText
                 is ParsedWeChatMessage.LinkCard -> "[Link] ${nested.title}"
                 is ParsedWeChatMessage.MiniProgram -> "[MiniProgram] ${nested.title}"
                 is ParsedWeChatMessage.ForwardedRecord -> "[Forwarded] ${nested.title}"
@@ -433,6 +465,53 @@ object WeChatXmlMessageParser {
             totalChars += line.length + 1
         }
         return items
+    }
+
+    private fun parseImageMessage(rawContent: String, timestampSeconds: Long): ParsedWeChatMessage.ImageAttachment? {
+        val xmlSlice = extractXmlDocument(rawContent, rootTag = "msg") ?: return null
+        if (xmlSlice.length > MAX_XML_LENGTH) return null
+        val doc = parseXmlDocument(xmlSlice) ?: return null
+        val root = doc.documentElement
+        val imgEl = firstDirectChild(root, "img") ?: firstDescendant(root, "img") ?: return null
+
+        val md5 = imgEl.getAttribute("md5").trim()
+            .lowercase(Locale.ROOT)
+            .takeIf { it.matches(Regex("^[0-9a-f]{32}$")) }
+            .orEmpty()
+        val lengthBytes = imgEl.getAttribute("hdlength").trim().toLongOrNull()?.takeIf { it > 0L }
+            ?: imgEl.getAttribute("length").trim().toLongOrNull()?.takeIf { it > 0L }
+            ?: 0L
+        val hasCdnRef = imgEl.getAttribute("cdnthumburl").isNotBlank() ||
+            imgEl.getAttribute("cdnmidimgurl").isNotBlank() ||
+            imgEl.getAttribute("cdnbigimgurl").isNotBlank() ||
+            imgEl.getAttribute("aeskey").isNotBlank()
+        if (md5.isBlank() && lengthBytes <= 0L && !hasCdnRef) {
+            return null
+        }
+
+        val token = md5.take(12).ifBlank { timestampSeconds.coerceAtLeast(0L).toString() }
+        val fileName = "image_$token.dat"
+        val attachment = EventAttachment(
+            fileName = fileName,
+            fileExtension = "img",
+            fileSizeBytes = lengthBytes,
+            md5 = md5,
+            localPath = null,
+            messageTimestampSeconds = timestampSeconds
+        )
+        return ParsedWeChatMessage.ImageAttachment(
+            attachment = attachment,
+            markerText = formatImageMarker(attachment)
+        )
+    }
+
+    /** Formats a concise transcript marker for a parsed `local_type=3` [attachment]. */
+    fun formatImageMarker(attachment: EventAttachment): String {
+        return if (attachment.fileSizeBytes > 0L) {
+            "[Image Attachment: ${attachment.fileName} (${formatByteSize(attachment.fileSizeBytes)})]"
+        } else {
+            "[Image Attachment: ${attachment.fileName}]"
+        }
     }
 
     private fun parseGroupAnnouncement(root: Element?, appMsgElement: Element): ParsedWeChatMessage.GroupAnnouncement? {

@@ -144,6 +144,7 @@ fun SettingsScreen(appState: AppState) {
             attachmentRootDir = attachmentRootDir,
             messagesPerSync = messagesPerSync,
             parseAttachmentContents = currentSettings.parseAttachmentContents,
+            enableVisualOcr = currentSettings.enableVisualOcr,
             isAutoDetecting = isAutoDetectingWeChat,
             autoDetectFeedback = autoDetectFeedback,
             onAutoDetect = {
@@ -202,7 +203,8 @@ fun SettingsScreen(appState: AppState) {
                     appState.transformSettings { it.copy(messagesPerSync = clamped) }
                 } ?: run { messagesPerSync = next }
             },
-            onParseAttachmentContentsChange = { enabled -> appState.transformSettings { it.copy(parseAttachmentContents = enabled) } }
+            onParseAttachmentContentsChange = { enabled -> appState.transformSettings { it.copy(parseAttachmentContents = enabled) } },
+            onEnableVisualOcrChange = { enabled -> appState.transformSettings { it.copy(enableVisualOcr = enabled) } }
         )
         BackgroundSyncSettingsCard(
             autoSyncEnabled = currentSettings.autoSyncEnabled,

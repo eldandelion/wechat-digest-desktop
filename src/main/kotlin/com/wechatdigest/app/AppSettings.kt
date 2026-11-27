@@ -50,6 +50,7 @@ data class AppSettings(
     val notifyOnManualSync: Boolean = false,
     val prefilter: PrefilterConfig = PrefilterConfig(),
     val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
-    val parseAttachmentContents: Boolean = true
+    val parseAttachmentContents: Boolean = true,
+    val enableVisualOcr: Boolean = true
 )
 

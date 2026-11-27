@@ -10,6 +10,7 @@ import org.apache.pdfbox.pdmodel.PDPage
 import org.apache.pdfbox.pdmodel.PDPageContentStream
 import org.apache.pdfbox.pdmodel.font.PDType1Font
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts
+import org.apache.poi.xslf.usermodel.XMLSlideShow
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import org.apache.poi.xwpf.usermodel.XWPFDocument
 import org.junit.jupiter.api.Test
@@ -382,6 +383,111 @@ class AttachmentPipelineTest {
             autoDetectSingleAccountRoot = false
         )
         kotlin.test.assertNull(symResolver.resolveMsgFileRoot())
+    }
+
+    @Test
+    fun `content extractor parses pptx slides notes tables, allows multi-part OOXML under 2000 entries, and OCRs blank scanned PDFs`() {
+        // 1. PPTX slides, table, grouped shapes, notes, and focusHints selection
+        val pptxFile = File(tempDir, "orientation_deck.pptx")
+        XMLSlideShow().use { show ->
+            val slide1 = show.createSlide()
+            slide1.createTextBox().apply { text = "Welcome Orientation Deck" }
+
+            val slide2 = show.createSlide()
+            slide2.createTextBox().apply { text = "Campus Cafeteria Hours" }
+
+            val slide3 = show.createSlide()
+            slide3.createTextBox().apply { text = "Scholarship Deadline Nov 30" }
+            val tbl = slide3.createTable(2, 2)
+            tbl.rows[0].cells[0].text = "Form"
+            tbl.rows[0].cells[1].text = "Office"
+            tbl.rows[1].cells[0].text = "F-104"
+            tbl.rows[1].cells[1].text = "Room 308"
+            val grp = slide3.createGroup()
+            grp.createTextBox().apply { text = "Bring original transcript" }
+
+            pptxFile.outputStream().use { show.write(it) }
+        }
+        val pptxPreview = AttachmentContentExtractor.extractBoundedPreview(
+            file = pptxFile,
+            focusHints = setOf("scholarship", "deadline"),
+            maxChars = 320
+        )
+        assertNotNull(pptxPreview)
+        assertTrue(pptxPreview.contains("Welcome Orientation Deck"))
+        assertTrue(pptxPreview.contains("Scholarship Deadline"))
+
+        // 2. Zip entries > 200 (e.g. 260) succeed safely while > 2000 fails closed as zip bomb
+        val manyPartsDocx = File(tempDir, "rich_300_parts.docx")
+        createZipWithExtraEntries(targetZip = manyPartsDocx, extraEntryCount = 260)
+        assertNotNull(AttachmentContentExtractor.extractBoundedPreview(manyPartsDocx))
+
+        val hugePartsDocx = File(tempDir, "too_many_2050_parts.docx")
+        createZipWithExtraEntries(targetZip = hugePartsDocx, extraEntryCount = 2050)
+        assertNull(AttachmentContentExtractor.extractBoundedPreview(hugePartsDocx))
+
+        // 3. Scanned blank-text PDF triggers PDFRenderer -> OCR service
+        val scannedPdf = File(tempDir, "scanned_notice.pdf")
+        PDDocument().use { doc ->
+            doc.addPage(PDPage())
+            doc.save(scannedPdf)
+        }
+        val fakeBin = File(tempDir, "fake-ocr-bin").apply {
+            writeText("#!/bin/sh\necho ok\n")
+            setExecutable(true)
+        }
+        val mockOcr = LocalVisionOcrService(
+            binDir = File(tempDir, "ocr-bin"),
+            isMacOs = { true },
+            customBinaryResolver = { fakeBin },
+            processRunner = { _, _ ->
+                VisionProcessResult(
+                    exitCode = 0,
+                    stdout = """{"text":"Scanned Exam Notice: Friday 14:00 in Hall B","qrPayloads":[]}""",
+                    stderr = ""
+                )
+            }
+        )
+        val disabledOutcome = AttachmentContentExtractor.extractWithStatus(
+            file = scannedPdf,
+            enableVisualOcr = false,
+            ocrService = mockOcr
+        )
+        assertFalse(disabledOutcome.analyzedByAi)
+        assertNull(disabledOutcome.preview)
+
+        val ocrOutcome = AttachmentContentExtractor.extractWithStatus(
+            file = scannedPdf,
+            enableVisualOcr = true,
+            ocrService = mockOcr
+        )
+        assertTrue(ocrOutcome.analyzedByAi)
+        assertNotNull(ocrOutcome.preview)
+        assertTrue(ocrOutcome.preview!!.contains("Scanned Exam Notice: Friday 14:00 in Hall B"))
+    }
+
+    private fun createZipWithExtraEntries(targetZip: File, extraEntryCount: Int) {
+        val baseDocx = File(tempDir, "template_$extraEntryCount.docx")
+        XWPFDocument().use { doc ->
+            doc.createParagraph().createRun().setText("Valid content inside multi-part archive")
+            baseDocx.outputStream().use { doc.write(it) }
+        }
+        java.util.zip.ZipFile(baseDocx).use { zin ->
+            java.util.zip.ZipOutputStream(targetZip.outputStream()).use { zout ->
+                val entries = zin.entries()
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    zout.putNextEntry(java.util.zip.ZipEntry(entry.name))
+                    zin.getInputStream(entry).use { it.copyTo(zout) }
+                    zout.closeEntry()
+                }
+                for (i in 0 until extraEntryCount) {
+                    zout.putNextEntry(java.util.zip.ZipEntry("customXml/item$i.xml"))
+                    zout.write("<empty/>".toByteArray())
+                    zout.closeEntry()
+                }
+            }
+        }
     }
 
     private fun md5Hex(bytes: ByteArray): String =

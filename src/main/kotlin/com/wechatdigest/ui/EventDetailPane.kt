@@ -50,14 +50,17 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Forum
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MarkEmailRead
 import androidx.compose.material.icons.filled.MarkEmailUnread
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Slideshow
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.NotificationAdd
 import androidx.compose.material3.AlertDialog
@@ -66,6 +69,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -104,6 +108,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.wechatdigest.core.attachment.AttachmentContentExtractor
 import com.wechatdigest.core.calendar.IcsCalendarGenerator
 import com.wechatdigest.core.model.DeadlineTriage
 import com.wechatdigest.core.model.DeadlineUrgency
@@ -181,6 +186,8 @@ internal fun EventDetailPane(
     onEnrichSections: (Int?) -> Unit = {},
     isReextracting: Boolean = false,
     canReextract: Boolean = true,
+    parseAttachmentContents: Boolean = true,
+    enableVisualOcr: Boolean = true,
     onReextractCard: () -> Unit = {},
     onQuickEditCard: (String, EventCategory, EventPriority, String?) -> Unit = { _, _, _, _ -> },
     onLoadContextMessages: suspend () -> Result<WeChatMessageRepository.ContextMessagesResult> = {
@@ -263,6 +270,10 @@ internal fun EventDetailPane(
                 isShowingTranslation = isShowingTranslation,
                 isRecheckingAttachments = isRecheckingAttachments,
                 isEnrichingSections = isEnrichingSections,
+                isReextracting = isReextracting,
+                canReextract = canReextract,
+                parseAttachmentContents = parseAttachmentContents,
+                enableVisualOcr = enableVisualOcr,
                 sourceBubbles = sourceBubbles,
                 highlightedBubbleIndex = highlightedBubbleIndex,
                 onDetailItemClick = { item ->
@@ -283,6 +294,7 @@ internal fun EventDetailPane(
                 onOpenAttachment = onOpenAttachment,
                 onRevealAttachmentInFinder = onRevealAttachmentInFinder,
                 onRecheckAttachments = onRecheckAttachments,
+                onReextractCard = onReextractCard,
                 onToggleStar = onToggleStar,
                 onAddToCalendar = onAddToCalendar
             )
@@ -494,6 +506,10 @@ private fun EventDetailScrollContent(
     isShowingTranslation: Boolean,
     isRecheckingAttachments: Boolean,
     isEnrichingSections: Boolean,
+    isReextracting: Boolean,
+    canReextract: Boolean,
+    parseAttachmentContents: Boolean,
+    enableVisualOcr: Boolean,
     sourceBubbles: List<SourceMessageBubble>,
     highlightedBubbleIndex: Int?,
     onDetailItemClick: (EventDetailItem) -> Unit,
@@ -506,6 +522,7 @@ private fun EventDetailScrollContent(
     onOpenAttachment: (EventAttachment) -> Unit,
     onRevealAttachmentInFinder: (EventAttachment) -> Unit,
     onRecheckAttachments: () -> Unit,
+    onReextractCard: () -> Unit,
     onToggleStar: () -> Unit,
     onAddToCalendar: () -> Unit
 ) {
@@ -556,7 +573,21 @@ private fun EventDetailScrollContent(
             }
             if (card.attachments.isNotEmpty()) {
                 Spacer(Modifier.height(12.dp))
-                AttachmentsSection(card.attachments, isRecheckingAttachments, onOpenAttachment, onRevealAttachmentInFinder, onRecheckAttachments)
+                key(card.id) {
+                    AttachmentsSection(
+                        attachments = card.attachments,
+                        isRechecking = isRecheckingAttachments,
+                        parseAttachmentContents = parseAttachmentContents,
+                        enableVisualOcr = enableVisualOcr,
+                        hasSourceMessages = hasSourceMessages,
+                        isReextracting = isReextracting,
+                        canReextract = canReextract,
+                        onOpenAttachment = onOpenAttachment,
+                        onRevealInFinder = onRevealAttachmentInFinder,
+                        onRecheck = onRecheckAttachments,
+                        onReextractCard = onReextractCard
+                    )
+                }
             }
             if (hasSourceMessages) {
                 Spacer(Modifier.height(12.dp))
@@ -1370,14 +1401,59 @@ private fun EventDetailNavigationBar(
     }
 }
 
+private data class AttachmentSectionUiState(
+    val presenceByIndex: List<Boolean> = emptyList(),
+    val extractableByIndex: List<Boolean> = emptyList(),
+    val hasUnanalyzedExtractable: Boolean = false
+)
+
 @Composable
 private fun AttachmentsSection(
     attachments: List<EventAttachment>,
     isRechecking: Boolean,
+    parseAttachmentContents: Boolean,
+    enableVisualOcr: Boolean,
+    hasSourceMessages: Boolean,
+    isReextracting: Boolean,
+    canReextract: Boolean,
     onOpenAttachment: (EventAttachment) -> Unit,
     onRevealInFinder: (EventAttachment) -> Unit,
-    onRecheck: () -> Unit
+    onRecheck: () -> Unit,
+    onReextractCard: () -> Unit
 ) {
+    val sectionState by produceState(
+        initialValue = AttachmentSectionUiState(),
+        attachments,
+        isRechecking,
+        parseAttachmentContents,
+        enableVisualOcr
+    ) {
+        value = withContext(Dispatchers.IO) {
+            val isVisionAvailable = if (parseAttachmentContents && enableVisualOcr) {
+                AttachmentContentExtractor.defaultOcrService.isAvailable()
+            } else {
+                false
+            }
+            val presence = attachments.map { it.isLocalFilePresent() }
+            val extractable = attachments.map { att ->
+                parseAttachmentContents && AttachmentContentExtractor.isExtractableAttachment(
+                    fileExtension = att.fileExtension,
+                    fileName = att.fileName,
+                    enableVisualOcr = enableVisualOcr,
+                    isVisionAvailable = isVisionAvailable
+                )
+            }
+            val anyUnanalyzedExtractable = attachments.indices.any { idx ->
+                presence[idx] && extractable[idx] && !attachments[idx].wasAnalyzedByAi
+            }
+            AttachmentSectionUiState(
+                presenceByIndex = presence,
+                extractableByIndex = extractable,
+                hasUnanalyzedExtractable = anyUnanalyzedExtractable
+            )
+        }
+    }
+
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
             text = if (attachments.size == 1) "Attachment" else "Attachments (${attachments.size})",
@@ -1385,12 +1461,63 @@ private fun AttachmentsSection(
             fontWeight = FontWeight.Medium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        if (hasSourceMessages && sectionState.hasUnanalyzedExtractable) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Attachment found — Update AI Summary",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Text(
+                            text = "Re-analyze this notice using the newly downloaded file or image.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f)
+                        )
+                    }
+                    FilledTonalButton(
+                        onClick = onReextractCard,
+                        enabled = canReextract && !isReextracting,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(34.dp)
+                    ) {
+                        if (isReextracting) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Updating...", style = MaterialTheme.typography.labelMedium)
+                        } else {
+                            Text("Update Summary", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+            }
+        }
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             attachments.forEachIndexed { index, attachment ->
-                key(attachment.previewKey()) {
+                key(index, attachment.previewKey()) {
+                    val isPresent = sectionState.presenceByIndex.getOrElse(index) { false }
+                    val isExtractable = sectionState.extractableByIndex.getOrElse(index) { false }
                     AttachmentRow(
                         attachment = attachment,
                         shape = segmentedItemShape(index = index, totalCount = attachments.size),
+                        isPresent = isPresent,
+                        isExtractable = isExtractable,
                         isRechecking = isRechecking,
                         onOpen = { onOpenAttachment(attachment) },
                         onRevealInFinder = { onRevealInFinder(attachment) },
@@ -1406,17 +1533,18 @@ private fun AttachmentsSection(
 private fun AttachmentRow(
     attachment: EventAttachment,
     shape: RoundedCornerShape,
+    isPresent: Boolean,
+    isExtractable: Boolean,
     isRechecking: Boolean,
     onOpen: () -> Unit,
     onRevealInFinder: () -> Unit,
     onRecheck: () -> Unit
 ) {
-    val isPresent by produceState(initialValue = false, attachment.previewKey(), attachment.localPath, isRechecking) {
-        value = withContext(Dispatchers.IO) { attachment.isLocalFilePresent() }
-    }
     val isExpired = remember(attachment.mediaExpireAtSeconds) { attachment.isExpired() }
     val sizeText = remember(attachment.fileSizeBytes) { formatFileSizeLabel(attachment.fileSizeBytes) }
     val statusText = when {
+        isPresent && attachment.wasAnalyzedByAi -> "$sizeText • Downloaded • Analyzed by AI"
+        isPresent && isExtractable -> "$sizeText • Downloaded • Not in AI summary"
         isPresent -> "$sizeText • Downloaded"
         isExpired -> "$sizeText • Expired in WeChat"
         else -> "$sizeText • Open in WeChat, then Re-check"
@@ -1424,7 +1552,7 @@ private fun AttachmentRow(
 
     Surface(modifier = Modifier.fillMaxWidth(), shape = shape, color = MaterialTheme.colorScheme.surfaceContainerLowest) {
         Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            AttachmentRowLeadingIcon(fileExtension = attachment.fileExtension, isPresent = isPresent)
+            AttachmentRowLeadingIcon(fileExtension = attachment.effectiveExtension(), isPresent = isPresent)
             Spacer(Modifier.width(12.dp))
             AttachmentRowMetadata(fileName = attachment.fileName, statusText = statusText, isExpiredError = isExpired && !isPresent, modifier = Modifier.weight(1f))
             Spacer(Modifier.width(8.dp))
@@ -1438,6 +1566,8 @@ private fun AttachmentRowLeadingIcon(fileExtension: String, isPresent: Boolean) 
     val fileIcon = when (fileExtension.lowercase(Locale.ROOT)) {
         "xlsx", "xls", "csv", "tsv" -> Icons.Default.TableChart
         "pdf" -> Icons.Default.PictureAsPdf
+        "pptx", "ppt" -> Icons.Default.Slideshow
+        in EventAttachment.IMAGE_EXTENSIONS -> Icons.Default.Image
         else -> Icons.Default.Description
     }
     val containerTint = if (isPresent) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh

@@ -490,12 +490,10 @@ class EventCardStore(private val db: AppDatabase) {
                 status = ?,
                 supersedes_card_id = ?,
                 content_fingerprint = ?,
-                checked_items = ?
+                checked_items = ?,
+                attachments = ?
             WHERE id = ? AND is_dismissed = 0
         """.trimIndent()
-        val resolvedFp = replacement.contentFingerprint.ifBlank {
-            ContentFingerprint.compute(replacement.sourceMessages, replacement.attachments.map { it.md5 })
-        }
         db.getConnection().use { conn ->
             conn.autoCommit = false
             try {
@@ -505,6 +503,20 @@ class EventCardStore(private val db: AppDatabase) {
                     return null
                 }
                 val prunedChecked = DetailChecklistKeys.sanitizeCheckedItems(existing.checkedItems, replacement.sections)
+                val replacementByKey = replacement.attachments.associateBy { it.previewKey() }
+                val mergedExisting = existing.attachments.map { prev ->
+                    val next = replacementByKey[prev.previewKey()] ?: return@map prev
+                    next.copy(
+                        localPath = next.localPath?.takeIf { it.isNotBlank() }
+                            ?: prev.localPath?.takeIf { java.io.File(it).isFile },
+                        wasAnalyzedByAi = prev.wasAnalyzedByAi || next.wasAnalyzedByAi
+                    )
+                }
+                val existingKeys = existing.attachments.mapTo(HashSet()) { it.previewKey() }
+                val mergedAttachments = mergedExisting + replacement.attachments.filter { it.previewKey() !in existingKeys }
+                val resolvedFp = replacement.contentFingerprint.ifBlank {
+                    ContentFingerprint.compute(replacement.sourceMessages, mergedAttachments.map { it.md5 })
+                }
                 conn.prepareStatement(sql).use { stmt ->
                     stmt.setString(1, replacement.title)
                     stmt.setString(2, replacement.summary)
@@ -517,7 +529,8 @@ class EventCardStore(private val db: AppDatabase) {
                     stmt.setString(9, replacement.supersedesCardId)
                     stmt.setString(10, resolvedFp)
                     stmt.setString(11, json.encodeToString(prunedChecked))
-                    stmt.setString(12, existingId)
+                    stmt.setString(12, json.encodeToString(mergedAttachments))
+                    stmt.setString(13, existingId)
                     if (stmt.executeUpdate() == 0) {
                         conn.rollback()
                         return null

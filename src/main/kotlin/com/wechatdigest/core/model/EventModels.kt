@@ -235,10 +235,18 @@ data class EventAttachment(
     val md5: String = "",
     val localPath: String? = null,
     val messageTimestampSeconds: Long = 0L,
-    val mediaExpireAtSeconds: Long? = null
+    val mediaExpireAtSeconds: Long? = null,
+    val wasAnalyzedByAi: Boolean = false
 ) {
     /** Returns `true` when [localPath] is populated and points to an existing regular file on disk. */
     fun isLocalFilePresent(): Boolean = !localPath.isNullOrBlank() && File(localPath).isFile
+
+    /** Returns `true` when this attachment represents an image file or WeChat `.dat` image cache. */
+    fun isImageAttachment(): Boolean = effectiveExtension() in IMAGE_EXTENSIONS
+
+    /** Returns normalized lowercase file extension, falling back to [fileName] extension when blank. */
+    fun effectiveExtension(): String = fileExtension.trim().lowercase(Locale.ROOT)
+        .ifBlank { fileName.substringAfterLast('.', "").lowercase(Locale.ROOT) }
 
     /** Returns `true` when WeChat's `media_expire_at` timestamp has passed relative to [nowEpochSeconds]. */
     fun isExpired(nowEpochSeconds: Long = System.currentTimeMillis() / 1000): Boolean =
@@ -246,6 +254,11 @@ data class EventAttachment(
 
     /** Stable deduplication key built from normalized MD5 (or fallback filename and timestamp). */
     fun previewKey(): String = md5.trim().lowercase(Locale.ROOT).ifBlank { "$fileName:$messageTimestampSeconds" }
+
+    companion object {
+        /** Image & obfuscated `.dat` cache extensions handled by the visual OCR and attach resolvers. */
+        val IMAGE_EXTENSIONS: Set<String> = setOf("jpg", "jpeg", "png", "gif", "webp", "heic", "dat", "img")
+    }
 }
 
 @Serializable

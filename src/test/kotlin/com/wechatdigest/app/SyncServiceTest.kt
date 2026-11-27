@@ -1546,4 +1546,60 @@ class SyncServiceTest {
         assertEquals(5, bounded.messages.size)
         assertEquals(1, repo.getRecentMessages(room, limit = -10).size)
     }
+
+    @Test
+    fun `enrichMessagesWithAttachmentPreviews runs Vision OCR on XOR dat chat images and marks wasAnalyzedByAi`() {
+        val imgBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val xorDat = ByteArray(imgBytes.size) { i -> ((imgBytes[i].toInt() and 0xFF) xor 0x55).toByte() }
+        val datFile = File(tempDir, "poster.dat").apply { writeBytes(xorDat) }
+
+        val fakeBin = File(tempDir, "fake-vision-sync").apply {
+            writeText("#!/bin/sh\necho ok\n")
+            setExecutable(true)
+        }
+        val mockOcr = com.wechatdigest.core.attachment.LocalVisionOcrService(
+            binDir = File(tempDir, "sync-ocr-bin"),
+            isMacOs = { true },
+            customBinaryResolver = { fakeBin },
+            processRunner = { _, _ ->
+                com.wechatdigest.core.attachment.VisionProcessResult(
+                    exitCode = 0,
+                    stdout = """{"text":"Seminar Friday 10am","qrPayloads":["https://example.edu/reg"]}""",
+                    stderr = ""
+                )
+            }
+        )
+
+        val msg = com.wechatdigest.core.model.WeChatMessage(
+            localId = 7L,
+            timestampSeconds = 1795000000L,
+            senderId = "wxid_a",
+            senderDisplayName = "Teacher",
+            rawContent = "<msg><img /></msg>",
+            textContent = "[Image Attachment: poster.dat]",
+            isZstdCompressed = false,
+            localType = 3L,
+            attachments = listOf(
+                com.wechatdigest.core.model.EventAttachment(
+                    fileName = "poster.dat",
+                    fileExtension = "img",
+                    localPath = datFile.absolutePath,
+                    wasAnalyzedByAi = false
+                )
+            )
+        )
+        val service = SyncService(eventCardStore = eventCardStore, syncCheckpointStore = SyncCheckpointStore(appDb))
+        val enriched = service.enrichMessagesWithAttachmentPreviews(
+            messages = listOf(msg),
+            focusHints = setOf("seminar"),
+            enableVisualOcr = true,
+            ocrService = mockOcr
+        ).single()
+
+        assertTrue(enriched.attachments.single().wasAnalyzedByAi)
+        val preview = enriched.attachmentPreviews[enriched.attachments.single().previewKey()]
+        kotlin.test.assertNotNull(preview)
+        assertTrue(preview.contains("Seminar Friday 10am"))
+        assertTrue(preview.contains("[QR Code]: https://example.edu/reg"))
+    }
 }

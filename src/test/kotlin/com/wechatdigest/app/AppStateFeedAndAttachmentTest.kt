@@ -612,4 +612,103 @@ class AppStateFeedAndAttachmentTest {
             appState.scheduler.stop()
         }
     }
+
+    @Test
+    fun `closed-loop pending attachment discovery is debounced and reextractCard enriches updated summary with wasAnalyzedByAi`() = runBlocking {
+        val accountDir = File(tempDir, "closed_loop_wxid").apply { mkdirs() }
+        val dbStorage = File(accountDir, "db_storage").apply { mkdirs() }
+        val hardlinkDir = File(dbStorage, "hardlink").apply { mkdirs() }
+        val msgFileMonth = File(accountDir, "msg/file/2026-11").apply { mkdirs() }
+
+        val contentBytes = "Exam Room: Hall B-201\nTime: Nov 30 09:00\n".toByteArray()
+        val md5 = java.security.MessageDigest.getInstance("MD5")
+            .digest(contentBytes)
+            .joinToString("") { "%02x".format(it) }
+
+        val initialCard = EventCard(
+            id = "closed-loop-1",
+            title = "Exam Notice",
+            summary = "Teacher shared exam_seats.csv.",
+            translatedSummary = "Teacher shared exam_seats.csv.",
+            category = EventCategory.EXAM,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Prof. Chen",
+            originalSenderId = "wxid_chen",
+            sourceRoomId = "cs@chatroom",
+            sourceRoomName = "CS Class",
+            sourceMessages = "[2026-11-20 10:00:00] Prof. Chen: [Shared File: exam_seats.csv]",
+            sourceLocalIds = listOf(10L),
+            timestampSeconds = 1795000000L,
+            attachments = listOf(
+                com.wechatdigest.core.model.EventAttachment(
+                    fileName = "exam_seats.csv",
+                    fileExtension = "csv",
+                    fileSizeBytes = contentBytes.size.toLong(),
+                    md5 = md5,
+                    localPath = null,
+                    messageTimestampSeconds = 1795000000L,
+                    wasAnalyzedByAi = false
+                )
+            )
+        )
+        eventCardStore.upsert(listOf(initialCard))
+
+        var capturedPrompt = ""
+        val engine = MockEngine { req ->
+            val body = (req.body as? io.ktor.http.content.OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString() ?: ""
+            capturedPrompt = body
+            val responseJson = """{"is_relevant":true,"events":[{"title":"Exam Notice — Hall B-201","summary":"Exam in Hall B-201 on Nov 30 at 09:00.","category":"EXAM","priority":"CRITICAL","source_message_ids":[10]}]}"""
+            val wrapper = """{"choices":[{"message":{"role":"assistant","content":${kotlinx.serialization.json.Json.encodeToString(kotlinx.serialization.serializer<String>(), responseJson)}}}]}"""
+            respond(wrapper, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()))
+        }
+
+        val syncService = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = com.wechatdigest.storage.SyncCheckpointStore(appDb),
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = syncService.syncCheckpointStore,
+            syncService = syncService,
+            scope = testScope,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        appState.updateSettings(
+            AppSettings(
+                wechatDataDir = dbStorage.absolutePath,
+                parseAttachmentContents = true,
+                llm = com.wechatdigest.core.llm.LlmConfig(
+                    providerType = com.wechatdigest.core.llm.LlmProviderType.OPENAI_COMPATIBLE,
+                    apiKey = "test-key"
+                )
+            )
+        ).join()
+        appState.loadEvents().join()
+
+        // First scan finds no downloaded file yet
+        appState.recheckAllPendingAttachments(nowMs = 1_000L).join()
+        assertNull(appState.events.value.single().attachments.single().localPath)
+
+        // Now simulate user downloading the attachment in WeChat
+        val csvFile = File(msgFileMonth, "exam_seats.csv").apply { writeBytes(contentBytes) }
+
+        // Inside 10s cooldown window without force -> debounced skip
+        appState.recheckAllPendingAttachments(force = false, nowMs = 5_000L).join()
+        assertNull(appState.events.value.single().attachments.single().localPath)
+
+        // Past cooldown -> discovers downloaded file, keeps wasAnalyzedByAi = false until summary updated
+        appState.recheckAllPendingAttachments(force = false, nowMs = 12_500L).join()
+        val afterDiscovery = appState.events.value.single()
+        assertEquals(csvFile.canonicalPath, afterDiscovery.attachments.single().localPath)
+        assertFalse(afterDiscovery.attachments.single().wasAnalyzedByAi)
+
+        // Single-card re-extraction enriches preview and marks wasAnalyzedByAi = true
+        appState.reextractCard("closed-loop-1").join()
+        val afterReextract = appState.events.value.single()
+        assertEquals("Exam Notice — Hall B-201", afterReextract.title)
+        assertTrue(afterReextract.attachments.single().wasAnalyzedByAi)
+        assertTrue(capturedPrompt.contains("Hall B-201"), "Re-extraction prompt must embed newly discovered attachment content")
+    }
 }

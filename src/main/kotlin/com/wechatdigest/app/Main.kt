@@ -207,6 +207,16 @@ fun main() {
             LaunchedEffect(window) {
                 window.minimumSize = java.awt.Dimension(440, 500)
             }
+            DisposableEffect(window) {
+                val focusListener = object : java.awt.event.WindowFocusListener {
+                    override fun windowGainedFocus(e: java.awt.event.WindowEvent?) {
+                        appState.recheckAllPendingAttachments()
+                    }
+                    override fun windowLostFocus(e: java.awt.event.WindowEvent?) = Unit
+                }
+                window.addWindowFocusListener(focusListener)
+                onDispose { window.removeWindowFocusListener(focusListener) }
+            }
             WeChatDigestTheme(themeMode = currentSettings.themeMode) {
                 MainAppShell(
                     appState = appState,

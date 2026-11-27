@@ -893,4 +893,71 @@ class StorageTest {
         settingsStore.save(com.wechatdigest.app.AppSettings(messagesPerSync = -5))
         assertEquals(1, settingsStore.load().messagesPerSync)
     }
+
+    @Test
+    fun `replaceExtractedCardOrThrow persists updated attachments wasAnalyzedByAi and preserves legacy false defaults`() {
+        val jsonWithoutNewField = """
+            [{"fileName":"guide.pdf","fileExtension":"pdf","fileSizeBytes":1200,"md5":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+        """.trimIndent()
+        val decodedLegacy = com.wechatdigest.core.llm.LlmJsonUtils.sharedJson
+            .decodeFromString<List<com.wechatdigest.core.model.EventAttachment>>(jsonWithoutNewField)
+        assertFalse(decodedLegacy.single().wasAnalyzedByAi)
+
+        val initialCard = EventCard(
+            id = "att-reextract-card-1",
+            title = "Initial Summary",
+            summary = "See attached guide.",
+            translatedSummary = "See attached guide.",
+            category = EventCategory.NOTICE,
+            priority = EventPriority.NORMAL,
+            originalSender = "Advisor",
+            originalSenderId = "wxid_adv",
+            sourceRoomId = "adv@chatroom",
+            sourceMessages = "[2026-11-20 10:00:00] Advisor: Check guide.pdf.",
+            timestampSeconds = 1795000000L,
+            isRead = true,
+            isStarred = true,
+            attachments = listOf(
+                com.wechatdigest.core.model.EventAttachment(
+                    fileName = "guide.pdf",
+                    fileExtension = "pdf",
+                    fileSizeBytes = 1200L,
+                    md5 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    localPath = null,
+                    wasAnalyzedByAi = false
+                )
+            )
+        )
+        eventCardStore.upsert(listOf(initialCard))
+
+        val updated = eventCardStore.replaceExtractedCardOrThrow(
+            existingId = "att-reextract-card-1",
+            replacement = initialCard.copy(
+                title = "Detailed Guide Summary",
+                summary = "Updated from guide.pdf",
+                translatedSummary = "Updated from guide.pdf",
+                attachments = initialCard.attachments.map {
+                    it.copy(localPath = "/tmp/guide.pdf", wasAnalyzedByAi = true)
+                }
+            )
+        )
+        assertNotNull(updated)
+        assertEquals("Detailed Guide Summary", updated.title)
+        assertTrue(updated.isRead)
+        assertTrue(updated.isStarred)
+        assertEquals("/tmp/guide.pdf", updated.attachments.single().localPath)
+        assertTrue(updated.attachments.single().wasAnalyzedByAi)
+
+        // If a partial re-extraction emits no attachments, existing attachments & flags must still be preserved
+        val emptyReplacement = eventCardStore.replaceExtractedCardOrThrow(
+            existingId = "att-reextract-card-1",
+            replacement = initialCard.copy(
+                title = "Partial Summary",
+                attachments = emptyList()
+            )
+        )
+        assertNotNull(emptyReplacement)
+        assertEquals(1, emptyReplacement.attachments.size)
+        assertTrue(emptyReplacement.attachments.single().wasAnalyzedByAi)
+    }
 }

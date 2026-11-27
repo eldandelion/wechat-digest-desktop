@@ -1,3 +1,6 @@
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+
 plugins {
     kotlin("jvm") version "2.0.21"
     kotlin("plugin.serialization") version "2.0.21"
@@ -61,7 +64,58 @@ kotlin {
     jvmToolchain(21)
 }
 
+val generatedVisionResourcesDir = layout.buildDirectory.dir("generated-vision-resources")
+val visionOcrSourceFile = layout.projectDirectory.file("src/main/native/vision-ocr/main.swift")
+
+val compileVisionOcrHelper by tasks.registering {
+    description = "Compiles the bundled macOS Swift Apple Vision CLI helper."
+    group = "build"
+    onlyIf {
+        System.getProperty("os.name").lowercase().contains("mac")
+    }
+    inputs.file(visionOcrSourceFile)
+    outputs.dir(generatedVisionResourcesDir)
+    doLast {
+        val outDir = generatedVisionResourcesDir.get().file("native/darwin").asFile
+        outDir.mkdirs()
+        val binaryFile = File(outDir, "vision-ocr")
+        val xcrunFile = File("/usr/bin/xcrun")
+        if (!xcrunFile.canExecute()) {
+            throw GradleException("Missing pinned macOS toolchain /usr/bin/xcrun required to compile vision-ocr.")
+        }
+        val proc = ProcessBuilder(
+            xcrunFile.absolutePath,
+            "swiftc",
+            "-O",
+            "-framework", "Vision",
+            "-framework", "ImageIO",
+            "-framework", "CoreGraphics",
+            visionOcrSourceFile.asFile.absolutePath,
+            "-o", binaryFile.absolutePath
+        ).redirectErrorStream(true).start()
+        proc.outputStream.close()
+        val output = proc.inputStream.bufferedReader().use { it.readText() }
+        val finished = proc.waitFor(120, TimeUnit.SECONDS)
+        if (!finished) {
+            proc.destroyForcibly()
+            throw GradleException("Timed out compiling vision-ocr Swift helper after 120s.")
+        }
+        val exitCode = proc.exitValue()
+        if (exitCode != 0) {
+            throw GradleException("Failed to compile vision-ocr Swift helper (exit $exitCode):\n$output")
+        }
+        binaryFile.setExecutable(true)
+        val sha256 = MessageDigest.getInstance("SHA-256")
+            .digest(binaryFile.readBytes())
+            .joinToString("") { "%02x".format(it) }
+        File(outDir, "vision-ocr.sha256").writeText("$sha256\n", Charsets.UTF_8)
+    }
+}
+
 sourceSets {
+    main {
+        resources.srcDir(generatedVisionResourcesDir)
+    }
     create("eval") {
         kotlin.setSrcDirs(listOf("src/eval/kotlin"))
         resources.setSrcDirs(listOf("src/eval/resources"))
@@ -77,6 +131,10 @@ configurations["evalRuntimeOnly"].extendsFrom(configurations["testRuntimeOnly"])
 
 jacoco {
     toolVersion = "0.8.12"
+}
+
+tasks.processResources {
+    dependsOn(compileVisionOcrHelper)
 }
 
 tasks.test {

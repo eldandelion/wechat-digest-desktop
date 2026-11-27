@@ -308,6 +308,8 @@ class AppState(
 
     private val enrichmentJobs = ConcurrentHashMap<String, Job>()
     private val reextractJobs = ConcurrentHashMap<String, Job>()
+    private val lastPendingRecheckMs = AtomicLong(0L)
+    private val isPendingRecheckRunning = AtomicBoolean(false)
 
     private val settingsMutex = Mutex()
     private val settingsSideEffectsMutex = Mutex()
@@ -1392,11 +1394,22 @@ class AppState(
                 val groupConfig = withContext(Dispatchers.IO) { groupConfigStore?.get(card.sourceRoomId) }
                 val effectivePersona = groupConfig?.customPersona?.takeIf { it.isNotBlank() } ?: currentSettings.userPersona
                 val effectiveRules = groupConfig?.customPrompt.orEmpty()
+                val preparedMessages = if (currentSettings.parseAttachmentContents) {
+                    withContext(Dispatchers.IO) {
+                        syncService.enrichMessagesWithAttachmentPreviews(
+                            messages = messages,
+                            focusHints = syncService.extractFocusHints(effectivePersona, effectiveRules),
+                            enableVisualOcr = currentSettings.enableVisualOcr
+                        )
+                    }
+                } else {
+                    messages
+                }
 
                 val extractedResult = withContext(Dispatchers.IO) {
                     createLlmClient(currentSettings.llm).use { client ->
                         EventExtractor(llmClient = client, maxConcurrency = 1, enableFastPath = true).extractEventsResult(
-                            messages = messages,
+                            messages = preparedMessages,
                             roomId = card.sourceRoomId,
                             userPersona = effectivePersona,
                             targetLanguage = currentSettings.targetLanguage,
@@ -1421,11 +1434,15 @@ class AppState(
                         latest.category != preCategory ||
                         latest.priority != prePriority ||
                         latest.eventDate != preEventDate
+                    val preparedAttachments = preparedMessages.flatMap { it.attachments }
+                    val mergedAttachments = com.wechatdigest.core.llm.ExtractionCardConsolidator
+                        .mergeAttachmentsByKey(rawCandidate.attachments + preparedAttachments)
                     val candidate = rawCandidate.copy(
                         title = if (editedInFlight) latest.title else rawCandidate.title,
                         category = if (editedInFlight) latest.category else rawCandidate.category,
                         priority = if (editedInFlight) latest.priority else rawCandidate.priority,
                         eventDate = if (editedInFlight) latest.eventDate else rawCandidate.eventDate,
+                        attachments = mergedAttachments,
                         status = latest.status,
                         supersedesCardId = latest.supersedesCardId
                     )
@@ -1454,6 +1471,12 @@ class AppState(
         return launchedJob
     }
 
+    private fun resolveAttachmentResolver(driver: WeChatDatabaseDriver? = resolveDriverFromSettings()): WeChatAttachmentResolver? {
+        val activeDriver = driver ?: return null
+        val explicitAttachmentRoot = WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
+        return WeChatAttachmentResolver(activeDriver, explicitAttachmentRootDir = explicitAttachmentRoot)
+    }
+
     private fun resolveMessagesForReextraction(card: EventCard): List<WeChatMessage> {
         val dbMessages = try {
             val driver = resolveDriverFromSettings()
@@ -1462,8 +1485,7 @@ class AppState(
             } else {
                 WeChatSessionContext(driver).use { session ->
                     val contactRepo = WeChatContactRepository(driver, sessionContext = session)
-                    val attachmentRoot = WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
-                    val attachmentResolver = WeChatAttachmentResolver(driver, explicitAttachmentRootDir = attachmentRoot)
+                    val attachmentResolver = resolveAttachmentResolver(driver)
                     WeChatMessageRepository(driver, contactRepo, attachmentResolver, session)
                         .findAnchorMessages(card.sourceRoomId, card.sourceLocalIds, card.timestampSeconds)
                 }
@@ -1474,6 +1496,20 @@ class AppState(
             emptyList()
         }
         if (dbMessages.isNotEmpty()) return dbMessages
+
+        val refreshedAttachments = try {
+            val resolver = resolveAttachmentResolver()
+            if (resolver != null && card.attachments.isNotEmpty()) {
+                resolver.refreshAttachments(card.attachments)
+            } else {
+                // Fail closed if WeChat attachment root cannot be verified
+                card.attachments.map { it.copy(localPath = null) }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            card.attachments.map { it.copy(localPath = null) }
+        }
 
         val bubbles = SourceMessageParser.parse(card.sourceMessages)
         return bubbles.mapIndexed { idx, bubble ->
@@ -1487,7 +1523,7 @@ class AppState(
                 rawContent = bubble.body,
                 textContent = bubble.body,
                 isZstdCompressed = false,
-                attachments = if (idx == bubbles.lastIndex) card.attachments else emptyList(),
+                attachments = if (idx == bubbles.lastIndex) refreshedAttachments else emptyList(),
                 isOwner = bubble.isOwner
             )
         }.filter { it.textContent.isNotBlank() || it.attachments.isNotEmpty() }
@@ -1592,6 +1628,7 @@ class AppState(
 
     private companion object {
         const val MAX_PREFILTER_RULES = 200
+        const val PENDING_RECHECK_COOLDOWN_MS = 10_000L
     }
 
     /**
@@ -1599,22 +1636,22 @@ class AppState(
      * under WeChat's verified `msg/file` folder.
      */
     fun openAttachment(attachment: EventAttachment): Job =
-        performAttachmentAction(attachment, verb = "open") { file, allowedRoot ->
-            attachmentLauncher.openFile(file, allowedRoot = allowedRoot)
+        performAttachmentAction(attachment, verb = "open") { file, allowedRoots ->
+            attachmentLauncher.openFile(file, allowedRoots = allowedRoots)
         }
 
     /**
-     * Reveals a downloaded [attachment] in Finder, strictly confined under WeChat's `msg/file` folder.
+     * Reveals a downloaded [attachment] in Finder, strictly confined under WeChat's verified media folders.
      */
     fun revealAttachmentInFinder(attachment: EventAttachment): Job =
-        performAttachmentAction(attachment, verb = "reveal") { file, allowedRoot ->
-            attachmentLauncher.revealInFinder(file, allowedRoot = allowedRoot)
+        performAttachmentAction(attachment, verb = "reveal") { file, allowedRoots ->
+            attachmentLauncher.revealInFinder(file, allowedRoots = allowedRoots)
         }
 
     private fun performAttachmentAction(
         attachment: EventAttachment,
         verb: String,
-        action: (File, File) -> Result<Unit>
+        action: (File, List<File>) -> Result<Unit>
     ): Job = scope.launch {
         val localPath = attachment.localPath?.takeIf { it.isNotBlank() }
         if (localPath == null) {
@@ -1622,14 +1659,13 @@ class AppState(
             return@launch
         }
         val result = withContext(Dispatchers.IO) {
-            val driver = resolveDriverFromSettings()
-            val explicitAttachmentRoot = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
-            val allowedRoot = driver?.let {
-                WeChatAttachmentResolver(it, explicitAttachmentRootDir = explicitAttachmentRoot).resolveMsgFileRoot()
-            } ?: return@withContext Result.failure<Unit>(
-                IllegalStateException("WeChat attachments folder could not be verified.")
-            )
-            action(File(localPath), allowedRoot)
+            val allowedRoots = resolveAttachmentResolver()?.resolveAllowedMediaRoots().orEmpty()
+            if (allowedRoots.isEmpty()) {
+                return@withContext Result.failure<Unit>(
+                    IllegalStateException("WeChat attachments folder could not be verified.")
+                )
+            }
+            action(File(localPath), allowedRoots)
         }
         if (result.isFailure) {
             val err = LlmJsonUtils.sanitizeLogMessage(result.exceptionOrNull()?.message)
@@ -1656,10 +1692,8 @@ class AppState(
         try {
             val (refreshed, foundCount) = eventsDbMutex.withLock {
                 withContext(Dispatchers.IO) {
-                    val driver = resolveDriverFromSettings() ?: return@withContext null to 0
-                    val explicitAttachmentRoot = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(_settings.value.wechatAttachmentRootDir)
-                    val updatedList = WeChatAttachmentResolver(driver, explicitAttachmentRootDir = explicitAttachmentRoot)
-                        .refreshAttachments(card.attachments)
+                    val resolver = resolveAttachmentResolver() ?: return@withContext null to 0
+                    val updatedList = resolver.refreshAttachments(card.attachments)
                     eventCardStore.updateAttachmentsOrThrow(cardId, updatedList)
                     updatedList to updatedList.count { it.isLocalFilePresent() }
                 }.also { (updatedList, _) ->
@@ -1688,6 +1722,98 @@ class AppState(
         } finally {
             _recheckingAttachmentCardIds.update { it - cardId }
         }
+    }
+
+    /**
+     * Re-scans WeChat local storage once per cooldown window across active non-completed cards with
+     * missing attachment files (for example when the main window regains focus from WeChat).
+     */
+    fun recheckAllPendingAttachments(
+        force: Boolean = false,
+        nowMs: Long = System.currentTimeMillis()
+    ): Job {
+        val candidateCards = _events.value.filter { card ->
+            !card.isDismissed &&
+                !card.isCompleted &&
+                card.attachments.isNotEmpty()
+        }
+        if (candidateCards.isEmpty()) {
+            return Job().apply { complete() }
+        }
+        val prevMs = lastPendingRecheckMs.get()
+        if (!force && prevMs > 0L && nowMs >= prevMs && nowMs - prevMs < PENDING_RECHECK_COOLDOWN_MS) {
+            return Job().apply { complete() }
+        }
+        if (!isPendingRecheckRunning.compareAndSet(false, true)) {
+            return Job().apply { complete() }
+        }
+
+        val job = scope.launch {
+            try {
+                val updates = withContext(Dispatchers.IO) {
+                    val pendingCards = candidateCards.filter { card ->
+                        card.attachments.any { !it.isLocalFilePresent() }
+                    }
+                    if (pendingCards.isEmpty()) return@withContext emptyList<Pair<EventCard, List<EventAttachment>>>()
+                    val resolver = resolveAttachmentResolver() ?: return@withContext emptyList()
+                    lastPendingRecheckMs.set(nowMs)
+                    pendingCards.mapNotNull { card ->
+                        val refreshed = resolver.refreshAttachments(card.attachments)
+                        if (refreshed != card.attachments) card to refreshed else null
+                    }
+                }
+                if (updates.isEmpty()) return@launch
+
+                var newlyFoundCount = 0
+                val updatedByCardId = mutableMapOf<String, List<EventAttachment>>()
+                eventsDbMutex.withLock {
+                    val currentById = _events.value.associateBy { it.id }
+                    withContext(Dispatchers.IO) {
+                        for ((snapCard, refreshedList) in updates) {
+                            val latest = currentById[snapCard.id] ?: continue
+                            if (latest.isDismissed) continue
+                            val refreshedByKey = refreshedList.associateBy { it.previewKey() }
+                            val mergedList = latest.attachments.map { latestAtt ->
+                                val refreshedAtt = refreshedByKey[latestAtt.previewKey()] ?: return@map latestAtt
+                                latestAtt.copy(localPath = refreshedAtt.localPath)
+                            }
+                            if (mergedList == latest.attachments) continue
+                            eventCardStore.updateAttachmentsOrThrow(latest.id, mergedList)
+                            updatedByCardId[latest.id] = mergedList
+                            val oldPresentKeys = latest.attachments
+                                .filter { it.isLocalFilePresent() }
+                                .mapTo(HashSet()) { it.previewKey() }
+                            newlyFoundCount += mergedList.count { att ->
+                                att.isLocalFilePresent() && att.previewKey() !in oldPresentKeys
+                            }
+                        }
+                    }
+                    if (updatedByCardId.isNotEmpty()) {
+                        eventsMutationEpoch.incrementAndGet()
+                        _events.update { list ->
+                            list.map { existing ->
+                                val updatedList = updatedByCardId[existing.id] ?: return@map existing
+                                existing.copy(attachments = updatedList)
+                            }
+                        }
+                    }
+                }
+                if (newlyFoundCount > 0) {
+                    _snackbarMessage.emit(
+                        "Located $newlyFoundCount newly downloaded attachment${if (newlyFoundCount == 1) "" else "s"}."
+                    )
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                System.err.println(
+                    "[AppState] Auto attachment re-check failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
+                )
+            } finally {
+                isPendingRecheckRunning.set(false)
+            }
+        }
+        job.invokeOnCompletion { isPendingRecheckRunning.set(false) }
+        return job
     }
 }
 
