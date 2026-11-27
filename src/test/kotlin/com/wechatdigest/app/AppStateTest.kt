@@ -1079,5 +1079,106 @@ class AppStateTest {
 
         appState.close()
     }
+
+    @Test
+    fun `AppState key verification and guided extraction persist keysPath and update diagnostics`() = runBlocking {
+        val dir = File(tempDir, "key_flow_wechat").apply { mkdirs() }
+        val contactDir = File(dir, "contact").apply { mkdirs() }
+        val encKey = ByteArray(32) { (it + 5).toByte() }
+        val salt = ByteArray(16) { (it + 11).toByte() }
+
+        val page1 = ByteArray(com.wechatdigest.core.db.WcdbDecryptor.PAGE_SIZE)
+        System.arraycopy(salt, 0, page1, 0, 16)
+        val macSalt = ByteArray(16) { idx -> (salt[idx].toInt() xor 0x3A).toByte() }
+        val macKey = com.wechatdigest.core.db.WcdbDecryptor.pbkdf2HmacSha512(encKey, macSalt, 2, 32)
+        val mac = javax.crypto.Mac.getInstance("HmacSHA512").apply {
+            init(javax.crypto.spec.SecretKeySpec(macKey, "HmacSHA512"))
+        }
+        mac.update(
+            page1,
+            com.wechatdigest.core.db.WcdbDecryptor.SALT_SIZE,
+            com.wechatdigest.core.db.WcdbDecryptor.PAGE_SIZE -
+                com.wechatdigest.core.db.WcdbDecryptor.SALT_SIZE -
+                com.wechatdigest.core.db.WcdbDecryptor.RESERVE_SIZE +
+                com.wechatdigest.core.db.WcdbDecryptor.IV_SIZE
+        )
+        mac.update(byteArrayOf(1, 0, 0, 0))
+        System.arraycopy(mac.doFinal(), 0, page1, com.wechatdigest.core.db.WcdbDecryptor.PAGE_SIZE - 64, 64)
+        File(contactDir, "contact.db").writeBytes(page1)
+
+        val outKeysFile = File(tempDir, "app_keys/all_keys.json")
+        val mockKeyManager = com.wechatdigest.core.db.WeChatKeyExtractionManager(
+            binDir = File(tempDir, "app_bin"),
+            defaultKeysFile = outKeysFile,
+            defaultPassphraseFile = File(tempDir, "app_keys/passphrase.json"),
+            isMacOs = { true },
+            wechatAppLocator = { File(tempDir, "WeChat.app").apply { mkdirs() } },
+            executableExists = { true },
+            commandRunner = { cmd, _ ->
+                if (cmd.firstOrNull()?.contains("xcode-select") == true) {
+                    com.wechatdigest.core.db.CommandExecResult(0, "/Library/Developer/CommandLineTools\n", "")
+                } else {
+                    com.wechatdigest.core.db.CommandExecResult(0, "", "")
+                }
+            },
+            uidGidProvider = { 501 to 20 },
+            elevationRunner = { shellCmd, _ ->
+                val logPath = Regex("""--json-events > '([^']+)'""").find(shellCmd)!!.groupValues[1]
+                File(logPath).writeText("""{"event":"complete","verifiedCount":1,"totalCount":1}""" + "\n")
+                outKeysFile.parentFile.mkdirs()
+                outKeysFile.writeText(
+                    """{"contact/contact.db":{"enc_key":"${encKey.joinToString("") { "%02x".format(it) }}"}}"""
+                )
+                com.wechatdigest.core.db.CommandExecResult(0, "", "")
+            }
+        )
+
+        val syncService = SyncService(
+            eventCardStore = eventCardStore,
+            groupConfigStore = groupConfigStore,
+            syncCheckpointStore = com.wechatdigest.storage.SyncCheckpointStore(appDb)
+        )
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            groupConfigStore = groupConfigStore,
+            scope = testScope,
+            keyExtractionManager = mockKeyManager
+        )
+        appState.updateSettings(AppSettings(wechatDataDir = dir.absolutePath)).join()
+
+        appState.refreshKeyDiagnostics().join()
+        assertFalse(appState.keyPreflightStatus.value?.isReadyToSync ?: true)
+
+        var callbackPath: String? = null
+        appState.startGuidedKeyExtraction(resignWeChat = false, onKeysExtracted = { callbackPath = it }).join()
+
+        assertTrue(appState.keyExtractionState.value is com.wechatdigest.core.db.KeyExtractionState.Succeeded)
+        assertEquals(outKeysFile.canonicalPath, appState.settings.value.keysPath)
+        assertEquals(outKeysFile.canonicalPath, callbackPath)
+        assertTrue(appState.keyPreflightStatus.value?.isReadyToSync == true)
+
+        // verifyWeChatKeysNow with empty-string override still auto-saves resolved canonical keysPath
+        appState.updateSettings(AppSettings(wechatDataDir = dir.absolutePath, keysPath = "")).join()
+        appState.verifyWeChatKeysNow(overrideDataDir = dir.absolutePath, overrideKeysPath = "").join()
+        assertEquals(outKeysFile.canonicalPath, appState.settings.value.keysPath)
+
+        // buildManualKeyExtractCommand runs off-EDT and respects custom keysPathOverride
+        val customManualOut = File(tempDir, "custom_keys.json")
+        val manualCmd = kotlin.test.assertNotNull(
+            appState.buildManualKeyExtractCommand(dir.absolutePath, customManualOut.absolutePath)
+        )
+        assertTrue(manualCmd.contains("/usr/bin/python3 -I "))
+        assertTrue(manualCmd.contains("--output '${customManualOut.canonicalPath}'"))
+
+        // cancelKeyExtraction cancels safely without throwing and lets a follow-up run succeed
+        appState.cancelKeyExtraction()
+        assertEquals(com.wechatdigest.core.db.KeyExtractionState.Cancelled, appState.keyExtractionState.value)
+        appState.startGuidedKeyExtraction(resignWeChat = false).join()
+        assertTrue(appState.keyExtractionState.value is com.wechatdigest.core.db.KeyExtractionState.Succeeded)
+
+        appState.close()
+    }
 }
 

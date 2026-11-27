@@ -24,15 +24,18 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.Memory
@@ -50,6 +53,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -58,9 +62,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -74,6 +80,7 @@ import com.wechatdigest.core.llm.local.LocalModelMirror
 import com.wechatdigest.core.model.GroupChat
 import com.wechatdigest.core.repository.WeChatContactRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
@@ -96,8 +103,13 @@ fun OnboardingWizardDialog(
 
     // Step 1 state (initialized once on wizard open so in-wizard model downloads/imports don't reset edits)
     var selectedPath by remember { mutableStateOf(currentSettings.wechatDataDir) }
+    var selectedKeysPath by remember { mutableStateOf(currentSettings.keysPath) }
     var candidatePaths by remember { mutableStateOf<List<DiscoveredPath>>(emptyList()) }
     var isScanningPaths by remember { mutableStateOf(false) }
+    var showKeyGuideDialog by remember { mutableStateOf(false) }
+
+    val keyPreflightStatus by appState.keyPreflightStatus.collectAsState()
+    val keyExtractionState by appState.keyExtractionState.collectAsState()
 
     // Step 2 state
     var providerType by remember { mutableStateOf(currentSettings.llm.providerType) }
@@ -126,8 +138,14 @@ fun OnboardingWizardDialog(
 
     // Step 3 state
     var discoveredRooms by remember { mutableStateOf<List<GroupChat>>(emptyList()) }
-    var selectedRoomIds by remember { mutableStateOf(currentSettings.monitoredRoomIds) }
+    var selectedRoomIds by remember(selectedPath) {
+        mutableStateOf(
+            if (selectedPath == currentSettings.wechatDataDir) currentSettings.monitoredRoomIds else emptySet()
+        )
+    }
     var isLoadingRooms by remember { mutableStateOf(false) }
+    var roomLoadError by remember { mutableStateOf<String?>(null) }
+    val wizardScope = rememberCoroutineScope()
 
     // Auto scan candidate paths & reset stale connection probe on open
     LaunchedEffect(Unit) {
@@ -157,28 +175,55 @@ fun OnboardingWizardDialog(
         }
     }
 
+    // Auto refresh key preflight diagnostics when Step 1 paths change
+    LaunchedEffect(currentStep, selectedPath, selectedKeysPath) {
+        if (currentStep == WizardStep.WECHAT_PATH) {
+            kotlinx.coroutines.delay(180)
+            appState.refreshKeyDiagnostics(overrideDataDir = selectedPath, overrideKeysPath = selectedKeysPath)
+        }
+    }
+
     // Load rooms when arriving at step 3
-    LaunchedEffect(currentStep, selectedPath) {
-        if (currentStep == WizardStep.CHATROOMS && selectedPath.isNotBlank()) {
+    LaunchedEffect(currentStep, selectedPath, selectedKeysPath) {
+        if (currentStep == WizardStep.CHATROOMS) {
+            discoveredRooms = emptyList()
+            roomLoadError = null
+            if (selectedPath.isBlank()) return@LaunchedEffect
             isLoadingRooms = true
             try {
-                val dir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)
-                if (dir != null && !java.nio.file.Files.isSymbolicLink(dir.toPath()) && dir.exists() && dir.isDirectory) {
-                    val rooms = withContext(Dispatchers.IO) {
+                val (rooms, errorMsg) = withContext(Dispatchers.IO) {
+                    val dir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)
+                    if (dir == null ||
+                        com.wechatdigest.core.db.WcdbDecryptor.hasSymlinkInChain(dir) ||
+                        !dir.exists() ||
+                        !dir.isDirectory
+                    ) {
+                        emptyList<GroupChat>() to "Selected WeChat directory is invalid or inaccessible."
+                    } else {
+                        val resolvedKeys = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedKeysPath)
+                            ?.takeUnless { com.wechatdigest.core.db.WcdbDecryptor.hasSymlinkInChain(it) }
+                            ?.takeIf { it.exists() && it.isFile }
                         val defaultCacheDir = File(System.getProperty("user.home"), "Library/Application Support/WeChatDigest/decrypted")
-                        val driver = WeChatDatabaseDriver(baseDir = dir, cacheDir = defaultCacheDir)
+                        val driver = WeChatDatabaseDriver(
+                            baseDir = dir,
+                            customKeysFile = resolvedKeys,
+                            cacheDir = defaultCacheDir
+                        )
                         val repo = WeChatContactRepository(driver)
-                        repo.listAllChatrooms()
+                        repo.listAllChatrooms() to null
                     }
-                    discoveredRooms = rooms
-                    if (selectedRoomIds.isEmpty() && rooms.isNotEmpty()) {
-                        selectedRoomIds = setOf(rooms.first().roomId)
-                    }
+                }
+                discoveredRooms = rooms
+                roomLoadError = errorMsg
+                if (selectedRoomIds.isEmpty() && rooms.isNotEmpty()) {
+                    selectedRoomIds = setOf(rooms.first().roomId)
                 }
             } catch (e: kotlin.coroutines.cancellation.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                System.err.println("[OnboardingWizard] Failed to list rooms: ${com.wechatdigest.core.llm.LlmJsonUtils.sanitizeLogMessage(e.message)}")
+                val safeMsg = com.wechatdigest.core.llm.LlmJsonUtils.sanitizeLogMessage(e.message)
+                roomLoadError = safeMsg
+                System.err.println("[OnboardingWizard] Failed to list rooms: $safeMsg")
             } finally {
                 isLoadingRooms = false
             }
@@ -186,7 +231,11 @@ fun OnboardingWizardDialog(
     }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            if (keyExtractionState !is com.wechatdigest.core.db.KeyExtractionState.Running) {
+                onDismiss()
+            }
+        },
         title = {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -306,6 +355,36 @@ fun OnboardingWizardDialog(
                                 }
                             },
                             singleLine = true
+                        )
+
+                        OutlinedTextField(
+                            value = selectedKeysPath,
+                            onValueChange = { selectedKeysPath = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("all_keys.json Path (Optional - extracted automatically or browse)") },
+                            placeholder = { Text("~/Library/Application Support/WeChatDigest/all_keys.json") },
+                            trailingIcon = {
+                                IconButton(
+                                    onClick = {
+                                        DesktopPickers.openExtensionFilePicker("Select all_keys.json", ".json") { file ->
+                                            selectedKeysPath = file.absolutePath
+                                        }
+                                    }
+                                ) {
+                                    Icon(Icons.Default.FolderOpen, contentDescription = "Browse all_keys.json")
+                                }
+                            },
+                            singleLine = true
+                        )
+
+                        WizardDecryptionStatusBanner(
+                            preflight = keyPreflightStatus,
+                            hasSelectedPath = selectedPath.isNotBlank(),
+                            onVerifyKeys = { appState.verifyWeChatKeysNow(selectedPath, selectedKeysPath) },
+                            onOpenKeyGuide = {
+                                appState.resetKeyExtractionState()
+                                showKeyGuideDialog = true
+                            }
                         )
                     }
 
@@ -617,7 +696,9 @@ fun OnboardingWizardDialog(
                             }
                         } else if (discoveredRooms.isEmpty()) {
                             Text(
-                                text = "No chatrooms found in selected directory. You can also configure them later under the 'Groups' tab.",
+                                text = roomLoadError?.let {
+                                    "Could not read chatrooms: $it"
+                                } ?: "No chatrooms found in selected directory. You can also configure them later under the 'Groups' tab.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.error
                             )
@@ -707,24 +788,34 @@ fun OnboardingWizardDialog(
                                 } else {
                                     modelName.trim()
                                 }
-                                val updatedSettings = currentSettings.copy(
-                                    wechatDataDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)?.absolutePath
-                                        ?: selectedPath.trim(),
-                                    llm = currentSettings.llm.copy(
-                                        providerType = providerType,
-                                        endpointUrl = endpointUrl.trim(),
-                                        apiKey = apiKey.trim(),
-                                        modelName = effectiveModelName,
-                                        localModelId = localModelId.trim(),
-                                        localModelMirror = localModelMirror.name
-                                    ),
-                                    monitoredRoomIds = selectedRoomIds
-                                )
-                                appState.updateSettings(updatedSettings)
-                                if (selectedRoomIds.isNotEmpty()) {
-                                    appState.triggerSync()
+                                wizardScope.launch {
+                                    val (resolvedDataPath, resolvedKeys) = withContext(Dispatchers.IO) {
+                                        val dp = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)?.absolutePath
+                                            ?: selectedPath.trim()
+                                        val rk = selectedKeysPath.trim().let { raw ->
+                                            if (raw.isBlank()) "" else com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(raw)?.absolutePath ?: raw
+                                        }
+                                        dp to rk
+                                    }
+                                    val updatedSettings = currentSettings.copy(
+                                        wechatDataDir = resolvedDataPath,
+                                        keysPath = resolvedKeys,
+                                        llm = currentSettings.llm.copy(
+                                            providerType = providerType,
+                                            endpointUrl = endpointUrl.trim(),
+                                            apiKey = apiKey.trim(),
+                                            modelName = effectiveModelName,
+                                            localModelId = localModelId.trim(),
+                                            localModelMirror = localModelMirror.name
+                                        ),
+                                        monitoredRoomIds = selectedRoomIds
+                                    )
+                                    appState.updateSettings(updatedSettings).join()
+                                    if (selectedRoomIds.isNotEmpty()) {
+                                        appState.triggerSync()
+                                    }
+                                    onDismiss()
                                 }
-                                onDismiss()
                             }
                         ) {
                             Icon(Icons.Default.Check, contentDescription = null)
@@ -739,7 +830,10 @@ fun OnboardingWizardDialog(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 when (currentStep) {
                     WizardStep.WECHAT_PATH -> {
-                        OutlinedButton(onClick = onDismiss) {
+                        OutlinedButton(
+                            onClick = onDismiss,
+                            enabled = keyExtractionState !is com.wechatdigest.core.db.KeyExtractionState.Running
+                        ) {
                             Text("Skip Setup")
                         }
                     }
@@ -757,4 +851,113 @@ fun OnboardingWizardDialog(
             }
         }
     )
+
+    var manualCommand by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(showKeyGuideDialog, selectedPath, selectedKeysPath, keyPreflightStatus) {
+        manualCommand = if (showKeyGuideDialog) {
+            appState.buildManualKeyExtractCommand(dataDirOverride = selectedPath, keysPathOverride = selectedKeysPath)
+        } else {
+            null
+        }
+    }
+
+    if (showKeyGuideDialog) {
+        KeyExtractionGuideDialog(
+            preflightStatus = keyPreflightStatus,
+            extractionState = keyExtractionState,
+            manualCommand = manualCommand,
+            onRecheckPreflight = { appState.refreshKeyDiagnostics(selectedPath, selectedKeysPath) },
+            onInstallXcodeTools = { appState.triggerXcodeCommandLineToolsInstall() },
+            onStartExtraction = { resign ->
+                appState.startGuidedKeyExtraction(
+                    dataDirOverride = selectedPath,
+                    keysPathOverride = selectedKeysPath,
+                    resignWeChat = resign,
+                    onKeysExtracted = { resolvedPath -> selectedKeysPath = resolvedPath }
+                )
+            },
+            onCancelExtraction = { appState.cancelKeyExtraction() },
+            onCommandCopied = { appState.showMessage("Copied extraction command to clipboard.") },
+            onDismiss = {
+                showKeyGuideDialog = false
+                appState.refreshKeyDiagnostics(selectedPath, selectedKeysPath)
+            }
+        )
+    }
+}
+
+@Composable
+private fun WizardDecryptionStatusBanner(
+    preflight: com.wechatdigest.core.db.KeyPreflightStatus?,
+    hasSelectedPath: Boolean,
+    onVerifyKeys: () -> Unit,
+    onOpenKeyGuide: () -> Unit
+) {
+    if (!hasSelectedPath || preflight == null || preflight.wechatDataDir == null) return
+
+    val report = preflight.verificationReport
+    val isReady = preflight.isReadyToSync
+    val containerColor = if (isReady) {
+        MaterialTheme.colorScheme.secondaryContainer
+    } else {
+        MaterialTheme.colorScheme.tertiaryContainer
+    }
+    val contentColor = if (isReady) {
+        MaterialTheme.colorScheme.onSecondaryContainer
+    } else {
+        MaterialTheme.colorScheme.onTertiaryContainer
+    }
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = containerColor,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(
+                imageVector = if (isReady) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
+                contentDescription = null,
+                tint = if (isReady) Color(0xFF2E7D32) else contentColor,
+                modifier = Modifier.size(18.dp)
+            )
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = when {
+                        !preflight.isEncryptedDb -> "Decrypted / Plaintext Databases Ready"
+                        report?.allVerified == true -> "Keys Verified (${report.verifiedDbs}/${report.totalEncryptedDbs} DBs Unlocked)"
+                        else -> "Database Decryption Keys Required"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = contentColor
+                )
+                Text(
+                    text = when {
+                        !preflight.isEncryptedDb -> "Ready to read messages directly."
+                        report?.allVerified == true -> "SQLCipher 4 Page 1 HMAC verified."
+                        else -> "Run the guided extractor to obtain WeChat decryption keys."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = contentColor.copy(alpha = 0.85f)
+                )
+            }
+            if (preflight.isEncryptedDb) {
+                if (report?.allVerified == true) {
+                    OutlinedButton(onClick = onVerifyKeys) {
+                        Text("Re-verify")
+                    }
+                } else {
+                    Button(onClick = onOpenKeyGuide) {
+                        Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Extract Keys...")
+                    }
+                }
+            }
+        }
+    }
 }

@@ -2,10 +2,14 @@ package com.wechatdigest.core.db
 
 import com.wechatdigest.core.llm.LlmJsonUtils
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -17,8 +21,10 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
@@ -32,6 +38,9 @@ object WcdbDecryptor {
     const val IV_SIZE = 16
     const val HMAC_SIZE = 64
     const val RESERVE_SIZE = 80 // IV(16) + HMAC(64)
+    const val PBKDF2_HMAC_ROUNDS = 2
+    const val PBKDF2_PASSPHRASE_ROUNDS = 256_000
+    private const val HMAC_SALT_XOR = 0x3A
     const val WAL_HEADER_SIZE = 32
     const val WAL_FRAME_HEADER_SIZE = 24
     const val WAL_MAGIC_LE = 0x377F0682
@@ -39,6 +48,22 @@ object WcdbDecryptor {
     const val WAL_FORMAT = 3007000
     const val MAX_WAL_BYTES = 512L * 1024 * 1024
     const val MAX_WAL_PAGES = 16_777_216L
+
+    private val PRETTY_JSON = Json { prettyPrint = true; ignoreUnknownKeys = true }
+
+    /** Summary of verifying SQLCipher 4 Page 1 HMAC across encrypted databases in a directory. */
+    data class DbKeyVerificationReport(
+        val totalEncryptedDbs: Int,
+        val verifiedDbs: Int,
+        val missingOrInvalidDbs: List<String>,
+        val autoDerivedNewKeys: Int,
+        val hasPassphraseCache: Boolean,
+        val activeKeysFile: File?,
+        val writeError: String? = null
+    ) {
+        val allVerified: Boolean
+            get() = totalEncryptedDbs > 0 && verifiedDbs == totalEncryptedDbs && missingOrInvalidDbs.isEmpty() && writeError == null
+    }
 
     val SQLITE_HEADER = "SQLite format 3\u0000".toByteArray(Charsets.ISO_8859_1)
 
@@ -71,10 +96,37 @@ object WcdbDecryptor {
         return data
     }
 
+    private const val MAX_JSON_FILE_BYTES = 16L * 1024L * 1024L
+    private const val MAX_PBKDF2_DK_LEN = 1_048_576
+
+    internal fun hasSymlinkInChain(target: File): Boolean {
+        var cursor: File? = target.absoluteFile
+        while (cursor != null) {
+            if (Files.isSymbolicLink(cursor.toPath())) {
+                val isSystemTopSymlink = cursor.parentFile?.absolutePath == "/" &&
+                    cursor.name in setOf("var", "tmp", "etc")
+                if (!isSystemTopSymlink) return true
+            }
+            cursor = cursor.parentFile
+        }
+        return false
+    }
+
+    private fun readBoundedText(file: File): String {
+        require(!hasSymlinkInChain(file) && file.exists() && file.isFile) {
+            "Refusing to read missing or symlinked file: ${file.name}"
+        }
+        val length = file.length()
+        require(length in 0..MAX_JSON_FILE_BYTES) {
+            "File too large to read safely: ${file.name} ($length bytes)"
+        }
+        return file.readText(Charsets.UTF_8)
+    }
+
     fun loadKeys(keysFile: File): Map<String, ByteArray> {
-        if (!keysFile.exists() || !keysFile.isFile || Files.isSymbolicLink(keysFile.toPath())) return emptyMap()
+        if (hasSymlinkInChain(keysFile) || !keysFile.exists() || !keysFile.isFile) return emptyMap()
         return try {
-            val text = keysFile.readText()
+            val text = readBoundedText(keysFile)
             val jsonElement = Json.parseToJsonElement(text).jsonObject
             val result = mutableMapOf<String, ByteArray>()
             for ((path, obj) in jsonElement) {
@@ -109,7 +161,7 @@ object WcdbDecryptor {
 
     fun findKeysFile(customKeysFile: File? = null, baseDir: File? = null): File? {
         if (customKeysFile != null) {
-            return if (customKeysFile.exists() && customKeysFile.isFile && !Files.isSymbolicLink(customKeysFile.toPath())) {
+            return if (customKeysFile.exists() && customKeysFile.isFile && !hasSymlinkInChain(customKeysFile)) {
                 customKeysFile
             } else {
                 null
@@ -133,7 +185,344 @@ object WcdbDecryptor {
         candidates.add(File(userHome, ".wcdb-key-tool/all_keys.json"))
         candidates.add(File(userHome, "Library/Application Support/WeChatDigest/all_keys.json"))
 
-        return candidates.firstOrNull { it.exists() && it.isFile && !Files.isSymbolicLink(it.toPath()) }
+        return candidates.firstOrNull { it.exists() && it.isFile && !hasSymlinkInChain(it) }
+    }
+
+    /**
+     * Locates a cached 32-byte raw passphrase JSON file (`wechat-passphrase.json`), strictly ignoring
+     * symlinks and missing files.
+     */
+    fun findPassphraseFile(customPassphraseFile: File? = null): File? {
+        if (customPassphraseFile != null) {
+            return customPassphraseFile.takeIf {
+                it.exists() && it.isFile && !hasSymlinkInChain(it)
+            }
+        }
+        val userHome = System.getProperty("user.home") ?: "."
+        val candidates = listOf(
+            File(userHome, "Library/Application Support/WeChatDigest/wechat-passphrase.json"),
+            File(userHome, ".wcdb-key-tool/wechat-passphrase.json")
+        )
+        return candidates.firstOrNull { it.exists() && it.isFile && !hasSymlinkInChain(it) }
+    }
+
+    /** Loads the 32-byte hex passphrase from `wechat-passphrase.json`, returning `null` if missing/invalid. */
+    fun loadPassphraseBytes(passphraseFile: File): ByteArray? {
+        if (hasSymlinkInChain(passphraseFile) || !passphraseFile.exists() || !passphraseFile.isFile) {
+            return null
+        }
+        return runCatching {
+            val root = Json.parseToJsonElement(readBoundedText(passphraseFile)).jsonObject
+            val hex = root["passphrase"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
+            if (hex.length != KEY_SIZE * 2) return@runCatching null
+            hexToBytes(hex).takeIf { it.size == KEY_SIZE }
+        }.getOrNull()
+    }
+
+    /**
+     * RFC 2898 PBKDF2-HMAC-SHA512 operating directly over raw [ByteArray] password bytes (avoiding
+     * Java `PBEKeySpec(char[])` UTF-8 encoding corruption for arbitrary binary keys/passphrases >= 0x80).
+     */
+    fun pbkdf2HmacSha512(
+        passwordBytes: ByteArray,
+        salt: ByteArray,
+        iterations: Int,
+        dkLen: Int = KEY_SIZE
+    ): ByteArray {
+        require(passwordBytes.isNotEmpty()) { "passwordBytes must not be empty" }
+        require(iterations >= 1) { "iterations must be positive" }
+        require(dkLen in 1..MAX_PBKDF2_DK_LEN) { "dkLen must be between 1 and $MAX_PBKDF2_DK_LEN" }
+        val hLen = HMAC_SIZE
+        val blockCount = (dkLen + hLen - 1) / hLen
+        val out = ByteArray(blockCount * hLen)
+        val mac = Mac.getInstance("HmacSHA512").apply {
+            init(SecretKeySpec(passwordBytes, "HmacSHA512"))
+        }
+        for (blockIdx in 1..blockCount) {
+            val blockSalt = ByteArray(salt.size + 4)
+            System.arraycopy(salt, 0, blockSalt, 0, salt.size)
+            blockSalt[salt.size] = ((blockIdx ushr 24) and 0xFF).toByte()
+            blockSalt[salt.size + 1] = ((blockIdx ushr 16) and 0xFF).toByte()
+            blockSalt[salt.size + 2] = ((blockIdx ushr 8) and 0xFF).toByte()
+            blockSalt[salt.size + 3] = (blockIdx and 0xFF).toByte()
+
+            var u = mac.doFinal(blockSalt)
+            val t = u.copyOf()
+            for (iter in 2..iterations) {
+                u = mac.doFinal(u)
+                for (i in t.indices) {
+                    t[i] = (t[i].toInt() xor u[i].toInt()).toByte()
+                }
+            }
+            System.arraycopy(t, 0, out, (blockIdx - 1) * hLen, hLen)
+        }
+        return out.copyOf(dkLen)
+    }
+
+    /**
+     * Verifies a 32-byte SQLCipher 4 [encKey] against a 4096-byte [page1] header using HMAC-SHA512
+     * (`mac_salt = salt ^ 0x3A`, 2-iteration PBKDF2 mac_key, page1[16..4031] + little-endian page 1).
+     */
+    fun verifyPage1Hmac(page1: ByteArray, encKey: ByteArray): Boolean {
+        if (page1.size < PAGE_SIZE || encKey.size != KEY_SIZE) return false
+        val salt = page1.copyOfRange(0, SALT_SIZE)
+        val macSalt = ByteArray(SALT_SIZE) { idx -> (salt[idx].toInt() xor HMAC_SALT_XOR).toByte() }
+        val macKey = pbkdf2HmacSha512(encKey, macSalt, PBKDF2_HMAC_ROUNDS, KEY_SIZE)
+        val mac = Mac.getInstance("HmacSHA512").apply {
+            init(SecretKeySpec(macKey, "HmacSHA512"))
+        }
+        mac.update(page1, SALT_SIZE, PAGE_SIZE - SALT_SIZE - RESERVE_SIZE + IV_SIZE)
+        mac.update(byteArrayOf(1, 0, 0, 0))
+        val computed = mac.doFinal()
+        val stored = page1.copyOfRange(PAGE_SIZE - HMAC_SIZE, PAGE_SIZE)
+        return MessageDigest.isEqual(computed, stored)
+    }
+
+    private fun readPage1(dbFile: File): ByteArray? {
+        if (!dbFile.exists() || !dbFile.isFile || hasSymlinkInChain(dbFile)) return null
+        if (dbFile.length() < PAGE_SIZE) return null
+        return runCatching {
+            FileInputStream(dbFile).use { input ->
+                val buf = ByteArray(PAGE_SIZE)
+                var total = 0
+                while (total < PAGE_SIZE) {
+                    val read = input.read(buf, total, PAGE_SIZE - total)
+                    if (read <= 0) break
+                    total += read
+                }
+                if (total == PAGE_SIZE) buf else null
+            }
+        }.getOrNull()
+    }
+
+    /** Reads the first 4096 bytes of [dbFile] and verifies [encKey] against Page 1 HMAC-SHA512. */
+    fun verifyDatabaseFileKey(dbFile: File, encKey: ByteArray): Boolean {
+        val page1 = readPage1(dbFile) ?: return false
+        return verifyPage1Hmac(page1, encKey)
+    }
+
+    /**
+     * Resolves candidate `enc_key` bytes from [keys] matching [sourceFile] under [sourceRoot] using
+     * the same path/filename hierarchy as [resolveDecryptedFile].
+     */
+    fun lookupKeyForFile(sourceFile: File, keys: Map<String, ByteArray>, sourceRoot: File? = null): ByteArray? {
+        if (keys.isEmpty()) return null
+        val normalizedPath = runCatching { sourceFile.canonicalPath }.getOrElse { sourceFile.absolutePath }.replace('\\', '/')
+        val rootRelativePath = sourceRoot?.let { root ->
+            runCatching {
+                val canonicalRoot = root.canonicalFile.toPath()
+                val canonicalSource = sourceFile.canonicalFile.toPath()
+                if (canonicalSource.startsWith(canonicalRoot)) {
+                    canonicalRoot.relativize(canonicalSource).toString().replace('\\', '/')
+                } else {
+                    null
+                }
+            }.getOrNull()
+        }
+        val parentAndName = sourceFile.parentFile?.name?.let { "$it/${sourceFile.name}" }
+        return keys[normalizedPath]
+            ?: rootRelativePath?.let { keys[it] }
+            ?: parentAndName?.let { keys[it] }
+            ?: keys.entries.firstOrNull { (k, _) ->
+                k.contains('/') && normalizedPath.endsWith("/${k.trimStart('/')}")
+            }?.value
+            ?: keys[sourceFile.name]
+    }
+
+    /** Collects non-symlinked WeChat `.db` files (>= 4096 bytes, excluding FTS/resource/-wal/-shm) under [baseDir]. */
+    fun collectDatabaseFiles(baseDir: File): List<File> {
+        if (!baseDir.exists() || !baseDir.isDirectory || Files.isSymbolicLink(baseDir.toPath())) {
+            return emptyList()
+        }
+        val collected = mutableListOf<File>()
+        fun walk(dir: File, depth: Int) {
+            if (depth > 2 || Files.isSymbolicLink(dir.toPath())) return
+            val children = dir.listFiles() ?: return
+            for (child in children) {
+                if (Files.isSymbolicLink(child.toPath())) continue
+                if (child.isDirectory) {
+                    walk(child, depth + 1)
+                } else if (child.isFile) {
+                    val name = child.name
+                    if (name.endsWith(".db") &&
+                        !name.endsWith("-wal") &&
+                        !name.endsWith("-shm") &&
+                        name != "message_fts.db" &&
+                        name != "message_resource.db" &&
+                        child.length() >= PAGE_SIZE
+                    ) {
+                        collected.add(child)
+                    }
+                }
+            }
+        }
+        walk(baseDir, 0)
+        return collected.sortedBy { it.absolutePath }
+    }
+
+    /**
+     * Verifies keys for all encrypted databases under [baseDir] via Page 1 HMAC-SHA512. If a cached
+     * raw passphrase is available in [passphraseFile] and any DB is missing or invalid in [keysFile],
+     * derives the missing keys via PBKDF2-HMAC-SHA512 (`256,000` rounds), verifies HMAC, and merges
+     * them atomically (`0600`) into [keysFile] (or [defaultOutputKeysFile]).
+     */
+    fun verifyAndRefreshKeysForDirectory(
+        baseDir: File,
+        keysFile: File? = findKeysFile(baseDir = baseDir),
+        passphraseFile: File? = findPassphraseFile(),
+        defaultOutputKeysFile: File = File(
+            System.getProperty("user.home") ?: ".",
+            "Library/Application Support/WeChatDigest/all_keys.json"
+        )
+    ): DbKeyVerificationReport {
+        val dbFiles = collectDatabaseFiles(baseDir)
+        val encryptedFiles = dbFiles.filter { isEncrypted(it) }
+        if (encryptedFiles.isEmpty()) {
+            return DbKeyVerificationReport(
+                totalEncryptedDbs = 0,
+                verifiedDbs = 0,
+                missingOrInvalidDbs = emptyList(),
+                autoDerivedNewKeys = 0,
+                hasPassphraseCache = passphraseFile?.let { loadPassphraseBytes(it) != null } ?: false,
+                activeKeysFile = keysFile
+            )
+        }
+
+        val resolvedKeysFile = keysFile?.takeIf { it.exists() && it.isFile && !hasSymlinkInChain(it) }
+        val loadedKeys = resolvedKeysFile?.let { loadKeys(it) }.orEmpty()
+        val passphraseBytes = passphraseFile?.let { loadPassphraseBytes(it) }
+        val derivedBySaltHex = mutableMapOf<String, ByteArray?>()
+        val newlyDerivedEntries = linkedMapOf<String, Triple<File, ByteArray, Long>>()
+
+        var verifiedCount = 0
+        val missingOrInvalid = mutableListOf<String>()
+        val canonicalBase = runCatching { baseDir.canonicalFile }.getOrElse { baseDir.absoluteFile }
+
+        for (dbFile in encryptedFiles) {
+            val relPath = runCatching {
+                val cFile = dbFile.canonicalFile
+                if (cFile.toPath().startsWith(canonicalBase.toPath())) {
+                    canonicalBase.toPath().relativize(cFile.toPath()).toString().replace('\\', '/')
+                } else {
+                    dbFile.name
+                }
+            }.getOrElse { dbFile.name }
+
+            val page1 = readPage1(dbFile)
+            if (page1 == null) {
+                missingOrInvalid.add(relPath)
+                continue
+            }
+
+            val existingKey = lookupKeyForFile(dbFile, loadedKeys, baseDir)
+            if (existingKey != null && verifyPage1Hmac(page1, existingKey)) {
+                verifiedCount++
+                continue
+            }
+
+            if (passphraseBytes != null) {
+                val salt = page1.copyOfRange(0, SALT_SIZE)
+                val saltHex = salt.joinToString("") { "%02x".format(it) }
+                val derivedKey = derivedBySaltHex.getOrPut(saltHex) {
+                    val candidate = pbkdf2HmacSha512(passphraseBytes, salt, PBKDF2_PASSPHRASE_ROUNDS, KEY_SIZE)
+                    if (verifyPage1Hmac(page1, candidate)) candidate else null
+                }
+                if (derivedKey != null && verifyPage1Hmac(page1, derivedKey)) {
+                    newlyDerivedEntries[relPath] = Triple(dbFile, derivedKey, dbFile.length())
+                    verifiedCount++
+                    continue
+                }
+            }
+            missingOrInvalid.add(relPath)
+        }
+
+        var outputKeysFile = resolvedKeysFile
+        var persistedDerivedCount = 0
+        var writeError: String? = null
+        if (newlyDerivedEntries.isNotEmpty()) {
+            val targetFile = resolvedKeysFile ?: defaultOutputKeysFile
+            val canonicalTarget = runCatching { targetFile.canonicalPath }.getOrElse { targetFile.absolutePath }
+            val writeLock = decryptLocks.computeIfAbsent(canonicalTarget) { Any() }
+            val writeAttempt = synchronized(writeLock) {
+                runCatching {
+                    require(!hasSymlinkInChain(targetFile)) {
+                        "Refusing to write keys through a symbolic link: ${targetFile.name}"
+                    }
+                    val parent = targetFile.parentFile
+                    if (parent != null) {
+                        val isDefaultAppDir = runCatching {
+                            parent.canonicalPath == defaultOutputKeysFile.parentFile?.canonicalPath
+                        }.getOrDefault(false)
+                        if (isDefaultAppDir) {
+                            ensureOwnerOnlyDirectoryTree(parent, parent)
+                        } else if (!parent.exists()) {
+                            ensureOwnerOnlyDirectoryTree(parent, parent)
+                        }
+                    }
+
+                    val existingJson: JsonObject? = if (targetFile.exists() && targetFile.length() > 0L) {
+                        Json.parseToJsonElement(readBoundedText(targetFile)).jsonObject
+                    } else {
+                        null
+                    }
+                    val refreshedShadows: List<Triple<String, String, String>> = newlyDerivedEntries.map { (rel, entry) ->
+                        val dbFile = entry.first
+                        val canonDb = runCatching { dbFile.canonicalPath }.getOrElse { dbFile.absolutePath }.replace('\\', '/')
+                        val parentName = dbFile.parentFile?.name?.let { "$it/${dbFile.name}" }.orEmpty()
+                        Triple(rel, canonDb, parentName)
+                    }
+
+                    val updatedJson = buildJsonObject {
+                        existingJson?.forEach { (k, v) ->
+                            if (k == "_db_dir" || k in newlyDerivedEntries) return@forEach
+                            val normK = k.replace('\\', '/')
+                            val isShadowed = refreshedShadows.any { (rel, canonDb, parentName) ->
+                                normK == canonDb ||
+                                    normK == File(canonDb).name ||
+                                    (parentName.isNotBlank() && normK == parentName && canonDb.endsWith("/$parentName")) ||
+                                    (normK.contains('/') && canonDb.endsWith("/${normK.trimStart('/')}")) ||
+                                    normK == rel
+                            }
+                            if (!isShadowed) {
+                                put(k, v)
+                            }
+                        }
+                        for ((relPath, entry) in newlyDerivedEntries) {
+                            val (_, keyBytes, sz) = entry
+                            put(
+                                relPath,
+                                buildJsonObject {
+                                    put("enc_key", keyBytes.joinToString("") { "%02x".format(it) })
+                                    put("size_mb", kotlin.math.round(sz.toDouble() / (1024.0 * 1024.0) * 10.0) / 10.0)
+                                }
+                            )
+                        }
+                        put("_db_dir", canonicalBase.absolutePath)
+                    }
+                    writeOwnerOnlyTextAtomically(targetFile, PRETTY_JSON.encodeToString(JsonObject.serializer(), updatedJson))
+                    targetFile
+                }
+            }
+            if (writeAttempt.isSuccess) {
+                outputKeysFile = writeAttempt.getOrNull()
+                persistedDerivedCount = newlyDerivedEntries.size
+            } else {
+                val reason = LlmJsonUtils.sanitizeLogMessage(writeAttempt.exceptionOrNull()?.message)
+                writeError = "Derived ${newlyDerivedEntries.size} key(s) in memory, but failed to persist ${targetFile.name}: $reason"
+                verifiedCount = (verifiedCount - newlyDerivedEntries.size).coerceAtLeast(0)
+                missingOrInvalid.addAll(newlyDerivedEntries.keys)
+            }
+        }
+
+        return DbKeyVerificationReport(
+            totalEncryptedDbs = encryptedFiles.size,
+            verifiedDbs = verifiedCount,
+            missingOrInvalidDbs = missingOrInvalid,
+            autoDerivedNewKeys = persistedDerivedCount,
+            hasPassphraseCache = passphraseBytes != null,
+            activeKeysFile = outputKeysFile,
+            writeError = writeError
+        )
     }
 
     fun decryptPage(cipher: Cipher, keySpec: SecretKeySpec, pageData: ByteArray, pgno: Int): ByteArray {
@@ -556,7 +945,6 @@ object WcdbDecryptor {
             tmp.writeText(text)
             setOwnerOnlyPermissions(tmp, isDirectory = false)
             moveAtomicallyWithFallback(tmp, targetFile)
-            setOwnerOnlyPermissions(targetFile, isDirectory = false)
         } finally {
             runCatching { if (tmp.exists()) tmp.delete() }
         }

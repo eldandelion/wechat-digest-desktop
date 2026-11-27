@@ -472,4 +472,139 @@ class WcdbDecryptorTest {
         assertFalse(WcdbDecryptor.replayEncryptedWalIfValid(intactOut, linkWal, encKey))
         assertTrue(intactOut.readBytes().contentEquals(mainPlain))
     }
+
+    @Test
+    fun `pbkdf2HmacSha512 and verifyPage1Hmac validate binary SQLCipher 4 keys and auto-derive new shards`() {
+        val passphraseBytes = ByteArray(32) { i -> (0x80 + i).toByte() } // all bytes >= 0x80
+        val salt = ByteArray(16) { i -> (0xA0 + i).toByte() }
+        val derivedKey = WcdbDecryptor.pbkdf2HmacSha512(
+            passwordBytes = passphraseBytes,
+            salt = salt,
+            iterations = WcdbDecryptor.PBKDF2_PASSPHRASE_ROUNDS,
+            dkLen = WcdbDecryptor.KEY_SIZE
+        )
+        assertEquals(32, derivedKey.size)
+
+        // Parity check with Python hashlib.pbkdf2_hmac when python3 is present
+        val python = File("/usr/bin/python3")
+        if (python.canExecute()) {
+            val phHex = passphraseBytes.joinToString("") { "%02x".format(it) }
+            val saltHex = salt.joinToString("") { "%02x".format(it) }
+            val pyCode = "import hashlib; print(hashlib.pbkdf2_hmac('sha512', bytes.fromhex('$phHex'), bytes.fromhex('$saltHex'), 256000, 32).hex())"
+            val proc = ProcessBuilder(python.absolutePath, "-c", pyCode).redirectErrorStream(true).start()
+            val pyHex = proc.inputStream.bufferedReader().use { it.readText().trim() }
+            assertEquals(0, proc.waitFor())
+            assertEquals(pyHex, derivedKey.joinToString("") { "%02x".format(it) })
+        }
+
+        // Construct valid SQLCipher 4 Page 1 with HMAC-SHA512
+        val validPage1 = buildSqlCipherPage1WithHmac(salt, derivedKey)
+        assertTrue(WcdbDecryptor.verifyPage1Hmac(validPage1, derivedKey))
+
+        val flippedBody = validPage1.copyOf().also { it[200] = (it[200].toInt() xor 0xFF).toByte() }
+        assertFalse(WcdbDecryptor.verifyPage1Hmac(flippedBody, derivedKey))
+
+        val flippedHmac = validPage1.copyOf().also { it[WcdbDecryptor.PAGE_SIZE - 1] = (it[WcdbDecryptor.PAGE_SIZE - 1].toInt() xor 0x01).toByte() }
+        assertFalse(WcdbDecryptor.verifyPage1Hmac(flippedHmac, derivedKey))
+
+        val wrongKey = ByteArray(32) { 0x11 }
+        assertFalse(WcdbDecryptor.verifyPage1Hmac(validPage1, wrongKey))
+
+        // Auto-derive new message_1.db shard from cached passphrase
+        val dbDir = File(tempDir, "db_storage").apply { mkdirs() }
+        val contactDir = File(dbDir, "contact").apply { mkdirs() }
+        val msgDir = File(dbDir, "message").apply { mkdirs() }
+        val salt1 = ByteArray(16) { 0x12 }
+        val key1 = WcdbDecryptor.pbkdf2HmacSha512(passphraseBytes, salt1, WcdbDecryptor.PBKDF2_PASSPHRASE_ROUNDS)
+        File(contactDir, "contact.db").writeBytes(buildSqlCipherPage1WithHmac(salt1, key1))
+        File(msgDir, "message_1.db").writeBytes(validPage1)
+
+        val keysFile = File(tempDir, "all_keys.json").apply {
+            writeText("""{"contact/contact.db":{"enc_key":"${key1.joinToString("") { "%02x".format(it) }}"}}""")
+        }
+        val passphraseFile = File(tempDir, "wechat-passphrase.json").apply {
+            writeText("""{"passphrase":"${passphraseBytes.joinToString("") { "%02x".format(it) }}"}""")
+        }
+
+        val report = WcdbDecryptor.verifyAndRefreshKeysForDirectory(
+            baseDir = dbDir,
+            keysFile = keysFile,
+            passphraseFile = passphraseFile
+        )
+        assertTrue(report.allVerified)
+        assertEquals(2, report.totalEncryptedDbs)
+        assertEquals(2, report.verifiedDbs)
+        assertEquals(1, report.autoDerivedNewKeys)
+        val reloaded = WcdbDecryptor.loadKeys(keysFile)
+        assertTrue(reloaded.containsKey("message/message_1.db"))
+        assertContentEquals(derivedKey, reloaded["message/message_1.db"])
+
+        // Stale canonicalPath key shadowing relPath is pruned on refresh, and existing unrelated entries in defaultOutputKeysFile are preserved
+        val staleCanonFile = File(dbDir, "message/message_1.db").canonicalPath.replace('\\', '/')
+        val wrongHex = ByteArray(32) { 0x55 }.joinToString("") { "%02x".format(it) }
+        val key1Hex = key1.joinToString("") { "%02x".format(it) }
+        val keysWithStaleShadow = File(tempDir, "stale_shadow_keys.json").apply {
+            writeText("""{"contact/contact.db":{"enc_key":"$key1Hex"},"$staleCanonFile":{"enc_key":"$wrongHex"}}""")
+        }
+        val shadowReport = WcdbDecryptor.verifyAndRefreshKeysForDirectory(
+            baseDir = dbDir,
+            keysFile = keysWithStaleShadow,
+            passphraseFile = passphraseFile
+        )
+        assertTrue(shadowReport.allVerified)
+        val reloadedAfterShadow = WcdbDecryptor.loadKeys(keysWithStaleShadow)
+        assertFalse(reloadedAfterShadow.containsKey(staleCanonFile))
+        assertContentEquals(
+            derivedKey,
+            WcdbDecryptor.lookupKeyForFile(File(dbDir, "message/message_1.db"), reloadedAfterShadow, dbDir)
+        )
+
+        val sharedDefaultKeys = File(tempDir, "shared_default_keys.json").apply {
+            writeText("""{"other_account/contact/contact.db":{"enc_key":"$wrongHex"}}""")
+        }
+        val nullKeysReport = WcdbDecryptor.verifyAndRefreshKeysForDirectory(
+            baseDir = dbDir,
+            keysFile = null,
+            passphraseFile = passphraseFile,
+            defaultOutputKeysFile = sharedDefaultKeys
+        )
+        assertTrue(nullKeysReport.allVerified)
+        val sharedReloaded = WcdbDecryptor.loadKeys(sharedDefaultKeys)
+        assertContentEquals(ByteArray(32) { 0x55 }, sharedReloaded["other_account/contact/contact.db"])
+        assertContentEquals(derivedKey, sharedReloaded["message/message_1.db"])
+
+        // Malformed existing non-empty target keys file fails closed without wiping
+        val corruptDefault = File(tempDir, "corrupt_default.json").apply { writeText("{not-json") }
+        val corruptReport = WcdbDecryptor.verifyAndRefreshKeysForDirectory(
+            baseDir = dbDir,
+            keysFile = null,
+            passphraseFile = passphraseFile,
+            defaultOutputKeysFile = corruptDefault
+        )
+        assertFalse(corruptReport.allVerified)
+        assertNotNull(corruptReport.writeError)
+        assertEquals("{not-json", corruptDefault.readText())
+    }
+
+    private fun buildSqlCipherPage1WithHmac(salt: ByteArray, encKey: ByteArray): ByteArray {
+        val page1 = ByteArray(WcdbDecryptor.PAGE_SIZE)
+        System.arraycopy(salt, 0, page1, 0, 16)
+        for (i in 16 until WcdbDecryptor.PAGE_SIZE - 64) {
+            page1[i] = ((i * 31) and 0xFF).toByte()
+        }
+        val macSalt = ByteArray(16) { idx -> (salt[idx].toInt() xor 0x3A).toByte() }
+        val macKey = WcdbDecryptor.pbkdf2HmacSha512(encKey, macSalt, 2, 32)
+        val mac = javax.crypto.Mac.getInstance("HmacSHA512").apply {
+            init(SecretKeySpec(macKey, "HmacSHA512"))
+        }
+        mac.update(
+            page1,
+            WcdbDecryptor.SALT_SIZE,
+            WcdbDecryptor.PAGE_SIZE - WcdbDecryptor.SALT_SIZE - WcdbDecryptor.RESERVE_SIZE + WcdbDecryptor.IV_SIZE
+        )
+        mac.update(byteArrayOf(1, 0, 0, 0))
+        val digest = mac.doFinal()
+        System.arraycopy(digest, 0, page1, WcdbDecryptor.PAGE_SIZE - 64, 64)
+        return page1
+    }
 }

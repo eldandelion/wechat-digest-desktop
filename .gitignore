@@ -6,3 +6,5 @@ build/
 .kotlin/
 .env
 .claude/
+__pycache__/
+*.pyc

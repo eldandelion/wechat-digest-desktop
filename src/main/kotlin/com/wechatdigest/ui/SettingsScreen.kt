@@ -54,6 +54,7 @@ fun SettingsScreen(appState: AppState) {
 
     var isAutoDetectingWeChat by remember { mutableStateOf(false) }
     var autoDetectFeedback by remember { mutableStateOf<String?>(null) }
+    var showKeyGuideDialog by remember { mutableStateOf(false) }
     var showClearEventsDialog by remember { mutableStateOf(false) }
     var showFactoryResetDialog by remember { mutableStateOf(false) }
 
@@ -101,6 +102,13 @@ fun SettingsScreen(appState: AppState) {
     val localModelDownloadStates by appState.localModelDownloadStates.collectAsState()
     val localRuntimeState by appState.localRuntimeState.collectAsState()
     val localServerState by appState.localServerState.collectAsState()
+    val keyPreflightStatus by appState.keyPreflightStatus.collectAsState()
+    val keyExtractionState by appState.keyExtractionState.collectAsState()
+
+    LaunchedEffect(currentSettings.wechatDataDir, currentSettings.keysPath) {
+        kotlinx.coroutines.delay(250)
+        appState.refreshKeyDiagnostics()
+    }
 
     val runDetectOllama: (String) -> Unit = { preferred ->
         appState.detectLocalOllama(preferred) { detectedEndpoint, firstModel ->
@@ -147,6 +155,7 @@ fun SettingsScreen(appState: AppState) {
             enableVisualOcr = currentSettings.enableVisualOcr,
             isAutoDetecting = isAutoDetectingWeChat,
             autoDetectFeedback = autoDetectFeedback,
+            keyPreflightStatus = keyPreflightStatus,
             onAutoDetect = {
                 if (!isAutoDetectingWeChat) {
                     isAutoDetectingWeChat = true
@@ -168,6 +177,11 @@ fun SettingsScreen(appState: AppState) {
                 }
             },
             onLaunchWizard = { appState.setShowWizard(true) },
+            onVerifyKeys = { appState.verifyWeChatKeysNow(dataDir, keysPath) },
+            onOpenKeyGuide = {
+                appState.resetKeyExtractionState()
+                showKeyGuideDialog = true
+            },
             onBrowseDataDir = {
                 DesktopPickers.openDirectoryPicker("Select WeChat Data Directory") { dir ->
                     val path = dir.absolutePath
@@ -328,6 +342,39 @@ fun SettingsScreen(appState: AppState) {
             showFactoryResetDialog = false
         }
     )
+
+    var manualCommand by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(showKeyGuideDialog, dataDir, keysPath, keyPreflightStatus) {
+        manualCommand = if (showKeyGuideDialog) {
+            appState.buildManualKeyExtractCommand(dataDirOverride = dataDir, keysPathOverride = keysPath)
+        } else {
+            null
+        }
+    }
+
+    if (showKeyGuideDialog) {
+        KeyExtractionGuideDialog(
+            preflightStatus = keyPreflightStatus,
+            extractionState = keyExtractionState,
+            manualCommand = manualCommand,
+            onRecheckPreflight = { appState.refreshKeyDiagnostics(dataDir, keysPath) },
+            onInstallXcodeTools = { appState.triggerXcodeCommandLineToolsInstall() },
+            onStartExtraction = { resign ->
+                appState.startGuidedKeyExtraction(
+                    dataDirOverride = dataDir,
+                    keysPathOverride = keysPath,
+                    resignWeChat = resign,
+                    onKeysExtracted = { resolvedPath -> keysPath = resolvedPath }
+                )
+            },
+            onCancelExtraction = { appState.cancelKeyExtraction() },
+            onCommandCopied = { appState.showMessage("Copied extraction command to clipboard.") },
+            onDismiss = {
+                showKeyGuideDialog = false
+                appState.refreshKeyDiagnostics(dataDir, keysPath)
+            }
+        )
+    }
 }
 
 @Composable

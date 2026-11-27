@@ -3,7 +3,11 @@ package com.wechatdigest.app
 import com.wechatdigest.core.attachment.AttachmentLauncher
 import com.wechatdigest.core.attachment.WeChatAttachmentResolver
 import com.wechatdigest.core.calendar.CalendarLauncher
+import com.wechatdigest.core.db.KeyExtractionState
+import com.wechatdigest.core.db.KeyPreflightStatus
+import com.wechatdigest.core.db.WcdbDecryptor
 import com.wechatdigest.core.db.WeChatDatabaseDriver
+import com.wechatdigest.core.db.WeChatKeyExtractionManager
 import com.wechatdigest.core.db.WeChatSessionContext
 import com.wechatdigest.core.detector.DiscoveredPath
 import com.wechatdigest.core.detector.WeChatPathDetector
@@ -130,7 +134,8 @@ class AppState(
     val localModelStore: LocalModelStore = LocalModelStore(),
     val localModelDownloadManager: LocalModelDownloadManager = LocalModelDownloadManager(localModelStore),
     val llamaRuntimeManager: LlamaRuntimeManager = LlamaRuntimeManager(),
-    llamaServerManager: LlamaServerManager? = null
+    llamaServerManager: LlamaServerManager? = null,
+    private val keyExtractionManager: WeChatKeyExtractionManager = WeChatKeyExtractionManager()
 ) {
     private val _currentScreen = MutableStateFlow(Screen.EVENTS)
     val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
@@ -192,6 +197,16 @@ class AppState(
 
     private val _syncCheckpoints = MutableStateFlow<Map<String, SyncCheckpoint>>(emptyMap())
     val syncCheckpoints: StateFlow<Map<String, SyncCheckpoint>> = _syncCheckpoints.asStateFlow()
+
+    private val _keyPreflightStatus = MutableStateFlow<KeyPreflightStatus?>(null)
+    val keyPreflightStatus: StateFlow<KeyPreflightStatus?> = _keyPreflightStatus.asStateFlow()
+
+    private val _keyExtractionState = MutableStateFlow<KeyExtractionState>(KeyExtractionState.Idle)
+    val keyExtractionState: StateFlow<KeyExtractionState> = _keyExtractionState.asStateFlow()
+
+    private var refreshKeyDiagnosticsJob: Job? = null
+    private var keyExtractionJob: Job? = null
+    private val keyExtractionToken = AtomicLong(0L)
 
     private val attributeFiltersFlow = combine(
         priorityFilter,
@@ -489,6 +504,198 @@ class AppState(
     /** Runs WeChat installation auto-detection on [Dispatchers.IO]. */
     suspend fun autoDetectWeChatCandidatesAsync(): List<DiscoveredPath> = withContext(Dispatchers.IO) {
         wechatPathDetector.detectCandidates()
+    }
+
+    /** Refreshes macOS key-extraction preflight & Page 1 HMAC status on [Dispatchers.IO]. */
+    fun refreshKeyDiagnostics(
+        overrideDataDir: String? = null,
+        overrideKeysPath: String? = null
+    ): Job {
+        refreshKeyDiagnosticsJob?.cancel()
+        val job = scope.launch {
+            val status = withContext(Dispatchers.IO) {
+                val rawDir = overrideDataDir ?: _settings.value.wechatDataDir
+                val rawKeys = overrideKeysPath ?: _settings.value.keysPath
+                val dir = WeChatPathDetector.resolveUserPath(rawDir)
+                val keys = WeChatPathDetector.resolveUserPath(rawKeys)
+                keyExtractionManager.inspectPreflight(dir, keys)
+            }
+            _keyPreflightStatus.value = status
+        }
+        refreshKeyDiagnosticsJob = job
+        return job
+    }
+
+    /** Verifies database keys now (auto-deriving missing shards when passphrase cached) and reports via snackbar. */
+    fun verifyWeChatKeysNow(
+        overrideDataDir: String? = null,
+        overrideKeysPath: String? = null
+    ): Job = scope.launch {
+        val rawDir = overrideDataDir ?: _settings.value.wechatDataDir
+        val rawKeys = overrideKeysPath ?: _settings.value.keysPath
+        val status = withContext(Dispatchers.IO) {
+            val dir = WeChatPathDetector.resolveUserPath(rawDir)
+            val keys = WeChatPathDetector.resolveUserPath(rawKeys)
+            keyExtractionManager.inspectPreflight(dir, keys)
+        }
+        _keyPreflightStatus.value = status
+        val activeKeys = status.keysFile
+        if (activeKeys != null && _settings.value.keysPath.isBlank() && overrideKeysPath.isNullOrBlank()) {
+            val activeCanon = withContext(Dispatchers.IO) { activeKeys.canonicalPath }
+            transformSettings { it.copy(keysPath = activeCanon) }
+        }
+        when {
+            status.wechatDataDir == null ->
+                _snackbarMessage.emit("Select a valid WeChat data directory first.")
+            !status.isEncryptedDb ->
+                _snackbarMessage.emit("Plaintext WeChat databases detected — no decryption keys needed.")
+            status.verificationReport?.allVerified == true -> {
+                val r = status.verificationReport
+                val suffix = if (r.autoDerivedNewKeys > 0) " (auto-derived ${r.autoDerivedNewKeys} new)" else ""
+                _snackbarMessage.emit("Verified ${r.verifiedDbs}/${r.totalEncryptedDbs} WeChat databases$suffix.")
+            }
+            else -> {
+                val r = status.verificationReport
+                val msg = r?.writeError
+                    ?: "Decryption keys missing or stale (${r?.verifiedDbs ?: 0}/${r?.totalEncryptedDbs ?: 0} verified). Use Extract / Refresh Keys."
+                _snackbarMessage.emit(msg)
+            }
+        }
+    }
+
+    /** Builds a copy-pasteable zsh extraction command for manual Terminal execution. */
+    suspend fun buildManualKeyExtractCommand(
+        dataDirOverride: String? = null,
+        keysPathOverride: String? = null
+    ): String? = withContext(Dispatchers.IO) {
+        val rawDir = dataDirOverride ?: _settings.value.wechatDataDir
+        val dir = WeChatPathDetector.resolveUserPath(rawDir) ?: return@withContext null
+        val preflight = _keyPreflightStatus.value
+        val includeResign = preflight?.needsResign ?: true
+        val appFile = when {
+            preflight == null -> keyExtractionManager.inspectPreflight(dir, null).wechatAppFile
+            preflight.codeSignState == com.wechatdigest.core.db.WeChatCodeSignState.APP_NOT_FOUND -> null
+            else -> preflight.wechatAppFile
+        }
+        val rawKeys = (keysPathOverride ?: _settings.value.keysPath).trim()
+        val resolvedOutKeys = if (rawKeys.isNotBlank()) {
+            WeChatPathDetector.resolveUserPath(rawKeys)
+        } else {
+            null
+        }
+        if (resolvedOutKeys != null) {
+            keyExtractionManager.buildManualTerminalCommand(
+                wechatDataDir = dir,
+                wechatAppFile = appFile,
+                includeResignStep = includeResign && appFile != null,
+                outputKeysFile = resolvedOutKeys
+            )
+        } else {
+            keyExtractionManager.buildManualTerminalCommand(
+                wechatDataDir = dir,
+                wechatAppFile = appFile,
+                includeResignStep = includeResign && appFile != null
+            )
+        }
+    }
+
+    /** Launches Apple's `xcode-select --install` installer prompt on macOS. */
+    fun triggerXcodeCommandLineToolsInstall(): Job = scope.launch {
+        val result = withContext(Dispatchers.IO) { keyExtractionManager.triggerXcodeToolsInstall() }
+        if (result.isSuccess) {
+            _snackbarMessage.emit("macOS Developer Tools installer launched. Click Re-check once finished.")
+        } else {
+            _snackbarMessage.emit(
+                "Could not start Xcode Tools installer: ${LlmJsonUtils.sanitizeLogMessage(result.exceptionOrNull()?.message)}"
+            )
+        }
+    }
+
+    /** Starts interactive macOS key extraction using Touch ID / Administrator authentication. */
+    fun startGuidedKeyExtraction(
+        dataDirOverride: String? = null,
+        keysPathOverride: String? = null,
+        resignWeChat: Boolean = true,
+        onKeysExtracted: ((String) -> Unit)? = null
+    ): Job {
+        keyExtractionJob?.takeIf { it.isActive }?.let { return it }
+        val prevJob = keyExtractionJob
+        val myToken = keyExtractionToken.incrementAndGet()
+        _keyExtractionState.value = KeyExtractionState.Running("preflight", "Checking macOS prerequisites...")
+
+        val job = scope.launch {
+            if (prevJob != null) {
+                runCatching { prevJob.join() }
+            }
+            if (keyExtractionToken.get() != myToken) return@launch
+
+            val rawDir = dataDirOverride ?: _settings.value.wechatDataDir
+            val rawKeys = keysPathOverride ?: _settings.value.keysPath
+            val preflight = withContext(Dispatchers.IO) {
+                val dir = WeChatPathDetector.resolveUserPath(rawDir)
+                val keys = WeChatPathDetector.resolveUserPath(rawKeys)
+                keyExtractionManager.inspectPreflight(dir, keys)
+            }
+            if (keyExtractionToken.get() != myToken) return@launch
+            _keyPreflightStatus.value = preflight
+
+            val finalState = keyExtractionManager.extractKeysInteractive(
+                preflight = preflight,
+                resignWeChat = resignWeChat,
+                onStateChange = { next ->
+                    if (keyExtractionToken.get() == myToken) {
+                        _keyExtractionState.value = next
+                    }
+                }
+            )
+            if (keyExtractionToken.get() != myToken) return@launch
+
+            if (finalState is KeyExtractionState.Succeeded) {
+                val (keysCanon, dataCanon) = withContext(Dispatchers.IO) {
+                    finalState.keysFile.canonicalPath to preflight.wechatDataDir?.canonicalPath.orEmpty()
+                }
+                val prevSettings = _settings.value
+                val targetDataDir = prevSettings.wechatDataDir.ifBlank { dataCanon }
+                val pathsChanged = prevSettings.keysPath != keysCanon || prevSettings.wechatDataDir != targetDataDir
+                if (pathsChanged) {
+                    transformSettings { current ->
+                        current.copy(
+                            wechatDataDir = current.wechatDataDir.ifBlank { dataCanon },
+                            keysPath = keysCanon
+                        )
+                    }.join()
+                } else {
+                    refreshRooms().join()
+                }
+                val refreshedPreflight = withContext(Dispatchers.IO) {
+                    keyExtractionManager.inspectPreflight(preflight.wechatDataDir, finalState.keysFile)
+                }
+                if (keyExtractionToken.get() == myToken) {
+                    _keyPreflightStatus.value = refreshedPreflight
+                    _keyExtractionState.value = finalState
+                    onKeysExtracted?.invoke(keysCanon)
+                    _snackbarMessage.emit("Unlocked ${finalState.verifiedCount}/${finalState.totalCount} WeChat databases.")
+                }
+            } else {
+                _keyExtractionState.value = finalState
+            }
+        }
+        keyExtractionJob = job
+        return job
+    }
+
+    /** Cancels an in-flight guided key extraction run and resets UI state. */
+    fun cancelKeyExtraction() {
+        keyExtractionToken.incrementAndGet()
+        keyExtractionJob?.cancel()
+        _keyExtractionState.value = KeyExtractionState.Cancelled
+    }
+
+    /** Resets transient extraction status banner back to idle. */
+    fun resetKeyExtractionState() {
+        if (keyExtractionJob?.isActive != true) {
+            _keyExtractionState.value = KeyExtractionState.Idle
+        }
     }
 
     fun detectLocalOllama(

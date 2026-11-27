@@ -99,13 +99,31 @@ class WeChatPathDetector {
             flatContact.isFile && !Files.isSymbolicLink(flatContact.toPath()) -> flatContact
             else -> null
         }
-        val isEncrypted = contactFile?.let { com.wechatdigest.core.db.WcdbDecryptor.isEncrypted(it) } ?: true
-        val hasKeys = com.wechatdigest.core.db.WcdbDecryptor.findKeysFile(baseDir = dir) != null
+        val dbFiles = com.wechatdigest.core.db.WcdbDecryptor.collectDatabaseFiles(dir)
+        val encryptedFiles = dbFiles.filter { com.wechatdigest.core.db.WcdbDecryptor.isEncrypted(it) }
+        val isEncrypted = if (dbFiles.isNotEmpty()) {
+            encryptedFiles.isNotEmpty()
+        } else {
+            val probe = contactFile ?: findFirstProbeMessageDb(dir)
+            probe?.let { com.wechatdigest.core.db.WcdbDecryptor.isEncrypted(it) } ?: true
+        }
+        val keysFile = if (isEncrypted) com.wechatdigest.core.db.WcdbDecryptor.findKeysFile(baseDir = dir) else null
+        val allKeysVerified = if (isEncrypted && keysFile != null && encryptedFiles.isNotEmpty()) {
+            val loaded = com.wechatdigest.core.db.WcdbDecryptor.loadKeys(keysFile)
+            encryptedFiles.all { db ->
+                val key = com.wechatdigest.core.db.WcdbDecryptor.lookupKeyForFile(db, loaded, sourceRoot = dir)
+                key != null && com.wechatdigest.core.db.WcdbDecryptor.verifyDatabaseFileKey(db, key)
+            }
+        } else {
+            false
+        }
 
         val finalLabel = if (!isEncrypted) {
             "$label (Plaintext / Decrypted)"
-        } else if (hasKeys) {
+        } else if (allKeysVerified) {
             "$label (Encrypted, auto-decrypt ready)"
+        } else if (keysFile != null) {
+            "$label (Encrypted, keys need refresh)"
         } else {
             "$label (Encrypted, requires all_keys.json)"
         }
@@ -144,6 +162,19 @@ class WeChatPathDetector {
             f.isFile && !Files.isSymbolicLink(f.toPath()) && SHARD_FILE_REGEX.matches(f.name)
         }
         return !directShard.isNullOrEmpty()
+    }
+
+    private fun findFirstProbeMessageDb(dir: File): File? {
+        val messageSubdir = File(dir, "message")
+        if (messageSubdir.exists() && messageSubdir.isDirectory && !Files.isSymbolicLink(messageSubdir.toPath())) {
+            val match = messageSubdir.listFiles { f ->
+                f.isFile && !Files.isSymbolicLink(f.toPath()) && SHARD_FILE_REGEX.matches(f.name)
+            }?.minByOrNull { it.name }
+            if (match != null) return match
+        }
+        return dir.listFiles { f ->
+            f.isFile && !Files.isSymbolicLink(f.toPath()) && SHARD_FILE_REGEX.matches(f.name)
+        }?.minByOrNull { it.name }
     }
 
     companion object {

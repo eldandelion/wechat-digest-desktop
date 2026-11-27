@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.SettingsBrightness
@@ -161,8 +162,11 @@ internal fun WeChatStorageSettingsCard(
     enableVisualOcr: Boolean,
     isAutoDetecting: Boolean,
     autoDetectFeedback: String?,
+    keyPreflightStatus: com.wechatdigest.core.db.KeyPreflightStatus? = null,
     onAutoDetect: () -> Unit,
     onLaunchWizard: () -> Unit,
+    onVerifyKeys: () -> Unit = {},
+    onOpenKeyGuide: () -> Unit = {},
     onBrowseDataDir: () -> Unit,
     onBrowseKeysPath: () -> Unit,
     onBrowseAttachmentRootDir: () -> Unit,
@@ -200,7 +204,7 @@ internal fun WeChatStorageSettingsCard(
             onValueChange = onKeysPathChange,
             modifier = Modifier.fillMaxWidth(),
             label = { Text("all_keys.json Path (Optional - auto-detected if left blank)") },
-            placeholder = { Text("~/.wcdb-key-tool/all_keys.json") },
+            placeholder = { Text("~/Library/Application Support/WeChatDigest/all_keys.json") },
             trailingIcon = {
                 IconButton(onClick = onBrowseKeysPath) {
                     Icon(Icons.Default.FolderOpen, contentDescription = "Browse all_keys.json")
@@ -208,6 +212,39 @@ internal fun WeChatStorageSettingsCard(
             },
             singleLine = true
         )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(onClick = onVerifyKeys, enabled = dataDir.isNotBlank()) {
+                Text("Verify Keys")
+            }
+            OutlinedButton(onClick = onOpenKeyGuide, enabled = dataDir.isNotBlank()) {
+                Icon(Icons.Default.Key, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Extract / Refresh Keys...")
+            }
+            val report = keyPreflightStatus?.verificationReport
+            val statusSummary = when {
+                keyPreflightStatus == null || keyPreflightStatus.wechatDataDir == null -> null
+                !keyPreflightStatus.isEncryptedDb -> "Plaintext DB ready"
+                report?.allVerified == true -> "Verified (${report.verifiedDbs}/${report.totalEncryptedDbs} DBs)"
+                report != null -> "Keys needed (${report.verifiedDbs}/${report.totalEncryptedDbs} verified)"
+                else -> null
+            }
+            statusSummary?.let { text ->
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (keyPreflightStatus?.isReadyToSync == true) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    }
+                )
+            }
+        }
         OutlinedTextField(
             value = attachmentRootDir,
             onValueChange = onAttachmentRootDirChange,

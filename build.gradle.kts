@@ -66,6 +66,8 @@ kotlin {
 
 val generatedVisionResourcesDir = layout.buildDirectory.dir("generated-vision-resources")
 val visionOcrSourceFile = layout.projectDirectory.file("src/main/native/vision-ocr/main.swift")
+val generatedScriptResourcesDir = layout.buildDirectory.dir("generated-script-resources")
+val keyExtractorScriptFile = layout.projectDirectory.file("src/main/resources/scripts/wcdb_key_extractor.py")
 
 val compileVisionOcrHelper by tasks.registering {
     description = "Compiles the bundled macOS Swift Apple Vision CLI helper."
@@ -112,9 +114,25 @@ val compileVisionOcrHelper by tasks.registering {
     }
 }
 
+val generateExtractorScriptSha256 by tasks.registering {
+    description = "Computes SHA-256 verification metadata for the bundled macOS key extractor script."
+    group = "build"
+    inputs.file(keyExtractorScriptFile)
+    outputs.dir(generatedScriptResourcesDir)
+    doLast {
+        val outDir = generatedScriptResourcesDir.get().file("scripts").asFile
+        outDir.mkdirs()
+        val sha256 = MessageDigest.getInstance("SHA-256")
+            .digest(keyExtractorScriptFile.asFile.readBytes())
+            .joinToString("") { "%02x".format(it) }
+        File(outDir, "wcdb_key_extractor.py.sha256").writeText("$sha256\n", Charsets.UTF_8)
+    }
+}
+
 sourceSets {
     main {
         resources.srcDir(generatedVisionResourcesDir)
+        resources.srcDir(generatedScriptResourcesDir)
     }
     create("eval") {
         kotlin.setSrcDirs(listOf("src/eval/kotlin"))
@@ -134,7 +152,8 @@ jacoco {
 }
 
 tasks.processResources {
-    dependsOn(compileVisionOcrHelper)
+    dependsOn(compileVisionOcrHelper, generateExtractorScriptSha256)
+    exclude("**/__pycache__/**", "**/*.pyc")
 }
 
 tasks.test {
