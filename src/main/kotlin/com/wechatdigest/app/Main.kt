@@ -34,6 +34,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Tray
@@ -155,6 +162,18 @@ fun main() {
     )
 
     if (isWindowVisible) {
+        val searchFocusRequester = remember { FocusRequester() }
+        var isFeedModalOpen by remember { mutableStateOf(false) }
+        var isSearchBarAttached by remember { mutableStateOf(true) }
+        var pendingSearchFocus by remember { mutableStateOf(false) }
+
+        LaunchedEffect(isSearchBarAttached, pendingSearchFocus) {
+            if (isSearchBarAttached && pendingSearchFocus) {
+                pendingSearchFocus = false
+                runCatching { searchFocusRequester.requestFocus() }
+            }
+        }
+
         Window(
             onCloseRequest = {
                 if (currentSettings.autoSyncEnabled) {
@@ -164,13 +183,37 @@ fun main() {
                 }
             },
             title = "WeChat Digest",
-            state = windowState
+            state = windowState,
+            onPreviewKeyEvent = { keyEvent ->
+                if (keyEvent.type == KeyEventType.KeyDown &&
+                    appState.currentScreen.value == Screen.EVENTS &&
+                    !appState.showWizard.value &&
+                    !isFeedModalOpen &&
+                    (keyEvent.isMetaPressed || keyEvent.isCtrlPressed) &&
+                    keyEvent.key == Key.F
+                ) {
+                    if (isSearchBarAttached) {
+                        runCatching { searchFocusRequester.requestFocus() }
+                    } else {
+                        appState.selectEvent(null)
+                        pendingSearchFocus = true
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
         ) {
             LaunchedEffect(window) {
                 window.minimumSize = java.awt.Dimension(440, 500)
             }
             WeChatDigestTheme(themeMode = currentSettings.themeMode) {
-                MainAppShell(appState)
+                MainAppShell(
+                    appState = appState,
+                    searchFocusRequester = searchFocusRequester,
+                    onFeedModalOpenChange = { isFeedModalOpen = it },
+                    onSearchBarAttachedChange = { isSearchBarAttached = it }
+                )
             }
         }
     }
@@ -178,7 +221,12 @@ fun main() {
 }
 
 @Composable
-fun MainAppShell(appState: AppState) {
+fun MainAppShell(
+    appState: AppState,
+    searchFocusRequester: FocusRequester = remember { FocusRequester() },
+    onFeedModalOpenChange: (Boolean) -> Unit = {},
+    onSearchBarAttachedChange: (Boolean) -> Unit = {}
+) {
     val currentScreen by appState.currentScreen.collectAsState()
     val events by appState.events.collectAsState()
     val unreadCount = remember(events) { events.count { !it.isRead } }
@@ -282,7 +330,12 @@ fun MainAppShell(appState: AppState) {
                             .fillMaxHeight()
                     ) {
                         when (currentScreen) {
-                            Screen.EVENTS -> EventFeedScreen(appState)
+                            Screen.EVENTS -> EventFeedScreen(
+                                appState = appState,
+                                searchFocusRequester = searchFocusRequester,
+                                onModalOpenChange = onFeedModalOpenChange,
+                                onSearchBarAttachedChange = onSearchBarAttachedChange
+                            )
                             Screen.GROUPS -> GroupsScreen(appState)
                             Screen.SETTINGS -> SettingsScreen(appState)
                         }

@@ -31,6 +31,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.DisableSelection
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -40,6 +42,9 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarToday
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
@@ -53,10 +58,13 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.NotificationAdd
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
@@ -69,6 +77,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -86,17 +95,26 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.wechatdigest.core.calendar.IcsCalendarGenerator
+import com.wechatdigest.core.model.DeadlineTriage
+import com.wechatdigest.core.model.DeadlineUrgency
+import com.wechatdigest.core.model.DetailChecklistKeys
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventDetailItem
 import com.wechatdigest.core.model.EventDetailItemParser
+import com.wechatdigest.core.model.EventDetailKind
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.EventSection
 import com.wechatdigest.core.model.SourceMessageBubble
@@ -105,15 +123,16 @@ import com.wechatdigest.core.repository.WeChatMessageRepository
 import com.wechatdigest.ui.theme.LocalIsDarkTheme
 import com.wechatdigest.ui.theme.PriorityColors
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-/**
- * Empty state shown on the right half of the split view when no event is currently selected.
- */
+private val detailSenderTimeFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy • HH:mm").withZone(ZoneId.systemDefault())
+
+/** Empty state shown on the right half of the split view when no event is currently selected. */
 @Composable
 internal fun EventDetailEmptyState() {
     Box(modifier = Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
@@ -151,8 +170,13 @@ internal fun EventDetailPane(
     onRecheckAttachments: () -> Unit,
     onToggleStar: () -> Unit,
     onToggleRead: () -> Unit,
+    onToggleCompleted: () -> Unit = {},
+    onToggleCheckedItem: (String) -> Unit = {},
     onAddToCalendar: () -> Unit,
+    onAddToReminders: () -> Unit = {},
+    onOpenLinkFailed: (String) -> Unit = {},
     onRequestDelete: () -> Unit,
+    onModalOpenChange: (Boolean) -> Unit = {},
     isEnrichingSections: Boolean = false,
     onEnrichSections: (Int?) -> Unit = {},
     isReextracting: Boolean = false,
@@ -170,6 +194,13 @@ internal fun EventDetailPane(
     var highlightedBubbleIndex by remember(card.id) { mutableStateOf<Int?>(null) }
     var showQuickEditDialog by remember(card.id) { mutableStateOf(false) }
     var showContextDialog by remember(card.id) { mutableStateOf(false) }
+
+    LaunchedEffect(showQuickEditDialog, showContextDialog) {
+        onModalOpenChange(showQuickEditDialog || showContextDialog)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onModalOpenChange(false) }
+    }
 
     LaunchedEffect(card.translatedSourceMessages, isTranslatingMessages) {
         if (autoRevealTranslation && card.translatedSourceMessages.isNotBlank()) {
@@ -217,8 +248,10 @@ internal fun EventDetailPane(
                 onQuickEdit = { showQuickEditDialog = true },
                 onReextract = onReextractCard,
                 onAddToCalendar = onAddToCalendar,
+                onAddToReminders = onAddToReminders,
                 onTranslateAction = handleTranslationAction,
                 onRequestDelete = onRequestDelete,
+                onToggleCompleted = onToggleCompleted,
                 onToggleRead = onToggleRead
             )
             EventDetailScrollContent(
@@ -241,6 +274,8 @@ internal fun EventDetailPane(
                         highlightedBubbleIndex = if (highlightedBubbleIndex == matched) null else matched
                     }
                 },
+                onToggleCheckedItem = onToggleCheckedItem,
+                onOpenLinkFailed = onOpenLinkFailed,
                 onClearHighlight = { highlightedBubbleIndex = null },
                 onShowContextDialog = { showContextDialog = true },
                 onTranslateAction = handleTranslationAction,
@@ -299,8 +334,10 @@ private fun EventDetailTopBar(
     onQuickEdit: () -> Unit,
     onReextract: () -> Unit,
     onAddToCalendar: () -> Unit,
+    onAddToReminders: () -> Unit,
     onTranslateAction: () -> Unit,
     onRequestDelete: () -> Unit,
+    onToggleCompleted: () -> Unit,
     onToggleRead: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -326,6 +363,16 @@ private fun EventDetailTopBar(
                 }
             }
             Spacer(Modifier.weight(1f))
+            TopBarTonalIconButton(
+                onClick = onToggleCompleted,
+                contentColor = if (card.isCompleted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            ) {
+                Icon(
+                    imageVector = if (card.isCompleted) Icons.Filled.CheckCircle else Icons.Outlined.CheckCircle,
+                    contentDescription = if (card.isCompleted) "Mark as not done" else "Mark as done",
+                    modifier = Modifier.size(20.dp)
+                )
+            }
             TopBarTonalIconButton(onClick = onQuickEdit) {
                 Icon(Icons.Default.Edit, contentDescription = "Quick edit notice", modifier = Modifier.size(20.dp))
             }
@@ -345,6 +392,9 @@ private fun EventDetailTopBar(
                 TopBarTonalIconButton(onClick = onAddToCalendar) {
                     Icon(Icons.Default.CalendarToday, contentDescription = "Add to Calendar", modifier = Modifier.size(20.dp))
                 }
+            }
+            TopBarTonalIconButton(onClick = onAddToReminders) {
+                Icon(Icons.Outlined.NotificationAdd, contentDescription = "Add to Reminders", modifier = Modifier.size(20.dp))
             }
             if (card.sourceMessages.isNotBlank()) {
                 TranslationActionButton(
@@ -447,6 +497,8 @@ private fun EventDetailScrollContent(
     sourceBubbles: List<SourceMessageBubble>,
     highlightedBubbleIndex: Int?,
     onDetailItemClick: (EventDetailItem) -> Unit,
+    onToggleCheckedItem: (String) -> Unit,
+    onOpenLinkFailed: (String) -> Unit,
     onClearHighlight: () -> Unit,
     onShowContextDialog: () -> Unit,
     onTranslateAction: () -> Unit,
@@ -462,6 +514,7 @@ private fun EventDetailScrollContent(
     val priorityContainer = PriorityColors.getContainerColor(card.priority, isDark)
     var sourceBoxTopPx by remember(card.id) { mutableStateOf(0) }
     val hasSourceMessages = card.sourceMessages.isNotBlank()
+    val checkedItemsSet = remember(card.checkedItems) { card.checkedItems.toSet() }
 
     LaunchedEffect(highlightedBubbleIndex) {
         if (highlightedBubbleIndex != null && sourceBoxTopPx > 0) {
@@ -469,48 +522,55 @@ private fun EventDetailScrollContent(
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(start = contentStartPadding, top = 8.dp, end = 16.dp, bottom = 84.dp)
-    ) {
-        EventDetailTitleRow(card = card, priorityColor = priorityColor, priorityContainer = priorityContainer, onToggleStar = onToggleStar)
-        Spacer(Modifier.height(16.dp))
-        EventDetailCardBody(
-            card = card,
-            roomName = roomName,
-            priorityColor = priorityColor,
-            priorityContainer = priorityContainer,
-            onAddToCalendar = onAddToCalendar
-        )
-        if (card.sections.isNotEmpty()) {
-            Spacer(Modifier.height(12.dp))
-            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                card.sections.forEachIndexed { idx, section ->
-                    EventDetailSectionCard(
-                        section = section,
-                        isEnrichingSections = isEnrichingSections,
-                        onEnrichSections = { onEnrichSections(idx) },
-                        enableDetailItemClick = hasSourceMessages,
-                        onDetailItemClick = onDetailItemClick
-                    )
+    SelectionContainer {
+        Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(start = contentStartPadding, top = 8.dp, end = 16.dp, bottom = 84.dp)
+        ) {
+            EventDetailTitleRow(card = card, priorityColor = priorityColor, priorityContainer = priorityContainer, onToggleStar = onToggleStar)
+            Spacer(Modifier.height(16.dp))
+            EventDetailCardBody(
+                card = card,
+                roomName = roomName,
+                priorityColor = priorityColor,
+                priorityContainer = priorityContainer,
+                onAddToCalendar = onAddToCalendar
+            )
+            if (card.sections.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    card.sections.forEachIndexed { idx, section ->
+                        EventDetailSectionCard(
+                            sectionIndex = idx,
+                            section = section,
+                            checkedItems = checkedItemsSet,
+                            sourceBubbles = sourceBubbles,
+                            hasSourceMessages = hasSourceMessages,
+                            isEnrichingSections = isEnrichingSections,
+                            onEnrichSections = { onEnrichSections(idx) },
+                            onDetailItemClick = onDetailItemClick,
+                            onToggleCheckedItem = onToggleCheckedItem,
+                            onOpenLinkFailed = onOpenLinkFailed
+                        )
+                    }
                 }
             }
-        }
-        if (card.attachments.isNotEmpty()) {
-            Spacer(Modifier.height(12.dp))
-            AttachmentsSection(card.attachments, isRecheckingAttachments, onOpenAttachment, onRevealAttachmentInFinder, onRecheckAttachments)
-        }
-        if (hasSourceMessages) {
-            Spacer(Modifier.height(12.dp))
-            Box(modifier = Modifier.fillMaxWidth().onGloballyPositioned { sourceBoxTopPx = it.positionInParent().y.toInt() }) {
-                EventDetailSourceMessagesBox(
-                    bubbles = sourceBubbles,
-                    highlightedBubbleIndex = highlightedBubbleIndex,
-                    isTranslatingMessages = isTranslatingMessages,
-                    isShowingTranslation = isShowingTranslation,
-                    onClearHighlight = onClearHighlight,
-                    onShowContextDialog = onShowContextDialog,
-                    onTranslateAction = onTranslateAction
-                )
+            if (card.attachments.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                AttachmentsSection(card.attachments, isRecheckingAttachments, onOpenAttachment, onRevealAttachmentInFinder, onRecheckAttachments)
+            }
+            if (hasSourceMessages) {
+                Spacer(Modifier.height(12.dp))
+                Box(modifier = Modifier.fillMaxWidth().onGloballyPositioned { sourceBoxTopPx = it.positionInParent().y.toInt() }) {
+                    EventDetailSourceMessagesBox(
+                        bubbles = sourceBubbles,
+                        highlightedBubbleIndex = highlightedBubbleIndex,
+                        isTranslatingMessages = isTranslatingMessages,
+                        isShowingTranslation = isShowingTranslation,
+                        onClearHighlight = onClearHighlight,
+                        onShowContextDialog = onShowContextDialog,
+                        onTranslateAction = onTranslateAction
+                    )
+                }
             }
         }
     }
@@ -526,9 +586,25 @@ private fun EventDetailTitleRow(
 ) {
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(text = card.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Normal, color = MaterialTheme.colorScheme.onSurface)
+            Text(
+                text = card.title,
+                style = MaterialTheme.typography.headlineSmall.copy(
+                    textDecoration = if (card.isCompleted) TextDecoration.LineThrough else TextDecoration.None
+                ),
+                fontWeight = FontWeight.Normal,
+                color = if (card.isCompleted) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
+            )
             Spacer(Modifier.height(8.dp))
+            val minuteTick = rememberMinuteTick()
+            val deadlineInfo = remember(card.eventDate, minuteTick) { DeadlineTriage.evaluate(card.eventDate) }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (card.isCompleted) {
+                    DetailBadgeChip(
+                        text = "Done",
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        textColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
                 if (card.status != EventCardStatus.ACTIVE) {
                     val isCancelled = card.status == EventCardStatus.CANCELLED
                     DetailBadgeChip(
@@ -543,14 +619,31 @@ private fun EventDetailTitleRow(
                     val formattedEventDate = remember(card.eventDate) { formatEventDateLabel(card.eventDate) }
                     DetailBadgeChip(text = formattedEventDate, containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f), textColor = MaterialTheme.colorScheme.onPrimaryContainer)
                 }
+                if (deadlineInfo != null && !card.isCompleted && card.status != EventCardStatus.CANCELLED && deadlineInfo.urgency != DeadlineUrgency.FUTURE) {
+                    DetailBadgeChip(
+                        text = deadlineInfo.label,
+                        containerColor = if (deadlineInfo.urgency == DeadlineUrgency.OVERDUE || deadlineInfo.urgency == DeadlineUrgency.DUE_TODAY) {
+                            MaterialTheme.colorScheme.errorContainer
+                        } else {
+                            MaterialTheme.colorScheme.tertiaryContainer
+                        },
+                        textColor = if (deadlineInfo.urgency == DeadlineUrgency.OVERDUE || deadlineInfo.urgency == DeadlineUrgency.DUE_TODAY) {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        } else {
+                            MaterialTheme.colorScheme.onTertiaryContainer
+                        }
+                    )
+                }
             }
         }
-        IconButton(onClick = onToggleStar) {
-            Icon(
-                imageVector = if (card.isStarred) Icons.Filled.Star else Icons.Default.StarBorder,
-                contentDescription = if (card.isStarred) "Unstar event" else "Star event",
-                tint = if (card.isStarred) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-            )
+        DisableSelection {
+            IconButton(onClick = onToggleStar) {
+                Icon(
+                    imageVector = if (card.isStarred) Icons.Filled.Star else Icons.Default.StarBorder,
+                    contentDescription = if (card.isStarred) "Unstar event" else "Star event",
+                    tint = if (card.isStarred) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 }
@@ -599,7 +692,7 @@ private fun EventDetailSenderRow(card: EventCard, roomName: String, priorityColo
     val senderName = card.originalSender.ifBlank { "Unknown" }
     val senderInitial = senderName.trim().take(1).uppercase().ifBlank { "S" }
     val formattedTime = remember(card.timestampSeconds) {
-        DateTimeFormatter.ofPattern("MMM dd, yyyy • HH:mm").withZone(ZoneId.systemDefault()).format(Instant.ofEpochSecond(card.timestampSeconds))
+        detailSenderTimeFormatter.format(Instant.ofEpochSecond(card.timestampSeconds))
     }
 
     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -628,11 +721,16 @@ private fun EventDetailSenderRow(card: EventCard, roomName: String, priorityColo
 
 @Composable
 private fun EventDetailSectionCard(
+    sectionIndex: Int,
     section: EventSection,
+    checkedItems: Set<String>,
+    sourceBubbles: List<SourceMessageBubble>,
+    hasSourceMessages: Boolean,
     isEnrichingSections: Boolean,
     onEnrichSections: () -> Unit,
-    enableDetailItemClick: Boolean,
-    onDetailItemClick: (EventDetailItem) -> Unit
+    onDetailItemClick: (EventDetailItem) -> Unit,
+    onToggleCheckedItem: (String) -> Unit,
+    onOpenLinkFailed: (String) -> Unit
 ) {
     val resolved = remember(section) { EventDetailItemParser.resolveSectionDisplay(section) }
     val safeHeading = remember(section.heading) {
@@ -643,6 +741,17 @@ private fun EventDetailSectionCard(
     }
     if (safeHeading.isBlank() && resolved.items.isEmpty() && resolved.remainingContent.isBlank()) {
         return
+    }
+    val (checkableDone, checkableTotal) = remember(section, resolved.items, checkedItems, sectionIndex) {
+        var total = 0
+        var done = 0
+        resolved.items.forEachIndexed { itemIdx, item ->
+            if (DetailChecklistKeys.isCheckable(item.kind)) {
+                total++
+                if (DetailChecklistKeys.keyFor(sectionIndex, itemIdx, item) in checkedItems) done++
+            }
+        }
+        done to total
     }
     val hasBulletCards = resolved.items.isNotEmpty()
     val sectionContainerModifier = if (hasBulletCards) {
@@ -655,11 +764,11 @@ private fun EventDetailSectionCard(
             .padding(horizontal = 18.dp, vertical = 14.dp)
     }
     Column(modifier = sectionContainerModifier) {
-        val hasHeaderRow = safeHeading.isNotBlank() || canEnrichWithAi
+        val hasHeaderRow = safeHeading.isNotBlank() || canEnrichWithAi || checkableTotal > 0
         if (hasHeaderRow) {
             Row(
                 modifier = if (hasBulletCards) Modifier.fillMaxWidth().padding(horizontal = 4.dp) else Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (safeHeading.isNotBlank()) {
@@ -673,19 +782,28 @@ private fun EventDetailSectionCard(
                 } else {
                     Spacer(Modifier.weight(1f))
                 }
+                if (checkableTotal > 0) {
+                    DetailBadgeChip(
+                        text = "$checkableDone/$checkableTotal done",
+                        containerColor = if (checkableDone == checkableTotal) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                        textColor = if (checkableDone == checkableTotal) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 if (canEnrichWithAi) {
-                    if (isEnrichingSections) {
-                        Box(modifier = Modifier.size(28.dp), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                        }
-                    } else {
-                        IconButton(onClick = onEnrichSections, modifier = Modifier.size(28.dp)) {
-                            Icon(
-                                imageVector = Icons.Default.AutoAwesome,
-                                contentDescription = "Structure detail cards with AI",
-                                modifier = Modifier.size(16.dp),
-                                tint = MaterialTheme.colorScheme.primary
-                            )
+                    DisableSelection {
+                        if (isEnrichingSections) {
+                            Box(modifier = Modifier.size(28.dp), contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                            }
+                        } else {
+                            IconButton(onClick = onEnrichSections, modifier = Modifier.size(28.dp)) {
+                                Icon(
+                                    imageVector = Icons.Default.AutoAwesome,
+                                    contentDescription = "Structure detail cards with AI",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
                         }
                     }
                 }
@@ -698,11 +816,24 @@ private fun EventDetailSectionCard(
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
                 resolved.items.forEachIndexed { index, item ->
+                    val itemKey = DetailChecklistKeys.keyFor(sectionIndex, index, item)
+                    val isCheckable = DetailChecklistKeys.isCheckable(item.kind)
+                    val isChecked = isCheckable && itemKey in checkedItems
+                    val canJumpToSource = remember(hasSourceMessages, sourceBubbles, item) {
+                        hasSourceMessages && SourceMessageParser.findMatchingBubbleIndex(
+                            bubbles = sourceBubbles,
+                            queryText = "${item.label} ${item.value}"
+                        ) != null
+                    }
                     DetailMetadataRow(
                         item = item,
                         shape = segmentedItemShape(index = index, totalCount = resolved.items.size),
-                        enabled = enableDetailItemClick,
-                        onClick = { onDetailItemClick(item) }
+                        enabled = !isCheckable && canJumpToSource,
+                        onClick = { onDetailItemClick(item) },
+                        isCheckable = isCheckable,
+                        isChecked = isChecked,
+                        onToggleCheck = { onToggleCheckedItem(itemKey) },
+                        onOpenLinkFailed = onOpenLinkFailed
                     )
                 }
             }
@@ -727,16 +858,42 @@ private fun DetailMetadataRow(
     item: EventDetailItem,
     shape: RoundedCornerShape,
     enabled: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    isCheckable: Boolean = false,
+    isChecked: Boolean = false,
+    onToggleCheck: () -> Unit = {},
+    onOpenLinkFailed: (String) -> Unit = {}
 ) {
     val visuals = detailItemVisuals(item)
     val labelText = item.label.ifBlank { EventDetailItemParser.defaultLabel(item.kind) }
+    val safeHttpUrl = remember(item.kind, item.value) {
+        if (item.kind == EventDetailKind.LINK) IcsCalendarGenerator.extractSafeHttpUrl(item.value) else null
+    }
+    val linkHost = remember(safeHttpUrl) {
+        safeHttpUrl?.let { url -> runCatching { java.net.URI(url).host }.getOrNull() }
+    }
+    val uriHandler = LocalUriHandler.current
+    val clipboardManager = LocalClipboardManager.current
+    var copiedRecently by remember(item) { mutableStateOf(false) }
+
+    LaunchedEffect(copiedRecently) {
+        if (copiedRecently) {
+            delay(1_400)
+            copiedRecently = false
+        }
+    }
 
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
-            .let { mod -> if (enabled) mod.clickable(onClick = onClick) else mod }
+            .let { mod ->
+                when {
+                    isCheckable -> mod.clickable(onClick = onToggleCheck)
+                    enabled -> mod.clickable(onClick = onClick)
+                    else -> mod
+                }
+            }
             .semantics(mergeDescendants = true) {},
         shape = shape,
         color = MaterialTheme.colorScheme.surfaceContainerLowest
@@ -747,21 +904,31 @@ private fun DetailMetadataRow(
                 .padding(horizontal = 14.dp, vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Surface(
-                modifier = Modifier.size(36.dp),
-                shape = CircleShape,
-                color = visuals.badgeContainerColor
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = visuals.icon,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                        tint = visuals.badgeIconColor
+            if (isCheckable) {
+                DisableSelection {
+                    Checkbox(
+                        checked = isChecked,
+                        onCheckedChange = { onToggleCheck() }
                     )
+                    Spacer(Modifier.width(4.dp))
                 }
+            } else {
+                Surface(
+                    modifier = Modifier.size(36.dp),
+                    shape = CircleShape,
+                    color = visuals.badgeContainerColor
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = visuals.icon,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = visuals.badgeIconColor
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
             }
-            Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = labelText,
@@ -774,9 +941,51 @@ private fun DetailMetadataRow(
                 Spacer(Modifier.height(2.dp))
                 Text(
                     text = item.value,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        textDecoration = if (isChecked) TextDecoration.LineThrough else TextDecoration.None
+                    ),
+                    color = if (isChecked) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
                 )
+            }
+            DisableSelection {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (safeHttpUrl != null) {
+                        IconButton(
+                            onClick = {
+                                runCatching { uriHandler.openUri(safeHttpUrl) }.onFailure { err ->
+                                    onOpenLinkFailed("Failed to open link: ${err.message ?: "unsupported URL"}")
+                                }
+                            },
+                            modifier = Modifier.size(30.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                                contentDescription = if (linkHost != null) "Open link ($linkHost)" else "Open link",
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                    if (item.value.isNotBlank()) {
+                        IconButton(
+                            onClick = {
+                                clipboardManager.setText(AnnotatedString(item.value))
+                                copiedRecently = true
+                            },
+                            modifier = Modifier.size(30.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (copiedRecently) Icons.Default.Check else Icons.Default.ContentCopy,
+                                contentDescription = if (copiedRecently) "Copied" else "Copy $labelText",
+                                modifier = Modifier.size(15.dp),
+                                tint = if (copiedRecently) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -841,22 +1050,26 @@ private fun EventDetailSourceMessagesBox(
                 color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.weight(1f)
             )
-            OutlinedButton(
-                onClick = onShowContextDialog,
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                modifier = Modifier.height(30.dp)
-            ) {
-                Icon(Icons.Default.Forum, contentDescription = null, modifier = Modifier.size(14.dp))
-                Spacer(Modifier.width(5.dp))
-                Text("±5 Context", style = MaterialTheme.typography.labelSmall)
+            DisableSelection {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(
+                        onClick = onShowContextDialog,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.height(30.dp)
+                    ) {
+                        Icon(Icons.Default.Forum, contentDescription = null, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("±5 Context", style = MaterialTheme.typography.labelSmall)
+                    }
+                    TranslationActionButton(
+                        isTranslating = isTranslatingMessages,
+                        isShowingTranslation = isShowingTranslation,
+                        onClick = onTranslateAction,
+                        buttonSizeDp = 28,
+                        iconSizeDp = 16
+                    )
+                }
             }
-            TranslationActionButton(
-                isTranslating = isTranslatingMessages,
-                isShowingTranslation = isShowingTranslation,
-                onClick = onTranslateAction,
-                buttonSizeDp = 28,
-                iconSizeDp = 16
-            )
         }
         Spacer(Modifier.height(8.dp))
         Column(
@@ -1011,16 +1224,7 @@ private fun QuickEditCardDialog(
 
 internal fun validateQuickEditIsoDate(rawDate: String?): String? {
     val trimmed = rawDate?.trim()?.takeIf { it.isNotBlank() } ?: return null
-    val isDate = runCatching { java.time.LocalDate.parse(trimmed) }.isSuccess
-    if (isDate) return null
-    val normalized = trimmed.replace(' ', 'T')
-    val isDateTime = runCatching {
-        when (normalized.length) {
-            16 -> java.time.LocalDateTime.parse("$normalized:00")
-            else -> java.time.LocalDateTime.parse(normalized)
-        }
-    }.isSuccess
-    return if (isDateTime) null else "Use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
+    return if (DeadlineTriage.isValidIsoTemporal(trimmed)) null else "Use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
 }
 
 @Composable
@@ -1126,11 +1330,13 @@ private fun ContextMessagesDialog(
 
 @Composable
 private fun EventDetailCalendarFooter(onAddToCalendar: () -> Unit) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-        OutlinedButton(onClick = onAddToCalendar) {
-            Icon(Icons.Default.CalendarToday, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(text = "Add to Calendar", lineHeight = MaterialTheme.typography.labelLarge.fontSize)
+    DisableSelection {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            OutlinedButton(onClick = onAddToCalendar) {
+                Icon(Icons.Default.CalendarToday, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(text = "Add to Calendar", lineHeight = MaterialTheme.typography.labelLarge.fontSize)
+            }
         }
     }
 }
@@ -1274,24 +1480,26 @@ private fun AttachmentRowActions(
     onRevealInFinder: () -> Unit,
     onRecheck: () -> Unit
 ) {
-    if (isPresent) {
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onOpen, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Open attachment", modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+    DisableSelection {
+        if (isPresent) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onOpen, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Open attachment", modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                }
+                IconButton(onClick = onRevealInFinder, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = "Reveal in Finder", modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
-            IconButton(onClick = onRevealInFinder, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.Default.FolderOpen, contentDescription = "Reveal in Finder", modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            return@DisableSelection
+        }
+        OutlinedButton(onClick = onRecheck, enabled = !isRechecking, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp), modifier = Modifier.height(32.dp)) {
+            if (isRechecking) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
             }
+            Spacer(Modifier.width(6.dp))
+            Text(text = if (isRechecking) "Checking..." else "Re-check", style = MaterialTheme.typography.labelMedium.copy(lineHeight = MaterialTheme.typography.labelMedium.fontSize))
         }
-        return
-    }
-    OutlinedButton(onClick = onRecheck, enabled = !isRechecking, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp), modifier = Modifier.height(32.dp)) {
-        if (isRechecking) {
-            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-        } else {
-            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
-        }
-        Spacer(Modifier.width(6.dp))
-        Text(text = if (isRechecking) "Checking..." else "Re-check", style = MaterialTheme.typography.labelMedium.copy(lineHeight = MaterialTheme.typography.labelMedium.fontSize))
     }
 }

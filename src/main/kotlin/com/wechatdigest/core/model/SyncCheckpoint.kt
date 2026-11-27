@@ -9,5 +9,6 @@ data class SyncCheckpoint(
     val lastSyncTimestamp: Long,
     val updatedAt: Long,
     val lastShardName: String = "",
-    val lastCreateTime: Long = 0L
+    val lastCreateTime: Long = 0L,
+    val hasMore: Boolean = false
 )

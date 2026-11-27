@@ -929,5 +929,155 @@ class AppStateTest {
 
         appState.close()
     }
+
+    @Test
+    fun `Phase 4 triage filters, full-corpus search, completion toggles, test probes, and sync cancellation work end to end`() = runBlocking {
+        val syncCheckpointStore = com.wechatdigest.storage.SyncCheckpointStore(appDb)
+        val syncService = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = syncCheckpointStore,
+            llmClientFactory = { cfg ->
+                val slowEngine = MockEngine {
+                    kotlinx.coroutines.delay(5_000)
+                    respond(
+                        """{"choices":[{"message":{"role":"assistant","content":"OK"}}]}""",
+                        HttpStatusCode.OK,
+                        headersOf(HttpHeaders.ContentType, "application/json")
+                    )
+                }
+                KtorLlmClient(cfg, slowEngine)
+            }
+        )
+
+        var notifyCalls = 0
+        val dispatcher = com.wechatdigest.core.notification.NotificationDispatcher(commandRunner = { notifyCalls++ })
+        var llmCalls = 0
+        val appState = AppState(
+            settingsStore = settingsStore,
+            eventCardStore = eventCardStore,
+            syncService = syncService,
+            syncCheckpointStore = syncCheckpointStore,
+            notificationDispatcher = dispatcher,
+            scope = testScope,
+            llmClientFactory = { cfg ->
+                val engine = MockEngine {
+                    llmCalls++
+                    respond(
+                        """{"choices":[{"message":{"role":"assistant","content":"OK"}}]}""",
+                        HttpStatusCode.OK,
+                        headersOf(HttpHeaders.ContentType, "application/json")
+                    )
+                }
+                KtorLlmClient(cfg.copy(apiKey = "test-key"), engine)
+            }
+        )
+
+        val soonCard = EventCard(
+            id = "p4-soon",
+            title = "Scholarship Essay",
+            summary = "Submit personal statement",
+            translatedSummary = "Submit personal statement",
+            category = EventCategory.DEADLINE,
+            priority = EventPriority.CRITICAL,
+            eventDate = "2026-11-28",
+            originalSender = "Advisor",
+            sourceRoomId = "r1@chatroom",
+            sourceRoomName = "Fellowships",
+            sourceMessages = "[2026-11-26] Advisor: UniquePhraseInSourceMsg",
+            timestampSeconds = 100L,
+            attachments = listOf(
+                com.wechatdigest.core.model.EventAttachment(
+                    fileName = "Fellowship_Form_2026.pdf",
+                    fileExtension = "pdf",
+                    fileSizeBytes = 1024L
+                )
+            )
+        )
+        val laterCard = soonCard.copy(
+            id = "p4-later",
+            title = "Club Fair",
+            summary = "Join student clubs",
+            translatedSummary = "Join student clubs",
+            category = EventCategory.ACTIVITY,
+            priority = EventPriority.NORMAL,
+            eventDate = "2026-12-20",
+            sourceRoomName = "Campus Life",
+            sourceMessages = "[2026-11-26] Lead: Welcome everyone",
+            timestampSeconds = 200L,
+            attachments = emptyList()
+        )
+        eventCardStore.upsert(listOf(soonCard, laterCard))
+        appState.loadEvents().join()
+
+        // Sort DEADLINE_SOONEST orders 2026-11-28 before 2026-12-20 even though laterCard has newer timestampSeconds
+        appState.sortOrder.value = EventSortOrder.DEADLINE_SOONEST
+        withTimeout(2_000) { appState.visibleEvents.first { it.map { c -> c.id } == listOf("p4-soon", "p4-later") } }
+
+        // Category filter
+        appState.categoryFilter.value = EventCategory.ACTIVITY
+        withTimeout(2_000) { appState.visibleEvents.first { it.map { c -> c.id } == listOf("p4-later") } }
+        appState.categoryFilter.value = null
+
+        // Full-corpus search matches sourceMessages and attachment fileName
+        appState.searchQuery.value = "UniquePhraseInSourceMsg"
+        withTimeout(2_000) { appState.visibleEvents.first { it.map { c -> c.id } == listOf("p4-soon") } }
+        appState.searchQuery.value = "Fellowship_Form_2026"
+        withTimeout(2_000) { appState.visibleEvents.first { it.map { c -> c.id } == listOf("p4-soon") } }
+        appState.searchQuery.value = ""
+
+        // Toggle completed & hideCompletedFilter
+        appState.toggleCompleted("p4-soon").join()
+        assertTrue(appState.events.value.first { it.id == "p4-soon" }.isCompleted)
+        assertTrue(eventCardStore.listActive().first { it.id == "p4-soon" }.isCompleted)
+        appState.hideCompletedFilter.value = true
+        withTimeout(2_000) { appState.visibleEvents.first { it.map { c -> c.id } == listOf("p4-later") } }
+        appState.hideCompletedFilter.value = false
+
+        // Toggle checklist item persists when sections allow or legacy empty; invalid key against structured section is ignored
+        appState.toggleCheckedItem("p4-soon", "0:0:999").join()
+        assertEquals(listOf("0:0:999"), appState.events.value.first { it.id == "p4-soon" }.checkedItems)
+        appState.toggleCheckedItem("p4-later", "invalid:key").join()
+
+        // Test connection & test notification probes
+        appState.testLlmConnection().join()
+        assertEquals(1, llmCalls)
+        assertTrue(appState.llmConnectionStatusMessage.value?.contains("Connected") == true)
+
+        // Built-in local connection probe is blocked cleanly while sync is active
+        val roomDir = File(tempDir, "cancel_wechat").apply { mkdirs() }
+        val cancelTable = com.wechatdigest.core.db.WeChatDatabaseDriver.calculateRoomTableName("r1@chatroom")
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(roomDir, "contact.db").absolutePath}").use { c ->
+            c.createStatement().execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(roomDir, "message_0.db").absolutePath}").use { c ->
+            c.createStatement().use { s ->
+                s.execute("CREATE TABLE $cancelTable (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                s.execute("INSERT INTO $cancelTable VALUES (1, 1794800000, 'u1', CAST('Urgent deadline tomorrow morning in Room 101.' AS BLOB))")
+            }
+        }
+        appState.updateSettings(appState.settings.value.copy(wechatDataDir = roomDir.absolutePath, monitoredRoomIds = setOf("r1@chatroom"))).join()
+        val syncJob = appState.triggerSync()
+        withTimeout(2_000) { appState.isSyncing.first { it } }
+        appState.testLlmConnection(
+            appState.settings.value.llm.copy(providerType = com.wechatdigest.core.llm.LlmProviderType.BUILT_IN_LOCAL)
+        ).join()
+        assertTrue(appState.llmConnectionStatusMessage.value?.contains("Wait for active sync") == true)
+        appState.cancelSync().join()
+        syncJob.join()
+        assertFalse(appState.isSyncing.value)
+
+        appState.testNotification().join()
+        assertEquals(1, notifyCalls)
+
+        // Secret redaction regression in LlmJsonUtils
+        val rawErr = "HTTP 401 Basic dXNlcjpwYXNz with AIzaSyDummyKey1234567890123 and gsk_secret_token_999 and x-api-key: secret_val_42"
+        val redacted = com.wechatdigest.core.llm.LlmJsonUtils.sanitizeLogMessage(rawErr)
+        assertFalse(redacted.contains("dXNlcjpwYXNz"))
+        assertFalse(redacted.contains("AIzaSyDummyKey"))
+        assertFalse(redacted.contains("gsk_secret"))
+        assertFalse(redacted.contains("secret_val_42"))
+
+        appState.close()
+    }
 }
 

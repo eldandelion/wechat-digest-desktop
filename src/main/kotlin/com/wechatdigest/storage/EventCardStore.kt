@@ -1,6 +1,7 @@
 package com.wechatdigest.storage
 
 import com.wechatdigest.core.llm.LlmJsonUtils
+import com.wechatdigest.core.model.DetailChecklistKeys
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCardStatus
@@ -49,6 +50,8 @@ class EventCardStore(private val db: AppDatabase) {
     private data class SupersededTarget(
         val id: String,
         val isStarred: Boolean,
+        val isCompleted: Boolean,
+        val checkedItems: List<String>,
         val isDismissed: Boolean,
         val originalSenderId: String
     )
@@ -82,8 +85,8 @@ class EventCardStore(private val db: AppDatabase) {
                 source_room_name, source_messages, translated_source_messages, attachments,
                 timestamp_seconds, is_read, is_starred, is_dismissed,
                 status, supersedes_card_id, original_sender_id, content_fingerprint, source_local_ids,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_completed, checked_items, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """.trimIndent()
         val dismissSupersededSql = "UPDATE event_cards SET is_dismissed = 1 WHERE id = ? AND is_dismissed = 0"
 
@@ -109,12 +112,23 @@ class EventCardStore(private val db: AppDatabase) {
                             )
                             val resolvedSupersedesId = supersededMatch?.id?.takeIf { canAutoDismissSuperseded }
                             val effectiveStarred = card.isStarred || (canAutoDismissSuperseded && supersededMatch?.isStarred == true)
+                            val effectiveCompleted = card.isCompleted || (canAutoDismissSuperseded && supersededMatch?.isCompleted == true)
+                            val rawChecked = if (card.checkedItems.isNotEmpty()) {
+                                card.checkedItems
+                            } else if (canAutoDismissSuperseded) {
+                                supersededMatch?.checkedItems.orEmpty()
+                            } else {
+                                emptyList()
+                            }
+                            val effectiveChecked = DetailChecklistKeys.sanitizeCheckedItems(rawChecked)
                             val resolvedFingerprint = card.contentFingerprint.ifBlank {
                                 ContentFingerprint.compute(card.sourceMessages, card.attachments.map { it.md5 })
                             }
                             val resolvedCard = card.copy(
                                 supersedesCardId = resolvedSupersedesId,
                                 isStarred = effectiveStarred,
+                                isCompleted = effectiveCompleted,
+                                checkedItems = effectiveChecked,
                                 contentFingerprint = resolvedFingerprint
                             )
                             val dedupeKey = computeDedupeKey(resolvedCard)
@@ -143,7 +157,9 @@ class EventCardStore(private val db: AppDatabase) {
                             insertStmt.setString(23, resolvedCard.originalSenderId)
                             insertStmt.setString(24, resolvedCard.contentFingerprint)
                             insertStmt.setString(25, json.encodeToString(resolvedCard.sourceLocalIds))
-                            insertStmt.setLong(26, now)
+                            insertStmt.setInt(26, if (resolvedCard.isCompleted) 1 else 0)
+                            insertStmt.setString(27, json.encodeToString(resolvedCard.checkedItems))
+                            insertStmt.setLong(28, now)
 
                             if (insertStmt.executeUpdate() > 0) {
                                 insertedCards.add(resolvedCard)
@@ -206,18 +222,13 @@ class EventCardStore(private val db: AppDatabase) {
             ?: return null
 
         // Query across both active and already-superseded targets so re-applying the same amended card keeps dedupe_key identical.
-        val exactSql = "SELECT id, is_starred, is_dismissed, original_sender_id FROM event_cards WHERE id = ? AND source_room_id = ? LIMIT 1"
+        val exactSql = "SELECT id, is_starred, is_completed, checked_items, is_dismissed, original_sender_id FROM event_cards WHERE id = ? AND source_room_id = ? LIMIT 1"
         conn.prepareStatement(exactSql).use { stmt ->
             stmt.setString(1, cleaned)
             stmt.setString(2, roomId)
             stmt.executeQuery().use { rs ->
                 if (rs.next()) {
-                    return SupersededTarget(
-                        id = rs.getString("id"),
-                        isStarred = rs.getInt("is_starred") == 1,
-                        isDismissed = rs.getInt("is_dismissed") == 1,
-                        originalSenderId = rs.getString("original_sender_id") ?: ""
-                    )
+                    return mapSupersededTarget(rs)
                 }
             }
         }
@@ -226,11 +237,30 @@ class EventCardStore(private val db: AppDatabase) {
             .replace("\\", "\\\\")
             .replace("%", "\\%")
             .replace("_", "\\_")
-        val activePrefixSql = "SELECT id, is_starred, is_dismissed, original_sender_id FROM event_cards WHERE source_room_id = ? AND is_dismissed = 0 AND id LIKE ? ESCAPE '\\' LIMIT 2"
+        val activePrefixSql = "SELECT id, is_starred, is_completed, checked_items, is_dismissed, original_sender_id FROM event_cards WHERE source_room_id = ? AND is_dismissed = 0 AND id LIKE ? ESCAPE '\\' LIMIT 2"
         findUniquePrefixMatch(conn, activePrefixSql, roomId, "$escapedPrefix%")?.let { return it }
 
-        val anyPrefixSql = "SELECT id, is_starred, is_dismissed, original_sender_id FROM event_cards WHERE source_room_id = ? AND id LIKE ? ESCAPE '\\' LIMIT 2"
+        val anyPrefixSql = "SELECT id, is_starred, is_completed, checked_items, is_dismissed, original_sender_id FROM event_cards WHERE source_room_id = ? AND id LIKE ? ESCAPE '\\' LIMIT 2"
         return findUniquePrefixMatch(conn, anyPrefixSql, roomId, "$escapedPrefix%")
+    }
+
+    private fun decodeBoundedCheckedItems(rawChecked: String?): List<String> {
+        if (rawChecked.isNullOrBlank() || rawChecked.length > DetailChecklistKeys.MAX_CHECKED_JSON_CHARS) {
+            return emptyList()
+        }
+        val decoded = runCatching { json.decodeFromString<List<String>>(rawChecked) }.getOrDefault(emptyList())
+        return DetailChecklistKeys.sanitizeCheckedItems(decoded)
+    }
+
+    private fun mapSupersededTarget(rs: ResultSet): SupersededTarget {
+        return SupersededTarget(
+            id = rs.getString("id"),
+            isStarred = rs.getInt("is_starred") == 1,
+            isCompleted = rs.getInt("is_completed") == 1,
+            checkedItems = decodeBoundedCheckedItems(rs.getString("checked_items")),
+            isDismissed = rs.getInt("is_dismissed") == 1,
+            originalSenderId = rs.getString("original_sender_id") ?: ""
+        )
     }
 
     private fun findUniquePrefixMatch(
@@ -244,12 +274,7 @@ class EventCardStore(private val db: AppDatabase) {
             stmt.setString(2, likePattern)
             stmt.executeQuery().use { rs ->
                 if (!rs.next()) return null
-                val first = SupersededTarget(
-                    id = rs.getString("id"),
-                    isStarred = rs.getInt("is_starred") == 1,
-                    isDismissed = rs.getInt("is_dismissed") == 1,
-                    originalSenderId = rs.getString("original_sender_id") ?: ""
-                )
+                val first = mapSupersededTarget(rs)
                 // Fail closed when short ID prefix is ambiguous across multiple cards
                 if (rs.next()) return null
                 return first
@@ -383,6 +408,7 @@ class EventCardStore(private val db: AppDatabase) {
         } else {
             runCatching { json.decodeFromString<List<Long>>(rawLocalIds) }.getOrDefault(emptyList())
         }
+        val decodedChecked = decodeBoundedCheckedItems(rs.getString("checked_items"))
         return EventCard(
             id = rs.getString("id"),
             title = rs.getString("title"),
@@ -406,11 +432,13 @@ class EventCardStore(private val db: AppDatabase) {
             supersedesCardId = rs.getString("supersedes_card_id")?.takeIf { it.isNotBlank() },
             originalSenderId = rs.getString("original_sender_id") ?: "",
             contentFingerprint = rs.getString("content_fingerprint") ?: "",
-            sourceLocalIds = decodedLocalIds
+            sourceLocalIds = decodedLocalIds,
+            isCompleted = rs.getInt("is_completed") == 1,
+            checkedItems = decodedChecked
         )
     }
 
-    /** Updates Quick-Edit fields for card [id] while preserving read/star/source attribution state. */
+    /** Updates Quick-Edit fields for card [id] transactionally while preserving read/star/source attribution state. */
     fun updateCardFieldsOrThrow(
         id: String,
         title: String,
@@ -420,19 +448,35 @@ class EventCardStore(private val db: AppDatabase) {
     ): EventCard? {
         val sql = "UPDATE event_cards SET title = ?, category = ?, priority = ?, event_date = ? WHERE id = ? AND is_dismissed = 0"
         db.getConnection().use { conn ->
-            conn.prepareStatement(sql).use { stmt ->
-                stmt.setString(1, title)
-                stmt.setString(2, category.name)
-                stmt.setString(3, priority.name)
-                stmt.setString(4, eventDate)
-                stmt.setString(5, id)
-                if (stmt.executeUpdate() == 0) return null
+            conn.autoCommit = false
+            try {
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.setString(1, title)
+                    stmt.setString(2, category.name)
+                    stmt.setString(3, priority.name)
+                    stmt.setString(4, eventDate)
+                    stmt.setString(5, id)
+                    if (stmt.executeUpdate() == 0) {
+                        conn.rollback()
+                        return null
+                    }
+                }
+                val updated = findByIdWithConn(conn, id)
+                conn.commit()
+                return updated
+            } catch (e: Exception) {
+                runCatching { conn.rollback() }.onFailure { e.addSuppressed(it) }
+                throw e
+            } finally {
+                runCatching { conn.autoCommit = true }
             }
-            return findByIdWithConn(conn, id)
         }
     }
 
-    /** Replaces extracted fields on an existing card after single-card re-extraction while keeping ID and read/star state. */
+    /**
+     * Replaces extracted fields transactionally after single-card re-extraction while keeping ID/read/star state
+     * and pruning any [EventCard.checkedItems] keys no longer present in replacement sections.
+     */
     fun replaceExtractedCardOrThrow(existingId: String, replacement: EventCard): EventCard? {
         val sql = """
             UPDATE event_cards
@@ -445,28 +489,49 @@ class EventCardStore(private val db: AppDatabase) {
                 event_date = ?,
                 status = ?,
                 supersedes_card_id = ?,
-                content_fingerprint = ?
+                content_fingerprint = ?,
+                checked_items = ?
             WHERE id = ? AND is_dismissed = 0
         """.trimIndent()
         val resolvedFp = replacement.contentFingerprint.ifBlank {
             ContentFingerprint.compute(replacement.sourceMessages, replacement.attachments.map { it.md5 })
         }
         db.getConnection().use { conn ->
-            conn.prepareStatement(sql).use { stmt ->
-                stmt.setString(1, replacement.title)
-                stmt.setString(2, replacement.summary)
-                stmt.setString(3, replacement.translatedSummary)
-                stmt.setString(4, json.encodeToString(replacement.sections))
-                stmt.setString(5, replacement.category.name)
-                stmt.setString(6, replacement.priority.name)
-                stmt.setString(7, replacement.eventDate)
-                stmt.setString(8, replacement.status.name)
-                stmt.setString(9, replacement.supersedesCardId)
-                stmt.setString(10, resolvedFp)
-                stmt.setString(11, existingId)
-                if (stmt.executeUpdate() == 0) return null
+            conn.autoCommit = false
+            try {
+                val existing = findByIdWithConn(conn, existingId)
+                if (existing == null || existing.isDismissed) {
+                    conn.rollback()
+                    return null
+                }
+                val prunedChecked = DetailChecklistKeys.sanitizeCheckedItems(existing.checkedItems, replacement.sections)
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.setString(1, replacement.title)
+                    stmt.setString(2, replacement.summary)
+                    stmt.setString(3, replacement.translatedSummary)
+                    stmt.setString(4, json.encodeToString(replacement.sections))
+                    stmt.setString(5, replacement.category.name)
+                    stmt.setString(6, replacement.priority.name)
+                    stmt.setString(7, replacement.eventDate)
+                    stmt.setString(8, replacement.status.name)
+                    stmt.setString(9, replacement.supersedesCardId)
+                    stmt.setString(10, resolvedFp)
+                    stmt.setString(11, json.encodeToString(prunedChecked))
+                    stmt.setString(12, existingId)
+                    if (stmt.executeUpdate() == 0) {
+                        conn.rollback()
+                        return null
+                    }
+                }
+                val updated = findByIdWithConn(conn, existingId)
+                conn.commit()
+                return updated
+            } catch (e: Exception) {
+                runCatching { conn.rollback() }.onFailure { e.addSuppressed(it) }
+                throw e
+            } finally {
+                runCatching { conn.autoCommit = true }
             }
-            return findByIdWithConn(conn, existingId)
         }
     }
 
@@ -492,6 +557,50 @@ class EventCardStore(private val db: AppDatabase) {
             }
         } catch (e: Exception) {
             System.err.println("[EventCardStore] Error updating star state: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
+    /** Persists the decoupled `is_completed` ("Done") state for card [id], throwing on database error. */
+    fun setCompletedOrThrow(id: String, completed: Boolean) {
+        val value = if (completed) 1 else 0
+        val sql = "UPDATE event_cards SET is_completed = ? WHERE id = ?"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                stmt.setInt(1, value)
+                stmt.setString(2, id)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    /** Sets the `is_completed` flag for card [id], logging and absorbing database errors. */
+    fun setCompleted(id: String, completed: Boolean) {
+        try {
+            setCompletedOrThrow(id, completed)
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error updating completed state: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
+    /** Persists bounded, distinct checklist checked keys as JSON for card [id], throwing on database error. */
+    fun setCheckedItemsOrThrow(id: String, checkedKeys: List<String>) {
+        val sanitized = DetailChecklistKeys.sanitizeCheckedItems(checkedKeys)
+        val sql = "UPDATE event_cards SET checked_items = ? WHERE id = ?"
+        db.getConnection().use { conn ->
+            conn.prepareStatement(sql).use { stmt ->
+                stmt.setString(1, json.encodeToString(sanitized))
+                stmt.setString(2, id)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    /** Persists checklist checked keys for card [id], logging and absorbing database errors. */
+    fun setCheckedItems(id: String, checkedKeys: List<String>) {
+        try {
+            setCheckedItemsOrThrow(id, checkedKeys)
+        } catch (e: Exception) {
+            System.err.println("[EventCardStore] Error updating checked items: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
     }
 
@@ -542,15 +651,29 @@ class EventCardStore(private val db: AppDatabase) {
     }
 
     /**
-     * Persists updated [sections] JSON for card [id], throwing on database errors.
+     * Persists updated [sections] JSON and prunes stale [EventCard.checkedItems] transactionally, throwing on database errors.
      */
     fun updateSectionsOrThrow(id: String, sections: List<EventSection>) {
-        val sql = "UPDATE event_cards SET sections = ? WHERE id = ?"
+        val sql = "UPDATE event_cards SET sections = ?, checked_items = ? WHERE id = ?"
         db.getConnection().use { conn ->
-            conn.prepareStatement(sql).use { stmt ->
-                stmt.setString(1, json.encodeToString(sections))
-                stmt.setString(2, id)
-                stmt.executeUpdate()
+            conn.autoCommit = false
+            try {
+                val existing = findByIdWithConn(conn, id)
+                val prunedChecked = existing?.let {
+                    DetailChecklistKeys.sanitizeCheckedItems(it.checkedItems, sections)
+                } ?: emptyList()
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.setString(1, json.encodeToString(sections))
+                    stmt.setString(2, json.encodeToString(prunedChecked))
+                    stmt.setString(3, id)
+                    stmt.executeUpdate()
+                }
+                conn.commit()
+            } catch (e: Exception) {
+                runCatching { conn.rollback() }.onFailure { e.addSuppressed(it) }
+                throw e
+            } finally {
+                runCatching { conn.autoCommit = true }
             }
         }
     }
@@ -614,7 +737,8 @@ class EventCardStore(private val db: AppDatabase) {
             event_date, original_sender, source_room_id,
             source_room_name, source_messages, translated_source_messages, attachments,
             timestamp_seconds, is_read, is_starred, is_dismissed,
-            status, supersedes_card_id, original_sender_id, content_fingerprint, source_local_ids
+            status, supersedes_card_id, original_sender_id, content_fingerprint, source_local_ids,
+            is_completed, checked_items
         """
     }
 }

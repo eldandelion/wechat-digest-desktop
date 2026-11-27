@@ -272,8 +272,75 @@ data class EventCard(
     val supersedesCardId: String? = null,
     val originalSenderId: String = "",
     val contentFingerprint: String = "",
-    val sourceLocalIds: List<Long> = emptyList()
+    val sourceLocalIds: List<Long> = emptyList(),
+    val isCompleted: Boolean = false,
+    val checkedItems: List<String> = emptyList()
 )
+
+/** Builds, validates, and bounds checklist keys for detail tiles inside an [EventSection]. */
+object DetailChecklistKeys {
+    const val MAX_CHECKED_ITEMS = 128
+    const val MAX_CHECKED_KEY_CHARS = 128
+    const val MAX_CHECKED_JSON_CHARS = 32_768
+
+    fun keyFor(sectionIndex: Int, itemIndex: Int, item: EventDetailItem): String =
+        "${sectionIndex}:${itemIndex}:${item.kind.name}:${item.label.trim().lowercase(Locale.ROOT)}"
+            .take(MAX_CHECKED_KEY_CHARS)
+
+    fun isCheckable(kind: EventDetailKind): Boolean =
+        kind == EventDetailKind.ACTION ||
+            kind == EventDetailKind.REQUIREMENT ||
+            kind == EventDetailKind.DOCUMENT
+
+    /** Returns all valid checklist keys derived from [sections] after item normalization. */
+    fun validKeysForSections(sections: List<EventSection>): Set<String> {
+        if (sections.isEmpty()) return emptySet()
+        return buildSet {
+            sections.forEachIndexed { secIdx, section ->
+                val resolved = EventDetailItemParser.resolveSectionDisplay(section)
+                resolved.items.forEachIndexed { itemIdx, item ->
+                    if (isCheckable(item.kind)) {
+                        add(keyFor(secIdx, itemIdx, item))
+                    }
+                }
+            }
+        }
+    }
+
+    /** Deduplicates, bounds, and optionally intersects [rawKeys] with valid keys of [sections]. */
+    fun sanitizeCheckedItems(
+        rawKeys: List<String>,
+        sections: List<EventSection>? = null
+    ): List<String> {
+        if (rawKeys.isEmpty()) return emptyList()
+        val validKeys = sections?.let { validKeysForSections(it) }
+        return rawKeys.asSequence()
+            .map { it.trim().take(MAX_CHECKED_KEY_CHARS) }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .filter { key -> validKeys == null || key in validKeys }
+            .take(MAX_CHECKED_ITEMS)
+            .toList()
+    }
+
+    /** Computes `(doneCount, totalCheckableCount)` across all [sections] cleanly without double traversal. */
+    fun countProgress(sections: List<EventSection>, checkedItems: List<String>): Pair<Int, Int> {
+        if (sections.isEmpty()) return 0 to 0
+        val checkedSet = checkedItems.toSet()
+        var total = 0
+        var done = 0
+        sections.forEachIndexed { secIdx, section ->
+            val resolved = EventDetailItemParser.resolveSectionDisplay(section)
+            resolved.items.forEachIndexed { itemIdx, item ->
+                if (isCheckable(item.kind)) {
+                    total++
+                    if (keyFor(secIdx, itemIdx, item) in checkedSet) done++
+                }
+            }
+        }
+        return done to total
+    }
+}
 
 @Serializable
 data class LlmExtractedEvent(

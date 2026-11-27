@@ -14,7 +14,10 @@ internal object LlmJsonUtils {
     private val urlWithQueryOrCredentialsRegex = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE)
     private val localFilesystemPathRegex = Regex("/(?:Users|Volumes|tmp|var|private|home)/[^\\s\"':,)<>]+")
     private val bearerTokenRegex = Regex("""(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}""")
-    private val secretKeyPrefixRegex = Regex("""\bsk-[A-Za-z0-9_-]{8,}\b""")
+    private val basicAuthRegex = Regex("""(?i)\bBasic\s+[A-Za-z0-9+/=]{6,}""")
+    private val secretKeyPrefixRegex = Regex("""\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{16,}|gsk_[0-9A-Za-z_-]{12,}|hf_[0-9A-Za-z]{12,}|ghp_[0-9A-Za-z]{16,}|github_pat_[0-9A-Za-z_]{16,}|AKIA[0-9A-Z]{16})\b""")
+    private val jwtRegex = Regex("""\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*\b""")
+    private val keyValSecretRegex = Regex("""(?i)\b(x-api-key|api[-_]?key|access[-_]?token|auth[-_]?token|token)\b(\s*[:=]\s*["']?)[^\s"',;}&]+""")
     private val hexKey64Regex = Regex("""\b[0-9a-fA-F]{64}\b""")
     private val controlOrAnsiRegex = Regex("[\\u0000-\\u001F\\u007F]")
     private val trailingCommaRegex = Regex(",(\\s*[}\\]])")
@@ -216,7 +219,10 @@ internal object LlmJsonUtils {
         val pathRedacted = urlRedacted.replace(localFilesystemPathRegex, "[redacted-path]")
         val secretsRedacted = pathRedacted
             .replace(bearerTokenRegex, "Bearer [redacted-token]")
+            .replace(basicAuthRegex, "Basic [redacted-token]")
             .replace(secretKeyPrefixRegex, "[redacted-api-key]")
+            .replace(jwtRegex, "[redacted-jwt]")
+            .replace(keyValSecretRegex) { mr -> "${mr.groupValues[1]}${mr.groupValues[2]}[redacted]" }
             .replace(hexKey64Regex, "[redacted-hex-key]")
         return secretsRedacted.replace(controlOrAnsiRegex, " ")
             .replace(Regex(" {2,}"), " ")

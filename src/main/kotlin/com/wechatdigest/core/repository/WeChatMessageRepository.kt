@@ -12,7 +12,7 @@ import com.wechatdigest.core.model.WeChatMessage
 import com.wechatdigest.core.sanitizer.MessageSanitizer
 import java.io.File
 import java.io.FileNotFoundException
-import java.util.concurrent.CancellationException
+import kotlinx.coroutines.CancellationException
 
 class WeChatMessageRepository(
     private val driver: WeChatDatabaseDriver,
@@ -26,7 +26,8 @@ class WeChatMessageRepository(
         val messages: List<WeChatMessage>,
         val latestShardName: String,
         val latestLocalId: Long,
-        val latestCreateTime: Long
+        val latestCreateTime: Long,
+        val hasMore: Boolean = false
     )
 
     /** Result of loading a bounded surrounding conversation window around an extracted card's messages. */
@@ -109,6 +110,7 @@ class WeChatMessageRepository(
         conn: java.sql.Connection,
         tableName: String
     ): WeChatSessionContext.RoomShardTableBounds? {
+        require(MSG_TABLE_REGEX.matches(tableName)) { "Invalid room message table name" }
         return try {
             val sql = "SELECT COALESCE(MIN(create_time), 0), COALESCE(MAX(create_time), 0), COALESCE(MAX(local_id), 0) FROM $tableName"
             conn.createStatement().use { stmt ->
@@ -196,6 +198,7 @@ class WeChatMessageRepository(
      * Fetches the latest messages for a chatroom and resolves sender names and decompresses content.
      */
     fun getRecentMessages(roomId: String, limit: Int = 30): List<WeChatMessage> {
+        val safeLimit = limit.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
         val tableName = WeChatDatabaseDriver.calculateRoomTableName(roomId)
         val shards = findShardsForTable(tableName)
         val shard = shards.minWithOrNull(newestShardComparator())
@@ -203,13 +206,14 @@ class WeChatMessageRepository(
 
         val contactsMap = contactRepository.loadContactsMap()
         val roomOwnerUsername = loadRoomOwnerUsername(roomId)
-        return readRecentFromShard(shard, tableName, contactsMap, limit, roomOwnerUsername)
+        return readRecentFromShard(shard, tableName, contactsMap, safeLimit, roomOwnerUsername)
     }
 
     /**
      * Fetches new messages strictly arriving after `sinceLocalId` in chronological order (oldest to newest).
      */
     fun getMessagesSince(roomId: String, sinceLocalId: Long, limit: Int = 50): List<WeChatMessage> {
+        val safeLimit = limit.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
         val tableName = WeChatDatabaseDriver.calculateRoomTableName(roomId)
         val shards = findShardsForTable(tableName)
         val shard = shards.minWithOrNull(newestShardComparator())
@@ -217,7 +221,7 @@ class WeChatMessageRepository(
 
         val contactsMap = contactRepository.loadContactsMap()
         val roomOwnerUsername = loadRoomOwnerUsername(roomId)
-        return readSinceLocalIdFromShard(shard, tableName, sinceLocalId, contactsMap, limit, roomOwnerUsername)
+        return readSinceLocalIdFromShard(shard, tableName, sinceLocalId, contactsMap, safeLimit, roomOwnerUsername)
     }
 
     /**
@@ -230,7 +234,7 @@ class WeChatMessageRepository(
         checkpoint: SyncCheckpoint?,
         limit: Int = 50
     ): IncrementalReadResult {
-        val safeLimit = limit.coerceAtLeast(1)
+        val safeLimit = limit.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
         val tableName = WeChatDatabaseDriver.calculateRoomTableName(roomId)
         val shards = findShardsForTable(tableName)
         val newestShard = shards.minWithOrNull(newestShardComparator())
@@ -252,16 +256,18 @@ class WeChatMessageRepository(
         if (checkpoint == null || checkpoint.lastLocalId <= 0L) {
             val recent = readRecentFromShard(newestShard, tableName, contactsMap, safeLimit, roomOwnerUsername)
             if (recent.isEmpty()) {
-                return IncrementalReadResult(emptyList(), newestShard.shardFile.name, 0L, 0L)
+                return IncrementalReadResult(emptyList(), newestShard.shardFile.name, 0L, 0L, hasMore = false)
             }
             return IncrementalReadResult(
                 messages = recent,
                 latestShardName = newestShard.shardFile.name,
                 latestLocalId = recent.maxOf { it.localId },
-                latestCreateTime = recent.maxOf { it.timestampSeconds }
+                latestCreateTime = recent.maxOf { it.timestampSeconds },
+                hasMore = false
             )
         }
 
+        val probeLimit = safeLimit + 1
         if (checkpoint.lastShardName.isNotBlank()) {
             val startIdx = nonEmptyShards.indexOfFirst { it.shardFile.name == checkpoint.lastShardName }
             if (startIdx >= 0) {
@@ -286,11 +292,11 @@ class WeChatMessageRepository(
             }
             var advancedCursor: Triple<String, Long, Long>? = null
             for (shard in candidateShards) {
-                if (collected.size >= safeLimit) break
+                if (collected.size >= probeLimit) break
                 var cursorCreateTime = checkpoint.lastCreateTime
                 var cursorLocalId = 0L
-                while (collected.size < safeLimit) {
-                    val remaining = safeLimit - collected.size
+                while (collected.size < probeLimit) {
+                    val remaining = probeLimit - collected.size
                     val batch = readSinceCreateTimeFromShard(shard, tableName, cursorCreateTime, cursorLocalId, contactsMap, remaining, roomOwnerUsername)
                     if (batch.isEmpty()) break
                     val added = appendDeduplicatedShardMessages(shard.shardFile.name, batch, collected, seenFingerprints)
@@ -306,22 +312,26 @@ class WeChatMessageRepository(
             if (collected.isEmpty()) {
                 val cursor = advancedCursor
                 return if (cursor != null) {
-                    IncrementalReadResult(emptyList(), cursor.first, cursor.second, cursor.third)
+                    IncrementalReadResult(emptyList(), cursor.first, cursor.second, cursor.third, hasMore = false)
                 } else {
                     IncrementalReadResult(
                         messages = emptyList(),
                         latestShardName = checkpoint.lastShardName,
                         latestLocalId = checkpoint.lastLocalId,
-                        latestCreateTime = checkpoint.lastCreateTime
+                        latestCreateTime = checkpoint.lastCreateTime,
+                        hasMore = false
                     )
                 }
             }
-            val last = collected.last()
+            val hasMore = collected.size > safeLimit
+            val sliced = if (hasMore) collected.take(safeLimit) else collected
+            val last = sliced.last()
             return IncrementalReadResult(
-                messages = collected.map { it.message },
+                messages = sliced.map { it.message },
                 latestShardName = last.shardName,
                 latestLocalId = last.message.localId,
-                latestCreateTime = last.message.timestampSeconds
+                latestCreateTime = last.message.timestampSeconds,
+                hasMore = hasMore
             )
         }
 
@@ -330,14 +340,16 @@ class WeChatMessageRepository(
         if (nonEmptyShards.size == 1) {
             val single = nonEmptyShards.single()
             if (single.bounds.maxLocalId >= checkpoint.lastLocalId) {
-                val msgs = readSinceLocalIdFromShard(single, tableName, checkpoint.lastLocalId, contactsMap, safeLimit, roomOwnerUsername)
-                if (msgs.isEmpty()) {
-                    return IncrementalReadResult(emptyList(), single.shardFile.name, checkpoint.lastLocalId, checkpoint.lastSyncTimestamp)
+                val probed = readSinceLocalIdFromShard(single, tableName, checkpoint.lastLocalId, contactsMap, probeLimit, roomOwnerUsername)
+                if (probed.isEmpty()) {
+                    return IncrementalReadResult(emptyList(), single.shardFile.name, checkpoint.lastLocalId, checkpoint.lastSyncTimestamp, hasMore = false)
                 }
-                val last = msgs.last()
-                return IncrementalReadResult(msgs, single.shardFile.name, last.localId, last.timestampSeconds)
+                val hasMore = probed.size > safeLimit
+                val sliced = if (hasMore) probed.take(safeLimit) else probed
+                val last = sliced.last()
+                return IncrementalReadResult(sliced, single.shardFile.name, last.localId, last.timestampSeconds, hasMore = hasMore)
             }
-            return IncrementalReadResult(emptyList(), single.shardFile.name, checkpoint.lastLocalId, checkpoint.lastSyncTimestamp)
+            return IncrementalReadResult(emptyList(), single.shardFile.name, checkpoint.lastLocalId, checkpoint.lastSyncTimestamp, hasMore = false)
         }
 
         val syncTs = checkpoint.lastSyncTimestamp
@@ -370,7 +382,7 @@ class WeChatMessageRepository(
             )
         }
 
-        return IncrementalReadResult(emptyList(), newestShard.shardFile.name, checkpoint.lastLocalId, syncTs)
+        return IncrementalReadResult(emptyList(), newestShard.shardFile.name, checkpoint.lastLocalId, syncTs, hasMore = false)
     }
 
     private fun readAcrossShardsFromIndex(
@@ -383,12 +395,14 @@ class WeChatMessageRepository(
         fallbackCheckpoint: SyncCheckpoint,
         roomOwnerUsername: String = ""
     ): IncrementalReadResult {
+        val safeLimit = limit.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
+        val probeLimit = safeLimit + 1
         val collected = mutableListOf<ShardMessage>()
         val seenFingerprints = HashSet<CrossShardFingerprint>()
         var exhaustedCursor: Triple<String, Long, Long>? = null
 
         val startShard = orderedShards[startIdx]
-        val tailMessages = readSinceLocalIdFromShard(startShard, tableName, sinceLocalIdOnStart, contactsMap, limit, roomOwnerUsername)
+        val tailMessages = readSinceLocalIdFromShard(startShard, tableName, sinceLocalIdOnStart, contactsMap, probeLimit, roomOwnerUsername)
         appendDeduplicatedShardMessages(startShard.shardFile.name, tailMessages, collected, seenFingerprints)
         if (tailMessages.isNotEmpty()) {
             val tailLast = tailMessages.last()
@@ -396,11 +410,11 @@ class WeChatMessageRepository(
         }
 
         var idx = startIdx + 1
-        while (collected.size < limit && idx < orderedShards.size) {
+        while (collected.size < probeLimit && idx < orderedShards.size) {
             val nextShard = orderedShards[idx]
             var shardCursorLocalId = 0L
-            while (collected.size < limit) {
-                val remaining = limit - collected.size
+            while (collected.size < probeLimit) {
+                val remaining = probeLimit - collected.size
                 val batch = readSinceLocalIdFromShard(nextShard, tableName, shardCursorLocalId, contactsMap, remaining, roomOwnerUsername)
                 if (batch.isEmpty()) break
                 appendDeduplicatedShardMessages(nextShard.shardFile.name, batch, collected, seenFingerprints)
@@ -417,23 +431,27 @@ class WeChatMessageRepository(
         if (collected.isEmpty()) {
             val cursor = exhaustedCursor
             return if (cursor != null) {
-                IncrementalReadResult(emptyList(), cursor.first, cursor.second, cursor.third)
+                IncrementalReadResult(emptyList(), cursor.first, cursor.second, cursor.third, hasMore = false)
             } else {
                 IncrementalReadResult(
                     messages = emptyList(),
                     latestShardName = fallbackCheckpoint.lastShardName,
                     latestLocalId = fallbackCheckpoint.lastLocalId,
-                    latestCreateTime = fallbackCheckpoint.lastCreateTime
+                    latestCreateTime = fallbackCheckpoint.lastCreateTime,
+                    hasMore = false
                 )
             }
         }
 
-        val last = collected.last()
+        val hasMore = collected.size > limit
+        val sliced = if (hasMore) collected.take(limit) else collected
+        val last = sliced.last()
         return IncrementalReadResult(
-            messages = collected.map { it.message },
+            messages = sliced.map { it.message },
             latestShardName = last.shardName,
             latestLocalId = last.message.localId,
-            latestCreateTime = last.message.timestampSeconds
+            latestCreateTime = last.message.timestampSeconds,
+            hasMore = hasMore
         )
     }
 
@@ -526,6 +544,8 @@ class WeChatMessageRepository(
         bindParams: List<Long> = emptyList(),
         roomOwnerUsername: String = ""
     ): List<WeChatMessage> {
+        require(MSG_TABLE_REGEX.matches(tableName)) { "Invalid room message table name" }
+        val safeSqlLimit = limit.coerceIn(1, MAX_MESSAGES_PER_SYNC + 1)
         val messages = mutableListOf<WeChatMessage>()
         driver.openReadOnlyConnection(shard.shardFile, sessionContext).use { conn ->
             val hasLocalType = hasColumn(conn, tableName, "local_type")
@@ -538,7 +558,7 @@ class WeChatMessageRepository(
                 for (param in bindParams) {
                     stmt.setLong(paramIdx++, param)
                 }
-                stmt.setInt(paramIdx, limit)
+                stmt.setInt(paramIdx, safeSqlLimit)
                 stmt.executeQuery().use { rs ->
                     while (rs.next()) {
                         messages.add(parseMessageRow(rs, contactsMap, shard.name2IdMap, hasLocalType, roomOwnerUsername))
@@ -924,6 +944,7 @@ class WeChatMessageRepository(
     }
 
     private fun hasColumn(conn: java.sql.Connection, tableName: String, columnName: String): Boolean {
+        require(MSG_TABLE_REGEX.matches(tableName)) { "Invalid room message table name" }
         return conn.createStatement().use { stmt ->
             stmt.executeQuery("PRAGMA table_info($tableName)").use { rs ->
                 var found = false
@@ -1020,6 +1041,8 @@ class WeChatMessageRepository(
     }
 
     companion object {
+        const val MIN_MESSAGES_PER_SYNC = 1
+        const val MAX_MESSAGES_PER_SYNC = 500
         private const val MAX_CONTEXT_WINDOW_COUNT = 200
         private const val ANCHOR_LOCAL_ID_MAX_DRIFT_SECONDS = 300L
 

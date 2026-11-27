@@ -30,7 +30,8 @@ class SyncSchedulerTest {
                 SyncResult.Success(newEventsCount = 2, totalScannedMessages = 10)
             },
             notificationDispatcher = mockDispatcher,
-            scope = backgroundScope
+            scope = backgroundScope,
+            ioDispatcher = coroutineContext[kotlin.coroutines.ContinuationInterceptor] as kotlinx.coroutines.CoroutineDispatcher
         )
 
         assertFalse(scheduler.isRunning)
@@ -95,6 +96,55 @@ class SyncSchedulerTest {
         assertTrue(called)
         assertTrue(result is SyncResult.Success)
         assertEquals(1, (result as SyncResult.Success).newEventsCount)
+    }
+
+    @Test
+    fun `scheduler filters notifications according to priority threshold`() = runTest {
+        var sentCount = 0
+        val dispatcher = NotificationDispatcher(commandRunner = { sentCount++ })
+        val normalCard = com.wechatdigest.core.model.EventCard(
+            id = "n-1",
+            title = "Routine Update",
+            summary = "Routine",
+            translatedSummary = "Routine",
+            category = com.wechatdigest.core.model.EventCategory.NOTICE,
+            priority = com.wechatdigest.core.model.EventPriority.NORMAL,
+            originalSender = "Admin",
+            sourceRoomId = "r@chatroom",
+            timestampSeconds = 100L
+        )
+        val criticalCard = normalCard.copy(
+            id = "c-1",
+            priority = com.wechatdigest.core.model.EventPriority.CRITICAL
+        )
+
+        var currentThreshold = NotificationPriorityThreshold.CRITICAL_ONLY
+        var cardsToReturn = listOf(normalCard)
+        val scheduler = SyncScheduler(
+            syncAction = {
+                SyncResult.Success(
+                    newEventsCount = cardsToReturn.size,
+                    totalScannedMessages = 10,
+                    insertedCards = cardsToReturn
+                )
+            },
+            notificationDispatcher = dispatcher,
+            scope = backgroundScope,
+            thresholdProvider = { currentThreshold },
+            ioDispatcher = coroutineContext[kotlin.coroutines.ContinuationInterceptor] as kotlinx.coroutines.CoroutineDispatcher
+        )
+
+        scheduler.triggerOnceNow(notifyOnNewEvents = true)
+        assertEquals(0, sentCount)
+
+        cardsToReturn = listOf(normalCard, criticalCard)
+        scheduler.triggerOnceNow(notifyOnNewEvents = true)
+        assertEquals(1, sentCount)
+
+        currentThreshold = NotificationPriorityThreshold.ALL
+        cardsToReturn = listOf(normalCard)
+        scheduler.triggerOnceNow(notifyOnNewEvents = true)
+        assertEquals(2, sentCount)
     }
 }
 

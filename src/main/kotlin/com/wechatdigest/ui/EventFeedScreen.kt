@@ -18,14 +18,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.platform.LocalDensity
@@ -37,16 +41,16 @@ import com.wechatdigest.app.AppState
 import com.wechatdigest.app.EventSortOrder
 import com.wechatdigest.core.attachment.WeChatFileMessageParser
 import com.wechatdigest.core.llm.EventExtractor
+import com.wechatdigest.core.llm.LlmProviderType
+import com.wechatdigest.core.model.DeadlineTriage
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCardStatus
 import com.wechatdigest.core.model.EventCategory
 import com.wechatdigest.core.model.EventPriority
 import com.wechatdigest.core.model.GroupChat
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import java.awt.Cursor
-import java.time.LocalDate
-import java.time.LocalDateTime
-import java.time.OffsetDateTime
-import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -86,26 +90,30 @@ internal fun formatEventDateLabel(rawDate: String): String {
     val trimmed = rawDate.trim()
     if (trimmed.isEmpty()) return ""
 
-    runCatching { LocalDate.parse(trimmed) }.getOrNull()?.let { date ->
-        return eventDateOnlyDisplayFormatter.format(date)
-    }
-
-    val normalized = trimmed.replace(' ', 'T')
-    val localDateTime = runCatching {
-        when {
-            normalized.length == 16 -> LocalDateTime.parse("$normalized:00")
-            normalized.contains('.') -> LocalDateTime.parse(normalized.substringBefore('.'))
-            else -> LocalDateTime.parse(normalized)
+    DeadlineTriage.parseTemporal(trimmed)?.let { parsed ->
+        val hasExactFallbackGarbage = !DeadlineTriage.isValidIsoTemporal(trimmed)
+        if (!hasExactFallbackGarbage) {
+            return if (!parsed.hasTime || parsed.localDateTime == null) {
+                eventDateOnlyDisplayFormatter.format(parsed.localDate)
+            } else {
+                eventDateTimeDisplayFormatter.format(parsed.localDateTime)
+            }
         }
-    }.getOrNull() ?: runCatching {
-        OffsetDateTime.parse(normalized).atZoneSameInstant(ZoneId.systemDefault()).toLocalDateTime()
-    }.getOrNull()
-
-    if (localDateTime != null) {
-        return eventDateTimeDisplayFormatter.format(localDateTime)
     }
 
     return trimmed.replace(inlineIsoDateTimeSeparatorRegex, "$1 $2")
+}
+
+/** Emits the current epoch minute periodically so deadline/sync labels stay accurate across midnight. */
+@Composable
+internal fun rememberMinuteTick(): Long {
+    val state by produceState(initialValue = System.currentTimeMillis() / 60_000L) {
+        while (isActive) {
+            delay(60_000L)
+            value = System.currentTimeMillis() / 60_000L
+        }
+    }
+    return state
 }
 
 internal fun resolveRoomDisplayName(roomNamesMap: Map<String, String>, card: EventCard): String =
@@ -208,10 +216,33 @@ internal fun isLongSourceMessage(
 }
 
 /**
+ * Steps event selection forward or backward within [visibleIds] for Up/Down keyboard navigation.
+ */
+internal fun navigateEventSelection(
+    visibleIds: List<String>,
+    currentSelectedId: String?,
+    step: Int
+): String? {
+    if (visibleIds.isEmpty() || step == 0) return null
+    val currentIndex = visibleIds.indexOf(currentSelectedId)
+    val nextIndex = if (currentIndex < 0) {
+        if (step > 0) 0 else visibleIds.lastIndex
+    } else {
+        (currentIndex + step).coerceIn(0, visibleIds.lastIndex)
+    }
+    return visibleIds[nextIndex]
+}
+
+/**
  * Top-level responsive master-detail feed screen adapting between split view and single-pane navigation.
  */
 @Composable
-fun EventFeedScreen(appState: AppState) {
+fun EventFeedScreen(
+    appState: AppState,
+    searchFocusRequester: FocusRequester = remember { FocusRequester() },
+    onModalOpenChange: (Boolean) -> Unit = {},
+    onSearchBarAttachedChange: (Boolean) -> Unit = {}
+) {
     val visibleEvents by appState.visibleEvents.collectAsState()
     val allEvents by appState.events.collectAsState()
     val availableRooms by appState.availableRooms.collectAsState()
@@ -219,7 +250,15 @@ fun EventFeedScreen(appState: AppState) {
     val selectedEventId by appState.selectedEventId.collectAsState()
     val isSyncing by appState.isSyncing.collectAsState()
     var cardPendingDelete by remember { mutableStateOf<EventCard?>(null) }
+    var isDetailModalOpen by remember { mutableStateOf(false) }
     var splitFraction by remember { mutableStateOf(0.44f) }
+
+    LaunchedEffect(cardPendingDelete, isDetailModalOpen) {
+        onModalOpenChange(cardPendingDelete != null || isDetailModalOpen)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onModalOpenChange(false) }
+    }
 
     val roomNamesMap = remember(availableRooms) { availableRooms.associate { it.roomId to it.displayName } }
     val groupOptions = remember(allEvents, availableRooms, settings.monitoredRoomIds) {
@@ -243,6 +282,9 @@ fun EventFeedScreen(appState: AppState) {
                     groupOptions = groupOptions,
                     selectedEventId = selectedCard?.id,
                     isSyncing = isSyncing,
+                    isLocalProvider = settings.llm.providerType == LlmProviderType.BUILT_IN_LOCAL,
+                    searchFocusRequester = searchFocusRequester,
+                    onSearchBarAttachedChange = onSearchBarAttachedChange,
                     contentEndPadding = 12.dp,
                     modifier = Modifier.width(totalWidth * splitFraction).fillMaxHeight()
                 )
@@ -259,7 +301,8 @@ fun EventFeedScreen(appState: AppState) {
                             roomNamesMap = roomNamesMap,
                             contentStartPadding = 12.dp,
                             onNavigateBack = null,
-                            onRequestDelete = { cardPendingDelete = selectedCard }
+                            onRequestDelete = { cardPendingDelete = selectedCard },
+                            onModalOpenChange = { isDetailModalOpen = it }
                         )
                     }
                 }
@@ -273,6 +316,9 @@ fun EventFeedScreen(appState: AppState) {
                 groupOptions = groupOptions,
                 selectedEventId = null,
                 isSyncing = isSyncing,
+                isLocalProvider = settings.llm.providerType == LlmProviderType.BUILT_IN_LOCAL,
+                searchFocusRequester = searchFocusRequester,
+                onSearchBarAttachedChange = onSearchBarAttachedChange,
                 contentEndPadding = 16.dp,
                 modifier = Modifier.fillMaxSize()
             )
@@ -285,7 +331,8 @@ fun EventFeedScreen(appState: AppState) {
                 roomNamesMap = roomNamesMap,
                 contentStartPadding = 16.dp,
                 onNavigateBack = { appState.selectEvent(null) },
-                onRequestDelete = { cardPendingDelete = selectedCard }
+                onRequestDelete = { cardPendingDelete = selectedCard },
+                onModalOpenChange = { isDetailModalOpen = it }
             )
         }
 
@@ -325,13 +372,22 @@ private fun EventListHost(
     groupOptions: List<GroupFilterOption>,
     selectedEventId: String?,
     isSyncing: Boolean,
+    isLocalProvider: Boolean,
+    searchFocusRequester: FocusRequester,
+    onSearchBarAttachedChange: (Boolean) -> Unit,
     contentEndPadding: Dp,
     modifier: Modifier
 ) {
+    DisposableEffect(Unit) {
+        onSearchBarAttachedChange(true)
+        onDispose { onSearchBarAttachedChange(false) }
+    }
     val selectedFilter by appState.priorityFilter.collectAsState()
+    val selectedCategory by appState.categoryFilter.collectAsState()
     val selectedGroupId by appState.groupFilter.collectAsState()
     val starredOnly by appState.starredOnlyFilter.collectAsState()
     val unreadOnly by appState.unreadOnlyFilter.collectAsState()
+    val hideCompleted by appState.hideCompletedFilter.collectAsState()
     val sortOrder by appState.sortOrder.collectAsState()
     val searchQuery by appState.searchQuery.collectAsState()
     val selectedGroupName = remember(selectedGroupId, groupOptions) {
@@ -345,12 +401,17 @@ private fun EventListHost(
         roomNamesMap = roomNamesMap,
         searchQuery = searchQuery,
         onSearchQueryChange = { appState.searchQuery.value = it },
+        searchFocusRequester = searchFocusRequester,
         starredOnly = starredOnly,
         onToggleStarredOnly = { appState.starredOnlyFilter.value = !starredOnly },
         unreadOnly = unreadOnly,
         onToggleUnreadOnly = { appState.unreadOnlyFilter.value = !unreadOnly },
+        hideCompleted = hideCompleted,
+        onToggleHideCompleted = { appState.hideCompletedFilter.value = !hideCompleted },
         selectedFilter = selectedFilter,
         onSelectPriority = { appState.priorityFilter.value = it },
+        selectedCategory = selectedCategory,
+        onSelectCategory = { appState.categoryFilter.value = it },
         selectedGroupId = selectedGroupId,
         selectedGroupName = selectedGroupName,
         groupOptions = groupOptions,
@@ -360,10 +421,15 @@ private fun EventListHost(
         selectedEventId = selectedEventId,
         onSelectEvent = { appState.selectEvent(it) },
         onToggleStarEvent = { appState.toggleStarred(it) },
+        onToggleCompletedEvent = { appState.toggleCompleted(it) },
         isSyncing = isSyncing,
+        isLocalProvider = isLocalProvider,
         syncStatusTextFlow = appState.syncStatusText,
+        localRuntimeStateFlow = appState.localRuntimeState,
+        localServerStateFlow = appState.localServerState,
         contentEndPadding = contentEndPadding,
-        onTriggerSync = { if (!isSyncing) appState.triggerSync() }
+        onTriggerSync = { if (!isSyncing) appState.triggerSync() },
+        onCancelSync = { appState.cancelSync() }
     )
 }
 
@@ -376,7 +442,8 @@ private fun EventDetailHost(
     roomNamesMap: Map<String, String>,
     contentStartPadding: Dp,
     onNavigateBack: (() -> Unit)?,
-    onRequestDelete: () -> Unit
+    onRequestDelete: () -> Unit,
+    onModalOpenChange: (Boolean) -> Unit
 ) {
     val translatingCardIds by appState.translatingCardIds.collectAsState()
     val recheckingCardIds by appState.recheckingAttachmentCardIds.collectAsState()
@@ -412,8 +479,13 @@ private fun EventDetailHost(
         onRecheckAttachments = { appState.recheckCardAttachments(selectedCard.id) },
         onToggleStar = { appState.toggleStarred(selectedCard.id) },
         onToggleRead = { if (selectedCard.isRead) appState.markUnread(selectedCard.id) else appState.markRead(selectedCard.id) },
+        onToggleCompleted = { appState.toggleCompleted(selectedCard.id) },
+        onToggleCheckedItem = { key -> appState.toggleCheckedItem(selectedCard.id, key) },
         onAddToCalendar = { appState.exportToCalendar(selectedCard) },
+        onAddToReminders = { appState.exportToReminders(selectedCard) },
+        onOpenLinkFailed = { msg -> appState.showMessage(msg) },
         onRequestDelete = onRequestDelete,
+        onModalOpenChange = onModalOpenChange,
         contentStartPadding = contentStartPadding,
         onNavigateBack = onNavigateBack
     )

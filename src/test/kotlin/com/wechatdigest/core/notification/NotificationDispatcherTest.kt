@@ -71,5 +71,17 @@ class NotificationDispatcherTest {
         val script = dispatcher.buildAppleScript("Title", "Body", "Subtitle")
         assertTrue(script.isNotBlank())
     }
+
+    @Test
+    fun `buildAppleScript strips NUL and control characters, normalizes bare CR, and respects bounds`() {
+        val dispatcher = NotificationDispatcher()
+        val rawBody = "Line1\rLine2\u0000\u0007!" + "A".repeat(600)
+        val script = dispatcher.buildAppleScript("T\u0000itle", rawBody, "Sub\rtitle")
+        assertFalse(script.contains('\u0000'))
+        assertFalse(script.contains('\u0007'))
+        assertFalse(script.contains('\r'))
+        assertTrue(script.contains("Line1 Line2!"))
+        assertTrue(script.length < 700)
+    }
 }
 

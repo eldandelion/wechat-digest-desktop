@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.SettingsBrightness
@@ -64,6 +65,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppSettings
 import com.wechatdigest.app.AppThemeMode
+import com.wechatdigest.app.NotificationPriorityThreshold
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.LocalOllamaModel
@@ -160,6 +162,9 @@ internal fun WeChatStorageSettingsCard(
     autoDetectFeedback: String?,
     onAutoDetect: () -> Unit,
     onLaunchWizard: () -> Unit,
+    onBrowseDataDir: () -> Unit,
+    onBrowseKeysPath: () -> Unit,
+    onBrowseAttachmentRootDir: () -> Unit,
     onDataDirChange: (String) -> Unit,
     onKeysPathChange: (String) -> Unit,
     onAttachmentRootDirChange: (String) -> Unit,
@@ -181,6 +186,11 @@ internal fun WeChatStorageSettingsCard(
             modifier = Modifier.fillMaxWidth(),
             label = { Text("WeChat Data Directory (db_storage or decrypted folder)") },
             placeholder = { Text("~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files") },
+            trailingIcon = {
+                IconButton(onClick = onBrowseDataDir) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = "Browse WeChat data directory")
+                }
+            },
             singleLine = true
         )
         OutlinedTextField(
@@ -189,6 +199,11 @@ internal fun WeChatStorageSettingsCard(
             modifier = Modifier.fillMaxWidth(),
             label = { Text("all_keys.json Path (Optional - auto-detected if left blank)") },
             placeholder = { Text("~/.wcdb-key-tool/all_keys.json") },
+            trailingIcon = {
+                IconButton(onClick = onBrowseKeysPath) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = "Browse all_keys.json")
+                }
+            },
             singleLine = true
         )
         OutlinedTextField(
@@ -197,13 +212,19 @@ internal fun WeChatStorageSettingsCard(
             modifier = Modifier.fillMaxWidth(),
             label = { Text("WeChat Attachment Root (Optional - for standalone decrypted DB mirrors)") },
             placeholder = { Text("~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_.../msg/file") },
+            trailingIcon = {
+                IconButton(onClick = onBrowseAttachmentRootDir) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = "Browse attachment root directory")
+                }
+            },
             singleLine = true
         )
         OutlinedTextField(
             value = messagesPerSync,
-            onValueChange = { if (it.all(Char::isDigit)) onMessagesPerSyncChange(it) },
+            onValueChange = { if (it.length <= 3 && it.all(Char::isDigit)) onMessagesPerSyncChange(it) },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Messages per group to scan on Sync") },
+            label = { Text("Messages per group to scan on Sync (1–500)") },
+            supportingText = { Text("Allowed range: 1 to 500 messages per room per sync batch.") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true
         )
@@ -216,14 +237,20 @@ internal fun WeChatStorageSettingsCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun BackgroundSyncSettingsCard(
     autoSyncEnabled: Boolean,
     syncIntervalMinutes: Int,
     notifyOnNewEvents: Boolean,
+    notificationThreshold: NotificationPriorityThreshold,
+    notifyOnManualSync: Boolean,
     onAutoSyncChange: (Boolean) -> Unit,
     onSelectInterval: (Int) -> Unit,
-    onNotifyChange: (Boolean) -> Unit
+    onNotifyChange: (Boolean) -> Unit,
+    onSelectNotificationThreshold: (NotificationPriorityThreshold) -> Unit,
+    onNotifyOnManualSyncChange: (Boolean) -> Unit,
+    onTestNotification: () -> Unit
 ) {
     SettingsSectionCard {
         Text(text = "Background Sync & macOS Notifications", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
@@ -247,6 +274,30 @@ internal fun BackgroundSyncSettingsCard(
             checked = notifyOnNewEvents,
             onCheckedChange = onNotifyChange
         )
+        if (notifyOnNewEvents || notifyOnManualSync) {
+            Text("Notify For Priorities", style = MaterialTheme.typography.labelMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                NotificationPriorityThreshold.entries.forEach { threshold ->
+                    FilterChip(
+                        selected = notificationThreshold == threshold,
+                        onClick = { onSelectNotificationThreshold(threshold) },
+                        label = { Text(threshold.displayName) }
+                    )
+                }
+            }
+        }
+        SettingsSwitchRow(
+            title = "Notify on Manual Sync",
+            subtitle = "Also show a system notification when a manual 'Sync now' finishes with matching events",
+            checked = notifyOnManualSync,
+            onCheckedChange = onNotifyOnManualSyncChange
+        )
+        OutlinedButton(onClick = onTestNotification) {
+            Text("Send Test Notification")
+        }
     }
 }
 
@@ -260,6 +311,8 @@ internal fun LlmEngineSettingsCard(
     detectedOllamaModels: List<LocalOllamaModel>,
     isDetectingOllama: Boolean,
     ollamaStatusMessage: String?,
+    isTestingConnection: Boolean,
+    connectionStatusMessage: String?,
     hardwareInfo: SystemHardwareInfo,
     localCatalogModels: List<LocalModelSpec>,
     downloadedLocalModelIds: Set<String>,
@@ -273,6 +326,7 @@ internal fun LlmEngineSettingsCard(
     onSelectOpenAi: () -> Unit,
     onSelectOllama: () -> Unit,
     onDetectOllama: () -> Unit,
+    onTestConnection: () -> Unit,
     onEndpointChange: (String) -> Unit,
     onApiKeyChange: (String) -> Unit,
     onModelNameChange: (String) -> Unit,
@@ -386,6 +440,47 @@ internal fun LlmEngineSettingsCard(
                 onDismissDropdown = { isModelDropdownOpen = false },
                 onValueChange = onModelNameChange,
                 onSelectModel = { name -> isModelDropdownOpen = false; onSelectOllamaModel(name) }
+            )
+        }
+        LlmConnectionTestRow(
+            isTesting = isTestingConnection,
+            statusMessage = connectionStatusMessage,
+            onTestConnection = onTestConnection
+        )
+    }
+}
+
+@Composable
+internal fun LlmConnectionTestRow(
+    isTesting: Boolean,
+    statusMessage: String?,
+    onTestConnection: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        OutlinedButton(onClick = onTestConnection, enabled = !isTesting) {
+            if (isTesting) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Testing Connection...")
+            } else {
+                Text("Test Connection")
+            }
+        }
+        statusMessage?.let { status ->
+            val statusColor = when {
+                status.startsWith("Connected") -> MaterialTheme.colorScheme.primary
+                status.startsWith("Testing") -> MaterialTheme.colorScheme.secondary
+                else -> MaterialTheme.colorScheme.error
+            }
+            Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = statusColor,
+                modifier = Modifier.weight(1f)
             )
         }
     }

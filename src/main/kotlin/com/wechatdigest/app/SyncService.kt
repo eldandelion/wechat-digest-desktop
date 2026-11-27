@@ -27,16 +27,21 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Result of executing an end-to-end monitored chatroom sync pass. */
 sealed class SyncResult {
-    /** Sync completed across monitored rooms, with optional per-room error summaries. */
+    /** Sync completed across monitored rooms, with optional per-room error summaries and inserted cards. */
     data class Success(
         val newEventsCount: Int,
         val totalScannedMessages: Int,
-        val roomErrors: List<String> = emptyList()
+        val roomErrors: List<String> = emptyList(),
+        val insertedCards: List<EventCard> = emptyList()
     ) : SyncResult()
+
+    /** Sync was cancelled cleanly mid-flight before finishing all rooms. */
+    data object Cancelled : SyncResult()
 
     /** Sync could not run or all rooms failed before scanning any messages. */
     data class Failure(val message: String) : SyncResult()
@@ -64,8 +69,6 @@ class SyncService(
 ) {
 
     private companion object {
-        const val MIN_MESSAGES_PER_SYNC = 1
-        const val MAX_MESSAGES_PER_SYNC = 500
         const val MAX_ROOM_LABEL_CHARS = 48
         const val MAX_SYNC_FAILURE_MSG_CHARS = 320
     }
@@ -88,11 +91,17 @@ class SyncService(
     ): SyncResult = withContext(Dispatchers.IO) {
         validateSettings(settings)?.let { return@withContext SyncResult.Failure(it) }
 
-        val dataDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.wechatDataDir)?.canonicalFile
+        val rawDataDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.wechatDataDir)
             ?: return@withContext SyncResult.Failure("WeChat data directory is not configured.")
-        val keysFile = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.keysPath)
-            ?.canonicalFile
-            ?.takeIf { it.isFile }
+        if (Files.isSymbolicLink(rawDataDir.toPath())) {
+            return@withContext SyncResult.Failure("Refusing to follow symbolic link for WeChat data directory.")
+        }
+        val dataDir = rawDataDir.canonicalFile
+        val rawKeysFile = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(settings.keysPath)
+        if (rawKeysFile != null && Files.isSymbolicLink(rawKeysFile.toPath())) {
+            return@withContext SyncResult.Failure("Refusing to follow symbolic link for keys file.")
+        }
+        val keysFile = rawKeysFile?.canonicalFile?.takeIf { it.isFile }
         val driver = WeChatDatabaseDriver(
             baseDir = dataDir,
             customKeysFile = keysFile,
@@ -101,6 +110,7 @@ class SyncService(
 
         var totalScanned = 0
         val totalInsertedCounter = AtomicInteger(0)
+        val persistedCards = java.util.Collections.synchronizedList(mutableListOf<EventCard>())
         val totalRooms = settings.monitoredRoomIds.size
         val callbackMutex = Mutex()
         val errors = mutableListOf<String>()
@@ -154,7 +164,10 @@ class SyncService(
                         activeFingerprints = activeFingerprints,
                         totalInsertedCounter = totalInsertedCounter,
                         callbackMutex = callbackMutex,
-                        onCardPersisted = onCardPersisted,
+                        onCardPersisted = { card ->
+                            persistedCards.add(card)
+                            onCardPersisted?.invoke(card)
+                        },
                         onProgress = onProgress
                     )
                     totalScanned += roomOutcome.scannedCount
@@ -169,7 +182,8 @@ class SyncService(
             SyncResult.Success(
                 newEventsCount = totalInsertedCounter.get(),
                 totalScannedMessages = totalScanned,
-                roomErrors = errors.toList()
+                roomErrors = errors.toList(),
+                insertedCards = synchronized(persistedCards) { persistedCards.toList() }
             )
         }
     }
@@ -219,7 +233,10 @@ class SyncService(
                 onProgress,
                 SyncProgress(roomIndex, totalRooms, roomLabel, "Scanning messages...", totalInsertedCounter.get())
             )
-            val batchLimit = settings.messagesPerSync.coerceIn(MIN_MESSAGES_PER_SYNC, MAX_MESSAGES_PER_SYNC)
+            val batchLimit = settings.messagesPerSync.coerceIn(
+                WeChatMessageRepository.MIN_MESSAGES_PER_SYNC,
+                WeChatMessageRepository.MAX_MESSAGES_PER_SYNC
+            )
             val checkpoint = syncCheckpointStore?.getOrThrow(roomId)
             val readResult = messageRepo.getMessagesSinceCheckpoint(
                 roomId = roomId,
@@ -260,7 +277,8 @@ class SyncService(
                 roomId = roomId,
                 maxLocalId = readResult.latestLocalId,
                 lastShardName = readResult.latestShardName,
-                lastCreateTime = readResult.latestCreateTime
+                lastCreateTime = readResult.latestCreateTime,
+                hasMore = readResult.hasMore
             )
             RoomSyncOutcome(scannedCount = scannedInRoom)
         } catch (e: Exception) {
@@ -445,7 +463,8 @@ class SyncService(
         roomId: String,
         maxLocalId: Long,
         lastShardName: String = "",
-        lastCreateTime: Long = 0L
+        lastCreateTime: Long = 0L,
+        hasMore: Boolean = false
     ) {
         val now = System.currentTimeMillis() / 1000
         syncCheckpointStore?.saveOrThrow(
@@ -455,7 +474,8 @@ class SyncService(
                 lastSyncTimestamp = now,
                 updatedAt = now,
                 lastShardName = lastShardName,
-                lastCreateTime = lastCreateTime
+                lastCreateTime = lastCreateTime,
+                hasMore = hasMore
             )
         )
     }

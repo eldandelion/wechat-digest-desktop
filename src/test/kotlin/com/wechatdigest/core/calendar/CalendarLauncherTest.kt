@@ -57,4 +57,37 @@ class CalendarLauncherTest {
         val result = launcher.exportAndLaunch(card)
         assertTrue(result.isFailure)
     }
+
+    @Test
+    fun `exportToReminders builds safely escaped AppleScript and handles runner failures`() {
+        var capturedScript = ""
+        val launcher = CalendarLauncher(
+            calendarDir = tempDir,
+            remindersRunner = { script -> capturedScript = script }
+        )
+        val card = EventCard(
+            id = "rem-1",
+            title = "Submit \"Thesis\" \\ Draft",
+            summary = "Upload PDF\nBefore 5pm",
+            translatedSummary = "Upload PDF\nBefore 5pm",
+            category = EventCategory.DEADLINE,
+            priority = EventPriority.CRITICAL,
+            eventDate = "2026-12-01",
+            originalSender = "Advisor",
+            sourceRoomId = "lab@chatroom",
+            timestampSeconds = 1731000000L
+        )
+
+        val ok = launcher.exportToReminders(card)
+        assertTrue(ok.isSuccess)
+        assertTrue(capturedScript.contains("""tell application "Reminders""""))
+        assertTrue(capturedScript.contains("""Submit \"Thesis\" \\ Draft"""))
+        assertTrue(capturedScript.contains("""Upload PDF\nBefore 5pm\nDue: 2026-12-01"""))
+
+        val failing = CalendarLauncher(
+            calendarDir = tempDir,
+            remindersRunner = { throw IllegalStateException("osascript exited 1") }
+        )
+        assertTrue(failing.exportToReminders(card).isFailure)
+    }
 }

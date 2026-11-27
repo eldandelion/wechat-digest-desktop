@@ -35,12 +35,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.core.llm.local.ImportedLocalModel
+import com.wechatdigest.core.llm.local.LocalModelCatalog
 import com.wechatdigest.core.llm.local.LocalModelDownloadState
 import com.wechatdigest.core.llm.local.LocalModelMirror
 import com.wechatdigest.core.llm.local.LocalModelSpec
@@ -50,12 +52,7 @@ import com.wechatdigest.core.llm.local.SystemHardwareInfo
 import com.wechatdigest.core.llm.local.formatModelBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.awt.FileDialog
-import java.awt.Frame
 import java.io.File
-import java.io.FilenameFilter
-import java.util.concurrent.atomic.AtomicBoolean
-import javax.swing.SwingUtilities
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -120,6 +117,9 @@ internal fun LocalModelSettingsSection(
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.SemiBold
             )
+            val recommendedSpecId = remember(hardwareInfo.totalRamGb) {
+                LocalModelCatalog.recommendedModelForRam(hardwareInfo.totalRamGb).id
+            }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 catalogModels.forEachIndexed { index, spec ->
                     key(spec.id) {
@@ -133,6 +133,7 @@ internal fun LocalModelSettingsSection(
                             shape = segmentedItemShape(index = index, totalCount = catalogModels.size),
                             isDownloaded = isDownloaded,
                             isSelected = isSelected,
+                            isRecommendedForHardware = spec.id == recommendedSpecId,
                             downloadState = downloadState,
                             lowRamWarning = lowRamWarning,
                             systemRamGb = hardwareInfo.totalRamGb,
@@ -275,6 +276,7 @@ private fun CatalogModelRow(
     shape: RoundedCornerShape,
     isDownloaded: Boolean,
     isSelected: Boolean,
+    isRecommendedForHardware: Boolean,
     downloadState: LocalModelDownloadState,
     lowRamWarning: Boolean,
     systemRamGb: Int,
@@ -324,9 +326,9 @@ private fun CatalogModelRow(
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Medium
                         )
-                        if (spec.isRecommended) {
+                        if (isRecommendedForHardware) {
                             ModelBadge(
-                                text = "Recommended",
+                                text = "Recommended for ${if (systemRamGb > 0) "${systemRamGb} GB" else "Mac"}",
                                 containerColor = MaterialTheme.colorScheme.secondaryContainer,
                                 contentColor = MaterialTheme.colorScheme.onSecondaryContainer
                             )
@@ -574,25 +576,10 @@ private fun ModelBadge(
     }
 }
 
-private val isGgufPickerOpen = AtomicBoolean(false)
-
 internal fun openGgufFilePicker(onFileSelected: (File) -> Unit) {
-    if (!isGgufPickerOpen.compareAndSet(false, true)) return
-    SwingUtilities.invokeLater {
-        val owner = Frame.getFrames().firstOrNull { it.isShowing && it.isActive }
-            ?: Frame.getFrames().firstOrNull { it.isShowing }
-        val dialog = FileDialog(owner, "Select Local GGUF Model", FileDialog.LOAD)
-        try {
-            dialog.filenameFilter = FilenameFilter { _, name -> name.lowercase().endsWith(".gguf") }
-            dialog.isVisible = true
-            val dir = dialog.directory
-            val file = dialog.file
-            if (!dir.isNullOrBlank() && !file.isNullOrBlank()) {
-                onFileSelected(File(dir, file))
-            }
-        } finally {
-            dialog.dispose()
-            isGgufPickerOpen.set(false)
-        }
-    }
+    DesktopPickers.openExtensionFilePicker(
+        title = "Select Local GGUF Model",
+        allowedExtension = ".gguf",
+        onSelected = onFileSelected
+    )
 }

@@ -824,4 +824,73 @@ class StorageTest {
         // Cancelled cards drop out of active fingerprint dedup set
         assertTrue(eventCardStore.listActiveFingerprints().isEmpty())
     }
+
+    @Test
+    fun `setCompleted and setCheckedItems persist and survive superseding updates`() {
+        val original = EventCard(
+            id = "chk-orig-1111",
+            title = "Visa Renewal",
+            summary = "Bring passport and I-20.",
+            translatedSummary = "Bring passport and I-20.",
+            category = EventCategory.DEADLINE,
+            priority = EventPriority.CRITICAL,
+            originalSender = "Intl Office",
+            originalSenderId = "wxid_intl",
+            sourceRoomId = "intl@chatroom",
+            sourceMessages = "[2026-11-20 10:00:00] Intl Office: Submit visa renewal documents by Friday.",
+            timestampSeconds = 1795000000L,
+            isCompleted = false,
+            checkedItems = listOf("0:0:123456")
+        )
+        eventCardStore.upsert(listOf(original))
+
+        eventCardStore.setCompleted("chk-orig-1111", true)
+        eventCardStore.setCheckedItems("chk-orig-1111", listOf("0:0:123456", "0:1:654321"))
+
+        val loaded = eventCardStore.listActive().single { it.id == "chk-orig-1111" }
+        assertTrue(loaded.isCompleted)
+        assertEquals(listOf("0:0:123456", "0:1:654321"), loaded.checkedItems)
+
+        // An authorized update superseding this card preserves checkedItems & isCompleted
+        val updateCard = original.copy(
+            id = "chk-upd-2222",
+            title = "Visa Renewal Extended",
+            summary = "Extended until next Tuesday.",
+            translatedSummary = "Extended until next Tuesday.",
+            timestampSeconds = 1795000500L,
+            status = com.wechatdigest.core.model.EventCardStatus.UPDATED,
+            supersedesCardId = "chk-orig",
+            isCompleted = false,
+            checkedItems = emptyList()
+        )
+        val outcome = eventCardStore.applyUpdateOrInsertOrThrow(listOf(updateCard))
+        assertEquals(listOf("chk-orig-1111"), outcome.supersededCardIds)
+        val active = eventCardStore.listActive().single { it.id == "chk-upd-2222" }
+        assertTrue(active.isCompleted)
+        assertEquals(listOf("0:0:123456", "0:1:654321"), active.checkedItems)
+
+        // Updating sections prunes orphaned checklist keys
+        eventCardStore.updateSectionsOrThrow(
+            "chk-upd-2222",
+            listOf(
+                com.wechatdigest.core.model.EventSection(
+                    heading = "Docs",
+                    items = listOf(
+                        com.wechatdigest.core.model.EventDetailItem(
+                            kind = com.wechatdigest.core.model.EventDetailKind.DOCUMENT,
+                            label = "Passport",
+                            value = "Valid 6 months"
+                        )
+                    )
+                )
+            )
+        )
+        assertTrue(eventCardStore.listActive().single { it.id == "chk-upd-2222" }.checkedItems.isEmpty())
+
+        // SettingsStore clamps out-of-range messagesPerSync on load
+        settingsStore.save(com.wechatdigest.app.AppSettings(messagesPerSync = 999))
+        assertEquals(500, settingsStore.load().messagesPerSync)
+        settingsStore.save(com.wechatdigest.app.AppSettings(messagesPerSync = -5))
+        assertEquals(1, settingsStore.load().messagesPerSync)
+    }
 }

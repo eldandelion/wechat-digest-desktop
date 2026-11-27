@@ -82,6 +82,8 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                         original_sender_id TEXT NOT NULL DEFAULT '',
                         content_fingerprint TEXT NOT NULL DEFAULT '',
                         source_local_ids TEXT NOT NULL DEFAULT '[]',
+                        is_completed INTEGER NOT NULL DEFAULT 0,
+                        checked_items TEXT NOT NULL DEFAULT '[]',
                         created_at INTEGER NOT NULL
                     );
                     """.trimIndent()
@@ -99,6 +101,8 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                 ensureColumnExists(stmt, "event_cards", "original_sender_id", "TEXT NOT NULL DEFAULT ''")
                 ensureColumnExists(stmt, "event_cards", "content_fingerprint", "TEXT NOT NULL DEFAULT ''")
                 ensureColumnExists(stmt, "event_cards", "source_local_ids", "TEXT NOT NULL DEFAULT '[]'")
+                ensureColumnExists(stmt, "event_cards", "is_completed", "INTEGER NOT NULL DEFAULT 0")
+                ensureColumnExists(stmt, "event_cards", "checked_items", "TEXT NOT NULL DEFAULT '[]'")
 
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_content_fingerprint ON event_cards(content_fingerprint)")
                 stmt.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_status_dismissed ON event_cards(status, is_dismissed)")
@@ -111,12 +115,14 @@ class AppDatabase(val dbFile: File = defaultDbFile()) {
                         last_sync_timestamp INTEGER NOT NULL DEFAULT 0,
                         updated_at INTEGER NOT NULL,
                         last_shard_name TEXT NOT NULL DEFAULT '',
-                        last_create_time INTEGER NOT NULL DEFAULT 0
+                        last_create_time INTEGER NOT NULL DEFAULT 0,
+                        has_more INTEGER NOT NULL DEFAULT 0
                     );
                     """.trimIndent()
                 )
                 ensureColumnExists(stmt, "sync_checkpoints", "last_shard_name", "TEXT NOT NULL DEFAULT ''")
                 ensureColumnExists(stmt, "sync_checkpoints", "last_create_time", "INTEGER NOT NULL DEFAULT 0")
+                ensureColumnExists(stmt, "sync_checkpoints", "has_more", "INTEGER NOT NULL DEFAULT 0")
             }
         }
     }

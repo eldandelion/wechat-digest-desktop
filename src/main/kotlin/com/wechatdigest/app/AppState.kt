@@ -10,6 +10,7 @@ import com.wechatdigest.core.detector.WeChatPathDetector
 import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.KtorLlmClient
 import com.wechatdigest.core.llm.LlmClient
+import com.wechatdigest.core.llm.LlmCompletionOptions
 import com.wechatdigest.core.llm.LlmConfig
 import com.wechatdigest.core.llm.LlmJsonUtils
 import com.wechatdigest.core.llm.LlmProviderType
@@ -31,6 +32,8 @@ import com.wechatdigest.core.llm.local.LocalRuntimeState
 import com.wechatdigest.core.llm.local.LocalServerState
 import com.wechatdigest.core.llm.local.ManagedLocalLlmClient
 import com.wechatdigest.core.llm.local.SystemHardwareInfo
+import com.wechatdigest.core.model.DeadlineTriage
+import com.wechatdigest.core.model.DetailChecklistKeys
 import com.wechatdigest.core.model.EventAttachment
 import com.wechatdigest.core.model.EventCard
 import com.wechatdigest.core.model.EventCategory
@@ -52,10 +55,12 @@ import com.wechatdigest.storage.GroupConfigStore
 import com.wechatdigest.storage.SettingsStore
 import com.wechatdigest.storage.SyncCheckpointStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -73,6 +78,7 @@ import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -91,14 +97,17 @@ enum class Screen {
 
 enum class EventSortOrder(val label: String) {
     NEWEST_FIRST("Newest to oldest"),
-    OLDEST_FIRST("Oldest to newest")
+    OLDEST_FIRST("Oldest to newest"),
+    DEADLINE_SOONEST("Deadline soonest")
 }
 
 private data class FeedFilterCriteria(
     val priority: EventPriority?,
+    val category: EventCategory?,
     val roomId: String?,
     val starredOnly: Boolean,
     val unreadOnly: Boolean,
+    val hideCompleted: Boolean,
     val sortOrder: EventSortOrder,
     val query: String
 )
@@ -133,9 +142,11 @@ class AppState(
     val events: StateFlow<List<EventCard>> = _events.asStateFlow()
 
     val priorityFilter = MutableStateFlow<EventPriority?>(null)
+    val categoryFilter = MutableStateFlow<EventCategory?>(null)
     val groupFilter = MutableStateFlow<String?>(null)
     val starredOnlyFilter = MutableStateFlow(false)
     val unreadOnlyFilter = MutableStateFlow(false)
+    val hideCompletedFilter = MutableStateFlow(false)
     val sortOrder = MutableStateFlow(EventSortOrder.NEWEST_FIRST)
     val searchQuery = MutableStateFlow("")
     val groupSearchQuery = MutableStateFlow("")
@@ -173,21 +184,38 @@ class AppState(
     private val _ollamaStatusMessage = MutableStateFlow<String?>(null)
     val ollamaStatusMessage: StateFlow<String?> = _ollamaStatusMessage.asStateFlow()
 
+    private val _isTestingLlmConnection = MutableStateFlow(false)
+    val isTestingLlmConnection: StateFlow<Boolean> = _isTestingLlmConnection.asStateFlow()
+
+    private val _llmConnectionStatusMessage = MutableStateFlow<String?>(null)
+    val llmConnectionStatusMessage: StateFlow<String?> = _llmConnectionStatusMessage.asStateFlow()
+
     private val _syncCheckpoints = MutableStateFlow<Map<String, SyncCheckpoint>>(emptyMap())
     val syncCheckpoints: StateFlow<Map<String, SyncCheckpoint>> = _syncCheckpoints.asStateFlow()
 
-    private val toggleFiltersFlow = combine(starredOnlyFilter, unreadOnlyFilter) { starredOnly, unreadOnly ->
-        starredOnly to unreadOnly
+    private val attributeFiltersFlow = combine(
+        priorityFilter,
+        categoryFilter,
+        groupFilter
+    ) { priority, category, roomId ->
+        Triple(priority, category, roomId)
+    }
+
+    private val toggleFiltersFlow = combine(
+        starredOnlyFilter,
+        unreadOnlyFilter,
+        hideCompletedFilter
+    ) { starredOnly, unreadOnly, hideCompleted ->
+        Triple(starredOnly, unreadOnly, hideCompleted)
     }
 
     private val filterCriteriaFlow = combine(
-        priorityFilter,
-        groupFilter,
+        attributeFiltersFlow,
         toggleFiltersFlow,
         sortOrder,
         searchQuery
-    ) { priority, roomId, (starredOnly, unreadOnly), order, query ->
-        FeedFilterCriteria(priority, roomId, starredOnly, unreadOnly, order, query)
+    ) { (priority, category, roomId), (starredOnly, unreadOnly, hideCompleted), order, query ->
+        FeedFilterCriteria(priority, category, roomId, starredOnly, unreadOnly, hideCompleted, order, query)
     }
 
     val visibleEvents: StateFlow<List<EventCard>> = combine(
@@ -196,15 +224,23 @@ class AppState(
     ) { allEvents, criteria ->
         val filtered = allEvents.filter { card ->
             val matchesPriority = criteria.priority == null || card.priority == criteria.priority
+            val matchesCategory = criteria.category == null || card.category == criteria.category
             val matchesGroup = criteria.roomId == null || card.sourceRoomId == criteria.roomId
             val matchesStarred = !criteria.starredOnly || card.isStarred
             val matchesUnread = !criteria.unreadOnly || !card.isRead
+            val matchesHideCompleted = !criteria.hideCompleted || !card.isCompleted
             val query = criteria.query
             val matchesQuery = if (query.isBlank()) true else {
                 card.title.contains(query, ignoreCase = true) ||
                 card.summary.contains(query, ignoreCase = true) ||
                 card.translatedSummary.contains(query, ignoreCase = true) ||
                 card.originalSender.contains(query, ignoreCase = true) ||
+                card.sourceRoomName.contains(query, ignoreCase = true) ||
+                card.category.name.contains(query, ignoreCase = true) ||
+                (card.eventDate?.contains(query, ignoreCase = true) == true) ||
+                card.sourceMessages.contains(query, ignoreCase = true) ||
+                card.translatedSourceMessages.contains(query, ignoreCase = true) ||
+                card.attachments.any { it.fileName.contains(query, ignoreCase = true) } ||
                 card.sections.any { section ->
                     section.heading.contains(query, ignoreCase = true) ||
                     section.content.contains(query, ignoreCase = true) ||
@@ -215,7 +251,8 @@ class AppState(
                     }
                 }
             }
-            matchesPriority && matchesGroup && matchesStarred && matchesUnread && matchesQuery
+            matchesPriority && matchesCategory && matchesGroup && matchesStarred &&
+                matchesUnread && matchesHideCompleted && matchesQuery
         }
         when (criteria.sortOrder) {
             EventSortOrder.NEWEST_FIRST -> filtered.sortedWith(
@@ -225,6 +262,11 @@ class AppState(
             EventSortOrder.OLDEST_FIRST -> filtered.sortedWith(
                 compareBy<EventCard> { it.timestampSeconds }
                     .thenBy { it.priority.ordinal }
+            )
+            EventSortOrder.DEADLINE_SOONEST -> filtered.sortedWith(
+                compareBy<EventCard> { DeadlineTriage.deadlineSortEpoch(it) }
+                    .thenBy { it.priority.ordinal }
+                    .thenByDescending { it.timestampSeconds }
             )
         }
     }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -268,14 +310,18 @@ class AppState(
     private val reextractJobs = ConcurrentHashMap<String, Job>()
 
     private val settingsMutex = Mutex()
+    private val settingsSideEffectsMutex = Mutex()
     private val groupConfigMutex = Mutex()
     private val syncExecutionMutex = Mutex()
     private val eventsDbMutex = Mutex()
     private val eventsMutationEpoch = AtomicLong(0L)
+    private val checkpointEpoch = AtomicLong(0L)
     @Volatile
     private var loadEventsJob: Job? = null
     @Volatile
     private var activeSyncJob: Job? = null
+    @Volatile
+    private var activeSyncCompletion: CompletableDeferred<Unit>? = null
     private var refreshRoomsJob: Job? = null
 
     private val _showWizard = MutableStateFlow(false)
@@ -289,7 +335,8 @@ class AppState(
             runExclusiveSync() ?: SyncResult.Success(newEventsCount = 0, totalScannedMessages = 0)
         },
         notificationDispatcher = notificationDispatcher,
-        scope = scope
+        scope = scope,
+        thresholdProvider = { _settings.value.notificationThreshold }
     )
 
     init {
@@ -312,16 +359,23 @@ class AppState(
 
     fun loadCheckpoints(): Job = scope.launch {
         if (syncCheckpointStore != null) {
-            val map = withContext(Dispatchers.IO) {
-                syncCheckpointStore.getAll()
+            syncExecutionMutex.withLock {
+                val capturedEpoch = checkpointEpoch.get()
+                val map = withContext(Dispatchers.IO) {
+                    syncCheckpointStore.getAll()
+                }
+                if (checkpointEpoch.get() == capturedEpoch) {
+                    _syncCheckpoints.value = map
+                }
             }
-            _syncCheckpoints.value = map
         }
     }
 
     fun resetGroupCheckpoint(roomId: String): Job = scope.launch {
         if (syncCheckpointStore != null) {
-            activeSyncJob?.cancelAndJoin()
+            checkpointEpoch.incrementAndGet()
+            activeSyncJob?.cancel()
+            activeSyncCompletion?.await()
             syncExecutionMutex.withLock {
                 withContext(Dispatchers.IO) {
                     syncCheckpointStore.reset(roomId)
@@ -336,7 +390,9 @@ class AppState(
     fun clearEventsAndCheckpoints(): Job = scope.launch {
         scheduler.stop()
         loadEventsJob?.cancel()
-        activeSyncJob?.cancelAndJoin()
+        checkpointEpoch.incrementAndGet()
+        activeSyncJob?.cancel()
+        activeSyncCompletion?.await()
         cancelEnrichmentJobs()
         syncExecutionMutex.withLock {
             eventsDbMutex.withLock {
@@ -350,8 +406,10 @@ class AppState(
             _syncCheckpoints.value = emptyMap()
         }
         groupFilter.value = null
+        categoryFilter.value = null
         starredOnlyFilter.value = false
         unreadOnlyFilter.value = false
+        hideCompletedFilter.value = false
         _selectedEventId.value = null
         val currentSettings = _settings.value
         if (currentSettings.autoSyncEnabled && currentSettings.syncIntervalMinutes > 0) {
@@ -367,10 +425,12 @@ class AppState(
         scheduler.stop()
         localModelDownloadManager.cancelAll()
         loadEventsJob?.cancel()
+        checkpointEpoch.incrementAndGet()
         val pendingRoomsJob = refreshRoomsJob
         refreshRoomsJob = null
         pendingRoomsJob?.cancelAndJoin()
-        activeSyncJob?.cancelAndJoin()
+        activeSyncJob?.cancel()
+        activeSyncCompletion?.await()
         cancelEnrichmentJobs()
         llamaServerManager.stop()
         syncExecutionMutex.withLock {
@@ -380,6 +440,7 @@ class AppState(
                     eventCardStore.clearAll()
                     syncCheckpointStore?.resetAll()
                     groupConfigStore?.clearAll()
+                    calendarLauncher.clearExportedFiles()
                     if (!Files.isSymbolicLink(decryptedCacheDir.toPath()) &&
                         decryptedCacheDir.exists() &&
                         decryptedCacheDir.isDirectory &&
@@ -401,10 +462,13 @@ class AppState(
         _availableRooms.value = emptyList()
         _detectedOllamaModels.value = emptyList()
         _ollamaStatusMessage.value = null
+        _llmConnectionStatusMessage.value = null
         priorityFilter.value = null
+        categoryFilter.value = null
         groupFilter.value = null
         starredOnlyFilter.value = false
         unreadOnlyFilter.value = false
+        hideCompletedFilter.value = false
         sortOrder.value = EventSortOrder.NEWEST_FIRST
         searchQuery.value = ""
         groupSearchQuery.value = ""
@@ -515,6 +579,19 @@ class AppState(
         }
     }
 
+    /** Exports [card] directly to Apple Reminders on macOS via osascript. */
+    fun exportToReminders(card: EventCard): Job = scope.launch {
+        val result = withContext(Dispatchers.IO) {
+            calendarLauncher.exportToReminders(card)
+        }
+        if (result.isSuccess) {
+            _snackbarMessage.emit("Added '${card.title}' to Reminders.")
+        } else {
+            val err = LlmJsonUtils.sanitizeLogMessage(result.exceptionOrNull()?.message)
+            _snackbarMessage.emit("Failed to add to Reminders: $err")
+        }
+    }
+
     fun loadEvents(): Job {
         loadEventsJob?.cancel()
         val job = scope.launch {
@@ -574,6 +651,50 @@ class AppState(
         }
     }
 
+    /** Toggles the user-triaged completion status ([EventCard.isCompleted]) for [id] and persists fail-closed to SQLite. */
+    fun toggleCompleted(id: String): Job = scope.launch {
+        try {
+            eventsDbMutex.withLock {
+                val current = _events.value.firstOrNull { it.id == id } ?: return@withLock
+                val newCompleted = !current.isCompleted
+                withContext(Dispatchers.IO) { eventCardStore.setCompletedOrThrow(id, newCompleted) }
+                eventsMutationEpoch.incrementAndGet()
+                _events.update { list -> list.map { if (it.id == id) it.copy(isCompleted = newCompleted) else it } }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Failed to update done state: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
+    /** Toggles completion of a valid checklist key ([DetailChecklistKeys.keyFor]) on [cardId] fail-closed. */
+    fun toggleCheckedItem(cardId: String, itemKey: String): Job = scope.launch {
+        try {
+            eventsDbMutex.withLock {
+                val current = _events.value.firstOrNull { it.id == cardId } ?: return@withLock
+                val cleanKey = itemKey.trim().take(DetailChecklistKeys.MAX_CHECKED_KEY_CHARS)
+                if (cleanKey.isBlank()) return@withLock
+                val validKeys = DetailChecklistKeys.validKeysForSections(current.sections)
+                if (validKeys.isNotEmpty() && cleanKey !in validKeys) return@withLock
+                val rawNext = if (cleanKey in current.checkedItems) {
+                    current.checkedItems - cleanKey
+                } else {
+                    current.checkedItems + cleanKey
+                }
+                val updatedItems = DetailChecklistKeys.sanitizeCheckedItems(
+                    rawNext,
+                    sections = current.sections.takeIf { validKeys.isNotEmpty() }
+                )
+                withContext(Dispatchers.IO) { eventCardStore.setCheckedItemsOrThrow(cardId, updatedItems) }
+                eventsMutationEpoch.incrementAndGet()
+                _events.update { list -> list.map { if (it.id == cardId) it.copy(checkedItems = updatedItems) else it } }
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            _snackbarMessage.emit("Failed to save checklist item: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
+        }
+    }
+
     fun dismiss(id: String): Job = scope.launch {
         eventsMutationEpoch.incrementAndGet()
         _selectedEventId.update { currentId -> if (currentId == id) null else currentId }
@@ -604,32 +725,34 @@ class AppState(
                     settingsStore.save(latest)
                 }
             }
-            if (updated.wechatDataDir != previous.wechatDataDir ||
-                updated.keysPath != previous.keysPath
-            ) {
-                refreshRooms().join()
-            }
-
-            val schedulerConfigChanged = updated.autoSyncEnabled != previous.autoSyncEnabled ||
-                updated.syncIntervalMinutes != previous.syncIntervalMinutes ||
-                updated.notifyOnNewEvents != previous.notifyOnNewEvents
-            if (schedulerConfigChanged) {
-                if (updated.autoSyncEnabled) {
-                    scheduler.start(
-                        intervalMinutes = updated.syncIntervalMinutes,
-                        notifyOnNewEvents = updated.notifyOnNewEvents
-                    )
-                } else {
-                    scheduler.stop()
+            settingsSideEffectsMutex.withLock {
+                if (updated.wechatDataDir != previous.wechatDataDir ||
+                    updated.keysPath != previous.keysPath
+                ) {
+                    refreshRooms().join()
                 }
-            }
+                val latest = _settings.value
+                val schedulerConfigChanged = updated.autoSyncEnabled != previous.autoSyncEnabled ||
+                    updated.syncIntervalMinutes != previous.syncIntervalMinutes ||
+                    updated.notifyOnNewEvents != previous.notifyOnNewEvents
+                if (schedulerConfigChanged) {
+                    if (latest.autoSyncEnabled) {
+                        scheduler.start(
+                            intervalMinutes = latest.syncIntervalMinutes,
+                            notifyOnNewEvents = latest.notifyOnNewEvents
+                        )
+                    } else {
+                        scheduler.stop()
+                    }
+                }
 
-            val localServerShouldReset = (previous.llm.providerType == LlmProviderType.BUILT_IN_LOCAL &&
-                updated.llm.providerType != LlmProviderType.BUILT_IN_LOCAL) ||
-                updated.llm.localModelId != previous.llm.localModelId ||
-                updated.llm.localContextSize != previous.llm.localContextSize
-            if (localServerShouldReset) {
-                llamaServerManager.stop()
+                val localServerShouldReset = (previous.llm.providerType == LlmProviderType.BUILT_IN_LOCAL &&
+                    latest.llm.providerType != LlmProviderType.BUILT_IN_LOCAL) ||
+                    updated.llm.localModelId != previous.llm.localModelId ||
+                    updated.llm.localContextSize != previous.llm.localContextSize
+                if (localServerShouldReset) {
+                    llamaServerManager.stop()
+                }
             }
         }
     }
@@ -796,9 +919,12 @@ class AppState(
         val snapshot = _settings.value
         val expandedDir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(snapshot.wechatDataDir)
             ?: return null
+        if (Files.isSymbolicLink(expandedDir.toPath())) return null
         val canonicalDir = runCatching { expandedDir.canonicalFile }.getOrNull() ?: return null
         if (!canonicalDir.exists() || !canonicalDir.isDirectory) return null
-        val keysFile = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(snapshot.keysPath)
+        val resolvedKeys = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(snapshot.keysPath)
+        val keysFile = resolvedKeys
+            ?.takeUnless { Files.isSymbolicLink(it.toPath()) }
             ?.let { runCatching { it.canonicalFile }.getOrNull() }
             ?.takeIf { it.exists() && it.isFile }
         return WeChatDatabaseDriver(
@@ -869,33 +995,49 @@ class AppState(
     private suspend fun executeSerializedSync(): SyncResult = syncExecutionMutex.withLock {
         val hadStreamedCard = AtomicBoolean(false)
         _syncStatusText.value = "Starting sync..."
-        val result = syncService.syncNow(
-            settings = _settings.value,
-            onCardPersisted = { card ->
-                hadStreamedCard.set(true)
-                eventsDbMutex.withLock {
-                    eventsMutationEpoch.incrementAndGet()
-                    _events.update { current -> mergeStreamedCard(current, card) }
+        var syncResult: SyncResult? = null
+        try {
+            syncResult = syncService.syncNow(
+                settings = _settings.value,
+                onCardPersisted = { card ->
+                    hadStreamedCard.set(true)
+                    eventsDbMutex.withLock {
+                        eventsMutationEpoch.incrementAndGet()
+                        _events.update { current -> mergeStreamedCard(current, card) }
+                    }
+                },
+                onProgress = { progress ->
+                    if (currentCoroutineContext().isActive) {
+                        _syncStatusText.value = formatSyncProgress(progress)
+                    }
                 }
-            },
-            onProgress = { progress ->
-                _syncStatusText.value = formatSyncProgress(progress)
+            )
+            syncResult
+        } finally {
+            withContext(NonCancellable) {
+                if (hadStreamedCard.get() || (syncResult is SyncResult.Success && syncResult.newEventsCount > 0)) {
+                    loadEvents().join()
+                }
+                val capturedEpoch = checkpointEpoch.get()
+                if (syncCheckpointStore != null) {
+                    val map = withContext(Dispatchers.IO) { syncCheckpointStore.getAll() }
+                    if (checkpointEpoch.get() == capturedEpoch) {
+                        _syncCheckpoints.value = map
+                    }
+                }
             }
-        )
-        if (hadStreamedCard.get() || (result is SyncResult.Success && result.newEventsCount > 0)) {
-            loadEvents().join()
         }
-        loadCheckpoints().join()
-        result
     }
 
     private suspend fun runExclusiveSync(): SyncResult? {
         if (!_isSyncing.compareAndSet(expect = false, update = true)) return null
+        val completion = CompletableDeferred<Unit>()
+        activeSyncCompletion = completion
         return try {
             var syncResult: SyncResult? = null
             coroutineScope {
                 // Launch the active sync in a dedicated child job so cancelling activeSyncJob
-                // (e.g. from resetGroupCheckpoint) aborts this run without cancelling SyncScheduler's loop.
+                // (e.g. from resetGroupCheckpoint or cancelSync) aborts this run without cancelling SyncScheduler's loop.
                 val syncJob = launch(start = CoroutineStart.LAZY) {
                     syncResult = executeSerializedSync()
                 }
@@ -904,7 +1046,7 @@ class AppState(
                 syncJob.join()
                 if (syncJob.isCancelled) {
                     currentCoroutineContext().ensureActive()
-                    syncResult = null
+                    syncResult = SyncResult.Cancelled
                 }
             }
             syncResult
@@ -912,6 +1054,98 @@ class AppState(
             activeSyncJob = null
             _syncStatusText.value = null
             _isSyncing.value = false
+            activeSyncCompletion = null
+            completion.complete(Unit)
+        }
+    }
+
+    /** Requests cooperative cancellation of any currently active sync run and waits until state settles. */
+    fun cancelSync(): Job = scope.launch {
+        val job = activeSyncJob ?: run {
+            activeSyncCompletion?.await()
+            return@launch
+        }
+        val completion = activeSyncCompletion
+        _syncStatusText.value = "Cancelling sync..."
+        job.cancelAndJoin()
+        completion?.await()
+    }
+
+    /** Clears transient LLM connection probe status text (e.g., on provider change or wizard open). */
+    fun clearConnectionStatus() {
+        _llmConnectionStatusMessage.value = null
+    }
+
+    /** Surfaces a short non-fatal message to the global Snackbar host. */
+    fun showMessage(message: String): Job = scope.launch {
+        _snackbarMessage.emit(message)
+    }
+
+    /**
+     * Runs a minimal single-token test prompt against the currently configured LLM provider (or [overrideConfig])
+     * and publishes human-readable status via [llmConnectionStatusMessage] and [snackbarMessage].
+     */
+    fun testLlmConnection(overrideConfig: LlmConfig? = null): Job = scope.launch {
+        if (!_isTestingLlmConnection.compareAndSet(false, true)) return@launch
+        val config = overrideConfig ?: _settings.value.llm
+        _llmConnectionStatusMessage.value = "Testing connection..."
+        try {
+            if (config.providerType == LlmProviderType.BUILT_IN_LOCAL && _isSyncing.value) {
+                val msg = "Wait for active sync to finish before testing local model."
+                _llmConnectionStatusMessage.value = msg
+                _snackbarMessage.emit(msg)
+                return@launch
+            }
+            if (config.providerType == LlmProviderType.BUILT_IN_LOCAL &&
+                llmClientFactory == null &&
+                localModelStore.resolveModel(config.localModelId) == null
+            ) {
+                val msg = "No downloaded or imported local model selected."
+                _llmConnectionStatusMessage.value = msg
+                _snackbarMessage.emit(msg)
+                return@launch
+            }
+            val reply = withContext(Dispatchers.IO) {
+                createLlmClient(config).use { client ->
+                    client.chatCompletion(
+                        systemPrompt = "Connection check. Reply briefly.",
+                        userPrompt = "Reply with OK.",
+                        options = LlmCompletionOptions(maxTokens = 8, allowSchemaFallback = true)
+                    )
+                }
+            }
+            val rawLabel = config.modelName.ifBlank { config.localModelId.ifBlank { config.providerType.name } }
+            val modelLabel = EventDetailItemParser.sanitizeSingleLine(rawLabel, 80).ifBlank { config.providerType.name }
+            val msg = if (reply.isNotBlank()) {
+                "Connected to $modelLabel."
+            } else {
+                "Connected to $modelLabel (empty probe response)."
+            }
+            _llmConnectionStatusMessage.value = msg
+            _snackbarMessage.emit(msg)
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            val msg = "Connection failed: ${LlmJsonUtils.sanitizeLogMessage(e.message)}"
+            _llmConnectionStatusMessage.value = msg
+            _snackbarMessage.emit(msg)
+        } finally {
+            _isTestingLlmConnection.value = false
+        }
+    }
+
+    /** Triggers an immediate sample notification using [notificationDispatcher] to verify macOS permissions. */
+    fun testNotification(): Job = scope.launch {
+        val sent = withContext(Dispatchers.IO) {
+            notificationDispatcher.sendNotification(
+                title = "WeChat Digest",
+                body = "Notifications verified (${_settings.value.notificationThreshold.displayName}).",
+                subtitle = "Test Alert"
+            )
+        }
+        if (sent) {
+            _snackbarMessage.emit("Sent test notification.")
+        } else {
+            _snackbarMessage.emit("Notification test failed. Check macOS notification permissions.")
         }
     }
 
@@ -920,12 +1154,24 @@ class AppState(
             val result = runExclusiveSync() ?: return@launch
             when (result) {
                 is SyncResult.Success -> {
+                    if (_settings.value.notifyOnManualSync && result.insertedCards.isNotEmpty()) {
+                        SyncScheduler.dispatchNotificationIfEligible(
+                            result = result,
+                            notifyEnabled = true,
+                            threshold = _settings.value.notificationThreshold,
+                            dispatcher = notificationDispatcher,
+                            subtitle = "Manual Sync"
+                        )
+                    }
                     val statusMsg = if (result.roomErrors.isNotEmpty()) {
                         "Sync completed with ${result.roomErrors.size} room error(s): ${result.roomErrors.first()} (${result.newEventsCount} new events)."
                     } else {
                         "Sync complete: ${result.newEventsCount} new events from ${result.totalScannedMessages} messages."
                     }
                     _snackbarMessage.emit(statusMsg)
+                }
+                is SyncResult.Cancelled -> {
+                    _snackbarMessage.emit("Sync cancelled.")
                 }
                 is SyncResult.Failure -> {
                     _snackbarMessage.emit("Sync failed: ${result.message}")
@@ -984,6 +1230,12 @@ class AppState(
      * persists the updated sections to SQLite.
      */
     fun enrichSectionCards(cardId: String, targetSectionIndex: Int? = null): Job {
+        val currentSettings = _settings.value
+        if (_isSyncing.value && EventExtractor.resolveConcurrencyForConfig(currentSettings.llm) == 1) {
+            return scope.launch {
+                _snackbarMessage.emit("Wait for active local sync to finish before structuring details.")
+            }
+        }
         val previous = _enrichingCardIds.getAndUpdate { it + cardId }
         if (cardId in previous) return Job().apply { complete() }
 
@@ -1003,7 +1255,6 @@ class AppState(
                         (listOf(idx) + autoTargets).distinct()
                     }
 
-                val currentSettings = _settings.value
                 val result = withContext(Dispatchers.IO) {
                     createLlmClient(currentSettings.llm).use { client ->
                         SectionCardEnricher(client).enrichCardSections(
@@ -1023,7 +1274,16 @@ class AppState(
                     }
                     eventsMutationEpoch.incrementAndGet()
                     _events.update { list ->
-                        list.map { existing -> if (existing.id == cardId) existing.copy(sections = updatedSections) else existing }
+                        list.map { existing ->
+                            if (existing.id == cardId) {
+                                existing.copy(
+                                    sections = updatedSections,
+                                    checkedItems = DetailChecklistKeys.sanitizeCheckedItems(existing.checkedItems, updatedSections)
+                                )
+                            } else {
+                                existing
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -1053,19 +1313,12 @@ class AppState(
         _reextractingCardIds.value = emptySet()
     }
 
-    /** Validated ISO-8601 date (`YYYY-MM-DD` or `YYYY-MM-DDTHH:MM(:SS)`) check for quick-edit inputs. */
+    /** Validated ISO-8601 date/datetime check (including fractional seconds and offsets) for quick-edit inputs. */
     internal fun validateQuickEditDate(rawDate: String?): String? {
         val trimmed = rawDate?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        val isIsoDate = runCatching { java.time.LocalDate.parse(trimmed) }.isSuccess
-        if (isIsoDate) return null
-        val normalized = trimmed.replace(' ', 'T')
-        val isIsoDateTime = runCatching {
-            when (normalized.length) {
-                16 -> java.time.LocalDateTime.parse("$normalized:00")
-                else -> java.time.LocalDateTime.parse(normalized)
-            }
-        }.isSuccess
-        return if (isIsoDateTime) null else "Use YYYY-MM-DD or YYYY-MM-DDTHH:MM format (or leave blank)."
+        return if (DeadlineTriage.isValidIsoTemporal(trimmed)) null else {
+            "Use YYYY-MM-DD or YYYY-MM-DDTHH:MM format (or leave blank)."
+        }
     }
 
     /**
@@ -1127,6 +1380,10 @@ class AppState(
         launchedJob = scope.launch {
             try {
                 val card = _events.value.firstOrNull { it.id == cardId } ?: return@launch
+                val preTitle = card.title
+                val preCategory = card.category
+                val prePriority = card.priority
+                val preEventDate = card.eventDate
                 val messages = withContext(Dispatchers.IO) { resolveMessagesForReextraction(card) }
                 if (messages.isEmpty()) {
                     _snackbarMessage.emit("No source messages available to re-extract.")
@@ -1157,13 +1414,21 @@ class AppState(
                     _snackbarMessage.emit("Re-extraction found no actionable announcement changes.")
                     return@launch
                 }
-                // Preserve prior lifecycle status & amendment link during single-card re-extract
-                val candidate = rawCandidate.copy(
-                    status = card.status,
-                    supersedesCardId = card.supersedesCardId
-                )
 
                 val saved = eventsDbMutex.withLock {
+                    val latest = _events.value.firstOrNull { it.id == cardId } ?: return@withLock null
+                    val editedInFlight = latest.title != preTitle ||
+                        latest.category != preCategory ||
+                        latest.priority != prePriority ||
+                        latest.eventDate != preEventDate
+                    val candidate = rawCandidate.copy(
+                        title = if (editedInFlight) latest.title else rawCandidate.title,
+                        category = if (editedInFlight) latest.category else rawCandidate.category,
+                        priority = if (editedInFlight) latest.priority else rawCandidate.priority,
+                        eventDate = if (editedInFlight) latest.eventDate else rawCandidate.eventDate,
+                        status = latest.status,
+                        supersedesCardId = latest.supersedesCardId
+                    )
                     withContext(Dispatchers.IO) {
                         eventCardStore.replaceExtractedCardOrThrow(card.id, candidate)
                     }?.also { persisted ->

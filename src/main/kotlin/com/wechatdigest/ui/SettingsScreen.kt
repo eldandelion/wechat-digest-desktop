@@ -94,6 +94,8 @@ fun SettingsScreen(appState: AppState) {
     val detectedOllamaModels by appState.detectedOllamaModels.collectAsState()
     val isDetectingOllama by appState.isDetectingOllama.collectAsState()
     val ollamaStatusMessage by appState.ollamaStatusMessage.collectAsState()
+    val isTestingLlmConnection by appState.isTestingLlmConnection.collectAsState()
+    val llmConnectionStatusMessage by appState.llmConnectionStatusMessage.collectAsState()
     val downloadedLocalModelIds by appState.downloadedLocalModelIds.collectAsState()
     val importedLocalModels by appState.importedLocalModels.collectAsState()
     val localModelDownloadStates by appState.localModelDownloadStates.collectAsState()
@@ -165,6 +167,27 @@ fun SettingsScreen(appState: AppState) {
                 }
             },
             onLaunchWizard = { appState.setShowWizard(true) },
+            onBrowseDataDir = {
+                DesktopPickers.openDirectoryPicker("Select WeChat Data Directory") { dir ->
+                    val path = dir.absolutePath
+                    dataDir = path
+                    appState.transformSettings { it.copy(wechatDataDir = path) }
+                }
+            },
+            onBrowseKeysPath = {
+                DesktopPickers.openExtensionFilePicker("Select all_keys.json", ".json") { file ->
+                    val path = file.absolutePath
+                    keysPath = path
+                    appState.transformSettings { it.copy(keysPath = path) }
+                }
+            },
+            onBrowseAttachmentRootDir = {
+                DesktopPickers.openDirectoryPicker("Select WeChat Attachment Root") { dir ->
+                    val path = dir.absolutePath
+                    attachmentRootDir = path
+                    appState.transformSettings { it.copy(wechatAttachmentRootDir = path) }
+                }
+            },
             onDataDirChange = { next -> dataDir = next; appState.transformSettings { it.copy(wechatDataDir = next.trim()) } },
             onKeysPathChange = { next -> keysPath = next; appState.transformSettings { it.copy(keysPath = next.trim()) } },
             onAttachmentRootDirChange = { next ->
@@ -172,11 +195,12 @@ fun SettingsScreen(appState: AppState) {
                 appState.transformSettings { it.copy(wechatAttachmentRootDir = next.trim()) }
             },
             onMessagesPerSyncChange = { next ->
-                messagesPerSync = next
-                next.toIntOrNull()?.let { count ->
-                    lastCommittedMessagesPerSync = count
-                    appState.transformSettings { it.copy(messagesPerSync = count) }
-                }
+                next.toIntOrNull()?.let { raw ->
+                    val clamped = clampMessagesPerSync(raw)
+                    messagesPerSync = clamped.toString()
+                    lastCommittedMessagesPerSync = clamped
+                    appState.transformSettings { it.copy(messagesPerSync = clamped) }
+                } ?: run { messagesPerSync = next }
             },
             onParseAttachmentContentsChange = { enabled -> appState.transformSettings { it.copy(parseAttachmentContents = enabled) } }
         )
@@ -184,9 +208,14 @@ fun SettingsScreen(appState: AppState) {
             autoSyncEnabled = currentSettings.autoSyncEnabled,
             syncIntervalMinutes = currentSettings.syncIntervalMinutes,
             notifyOnNewEvents = currentSettings.notifyOnNewEvents,
+            notificationThreshold = currentSettings.notificationThreshold,
+            notifyOnManualSync = currentSettings.notifyOnManualSync,
             onAutoSyncChange = { enabled -> appState.transformSettings { it.copy(autoSyncEnabled = enabled) } },
             onSelectInterval = { mins -> appState.transformSettings { it.copy(syncIntervalMinutes = mins) } },
-            onNotifyChange = { enabled -> appState.transformSettings { it.copy(notifyOnNewEvents = enabled) } }
+            onNotifyChange = { enabled -> appState.transformSettings { it.copy(notifyOnNewEvents = enabled) } },
+            onSelectNotificationThreshold = { threshold -> appState.transformSettings { it.copy(notificationThreshold = threshold) } },
+            onNotifyOnManualSyncChange = { enabled -> appState.transformSettings { it.copy(notifyOnManualSync = enabled) } },
+            onTestNotification = { appState.testNotification() }
         )
         LlmEngineSettingsCard(
             providerType = currentSettings.llm.providerType,
@@ -196,6 +225,8 @@ fun SettingsScreen(appState: AppState) {
             detectedOllamaModels = detectedOllamaModels,
             isDetectingOllama = isDetectingOllama,
             ollamaStatusMessage = ollamaStatusMessage,
+            isTestingConnection = isTestingLlmConnection,
+            connectionStatusMessage = llmConnectionStatusMessage,
             hardwareInfo = appState.systemHardwareInfo,
             localCatalogModels = appState.localCatalogModels,
             downloadedLocalModelIds = downloadedLocalModelIds,
@@ -236,6 +267,7 @@ fun SettingsScreen(appState: AppState) {
                 if (detectedOllamaModels.isEmpty() && !isDetectingOllama) runDetectOllama(nextUrl)
             },
             onDetectOllama = { runDetectOllama(endpointUrl) },
+            onTestConnection = { appState.testLlmConnection() },
             onEndpointChange = { next -> endpointUrl = next; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(endpointUrl = next.trim())) } },
             onApiKeyChange = { next -> apiKey = next; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(apiKey = next.trim())) } },
             onModelNameChange = { next -> modelName = next; appState.transformSettings { cur -> cur.copy(llm = cur.llm.copy(modelName = next.trim())) } },

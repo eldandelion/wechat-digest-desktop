@@ -52,6 +52,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppState
 import com.wechatdigest.app.Screen
+import com.wechatdigest.core.model.DeadlineTriage
 import com.wechatdigest.core.model.GroupChat
 import com.wechatdigest.core.model.GroupConfig
 import com.wechatdigest.core.model.SyncCheckpoint
@@ -73,6 +74,7 @@ fun GroupsScreen(appState: AppState) {
     val filteredRooms = remember(rooms, query, showSelectedOnly, settings.monitoredRoomIds) {
         filterChatrooms(rooms, query, showSelectedOnly, settings.monitoredRoomIds)
     }
+    val minuteTick = rememberMinuteTick()
     val canScan = !isLoading && settings.wechatDataDir.isNotBlank()
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -95,6 +97,7 @@ fun GroupsScreen(appState: AppState) {
                 monitoredIds = settings.monitoredRoomIds,
                 groupConfigs = groupConfigs,
                 syncCheckpoints = syncCheckpoints,
+                minuteTick = minuteTick,
                 onToggleMonitored = { appState.toggleRoomMonitored(it) },
                 onResetCheckpoint = { appState.resetGroupCheckpoint(it) },
                 onConfigureRules = { editingRoom = it }
@@ -193,6 +196,7 @@ private fun GroupsListContent(
     monitoredIds: Set<String>,
     groupConfigs: Map<String, GroupConfig>,
     syncCheckpoints: Map<String, SyncCheckpoint>,
+    minuteTick: Long,
     onToggleMonitored: (String) -> Unit,
     onResetCheckpoint: (String) -> Unit,
     onConfigureRules: (GroupChat) -> Unit
@@ -220,6 +224,7 @@ private fun GroupsListContent(
                 isChecked = monitoredIds.contains(room.roomId),
                 config = groupConfigs[room.roomId],
                 checkpoint = syncCheckpoints[room.roomId],
+                minuteTick = minuteTick,
                 onToggleMonitored = onToggle,
                 onResetCheckpoint = onReset,
                 onConfigureRules = onConfigure
@@ -282,6 +287,7 @@ private fun GroupRoomCard(
     isChecked: Boolean,
     config: GroupConfig?,
     checkpoint: SyncCheckpoint?,
+    minuteTick: Long,
     onToggleMonitored: () -> Unit,
     onResetCheckpoint: () -> Unit,
     onConfigureRules: () -> Unit
@@ -296,7 +302,13 @@ private fun GroupRoomCard(
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Checkbox(checked = isChecked, onCheckedChange = null)
             Spacer(Modifier.width(12.dp))
-            GroupRoomMetadataColumn(room = room, badgeLabel = badgeLabel, checkpoint = checkpoint, modifier = Modifier.weight(1f))
+            GroupRoomMetadataColumn(
+                room = room,
+                badgeLabel = badgeLabel,
+                checkpoint = checkpoint,
+                minuteTick = minuteTick,
+                modifier = Modifier.weight(1f)
+            )
             if (checkpoint != null && checkpoint.lastLocalId > 0) {
                 IconButton(onClick = onResetCheckpoint) {
                     Icon(Icons.Default.Refresh, contentDescription = "Re-scan group history", tint = MaterialTheme.colorScheme.outline)
@@ -333,6 +345,7 @@ private fun GroupRoomMetadataColumn(
     room: GroupChat,
     badgeLabel: String?,
     checkpoint: SyncCheckpoint?,
+    minuteTick: Long,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier) {
@@ -354,8 +367,20 @@ private fun GroupRoomMetadataColumn(
                 }
             }
             if (checkpoint != null && checkpoint.lastLocalId > 0) {
+                val syncLabel = remember(checkpoint.lastSyncTimestamp, checkpoint.lastLocalId, minuteTick) {
+                    if (checkpoint.lastSyncTimestamp > 0L) {
+                        "${DeadlineTriage.formatRelativeSyncTime(checkpoint.lastSyncTimestamp)} (#${checkpoint.lastLocalId})"
+                    } else {
+                        "Synced: #${checkpoint.lastLocalId}"
+                    }
+                }
                 Surface(color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f), shape = RoundedCornerShape(4.dp)) {
-                    Text(text = "Synced: #${checkpoint.lastLocalId}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer, fontWeight = FontWeight.Medium)
+                    Text(text = syncLabel, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer, fontWeight = FontWeight.Medium)
+                }
+                if (checkpoint.hasMore) {
+                    Surface(color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.85f), shape = RoundedCornerShape(4.dp)) {
+                        Text(text = "More waiting", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onTertiaryContainer, fontWeight = FontWeight.SemiBold)
+                    }
                 }
             }
         }

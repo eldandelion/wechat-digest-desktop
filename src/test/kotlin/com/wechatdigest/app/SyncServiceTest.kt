@@ -1465,4 +1465,85 @@ class SyncServiceTest {
         assertEquals(4, llmCalls)
         assertEquals(2, eventCardStore.listActive().size)
     }
+
+    @Test
+    fun `incremental checkpoint read sets hasMore when more messages remain beyond messagesPerSync`() = runBlocking {
+        val dir = File(tempDir, "has_more_wechat").apply { mkdirs() }
+        val room = "busy@chatroom"
+        val table = WeChatDatabaseDriver.calculateRoomTableName(room)
+
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "contact.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE contact (username TEXT PRIMARY KEY, nick_name TEXT, remark TEXT)")
+                stmt.executeUpdate("INSERT INTO contact VALUES ('wxid_a', 'Alice', '')")
+            }
+        }
+        java.sql.DriverManager.getConnection("jdbc:sqlite:${File(dir, "message_0.db").absolutePath}").use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute("CREATE TABLE $table (local_id INTEGER PRIMARY KEY, create_time INTEGER, real_sender_id TEXT, message_content BLOB)")
+                for (i in 1..5) {
+                    stmt.executeUpdate("INSERT INTO $table VALUES ($i, ${1794800000 + i * 10}, 'wxid_a', CAST('Exam update batch notice $i on Nov 29.' AS BLOB))")
+                }
+            }
+        }
+
+        val syncCheckpointStore = SyncCheckpointStore(appDb)
+        syncCheckpointStore.save(
+            com.wechatdigest.core.model.SyncCheckpoint(
+                roomId = room,
+                lastLocalId = 1L,
+                lastSyncTimestamp = 1794800010L,
+                updatedAt = 1794800010L,
+                lastShardName = "message_0.db",
+                lastCreateTime = 1794800010L
+            )
+        )
+        val engine = MockEngine {
+            respond(
+                """{"choices":[{"message":{"role":"assistant","content":"{\"is_relevant\":false,\"events\":[]}"}}]}""",
+                HttpStatusCode.OK,
+                headersOf(HttpHeaders.ContentType, "application/json")
+            )
+        }
+        val service = SyncService(
+            eventCardStore = eventCardStore,
+            syncCheckpointStore = syncCheckpointStore,
+            llmClientFactory = { cfg -> KtorLlmClient(cfg, engine) }
+        )
+        val result = service.syncNow(
+            AppSettings(
+                wechatDataDir = dir.absolutePath,
+                monitoredRoomIds = linkedSetOf(room),
+                messagesPerSync = 2
+            )
+        )
+        assertTrue(result is SyncResult.Success)
+        val checkpoint = syncCheckpointStore.get(room)
+        kotlin.test.assertNotNull(checkpoint)
+        assertEquals(3L, checkpoint.lastLocalId)
+        assertTrue(checkpoint.hasMore, "Capped incremental batch (2,3 out of 2..5) should flag hasMore=true")
+
+        // Drain the final remaining 2 messages (4, 5)
+        service.syncNow(AppSettings(wechatDataDir = dir.absolutePath, monitoredRoomIds = linkedSetOf(room), messagesPerSync = 2))
+        val finalCheckpoint = syncCheckpointStore.get(room)
+        kotlin.test.assertNotNull(finalCheckpoint)
+        assertEquals(5L, finalCheckpoint.lastLocalId)
+        assertEquals(false, finalCheckpoint.hasMore, "Exhausted backlog must clear hasMore=false")
+
+        // Security regression: Int.MAX_VALUE limit does not overflow probeLimit to negative SQLite LIMIT
+        val driver = WeChatDatabaseDriver(dir)
+        val repo = WeChatMessageRepository(driver, WeChatContactRepository(driver))
+        val bounded = repo.getMessagesSinceCheckpoint(
+            roomId = room,
+            checkpoint = com.wechatdigest.core.model.SyncCheckpoint(
+                roomId = room,
+                lastLocalId = 0L,
+                lastSyncTimestamp = 0L,
+                updatedAt = 0L
+            ),
+            limit = Int.MAX_VALUE
+        )
+        assertEquals(5, bounded.messages.size)
+        assertEquals(1, repo.getRecentMessages(room, limit = -10).size)
+    }
 }

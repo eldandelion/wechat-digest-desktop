@@ -1,6 +1,8 @@
 package com.wechatdigest.storage
 
 import com.wechatdigest.app.AppSettings
+import com.wechatdigest.core.llm.LlmJsonUtils
+import com.wechatdigest.core.repository.WeChatMessageRepository
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -22,19 +24,31 @@ class SettingsStore(private val db: AppDatabase) {
                     if (rs.next()) {
                         val raw = rs.getString("value")
                         if (!raw.isNullOrBlank()) {
-                            return json.decodeFromString<AppSettings>(raw)
+                            val decoded = json.decodeFromString<AppSettings>(raw)
+                            return decoded.copy(
+                                messagesPerSync = decoded.messagesPerSync.coerceIn(
+                                    WeChatMessageRepository.MIN_MESSAGES_PER_SYNC,
+                                    WeChatMessageRepository.MAX_MESSAGES_PER_SYNC
+                                )
+                            )
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[SettingsStore] Failed to load settings: ${e.message}")
+            System.err.println("[SettingsStore] Failed to load settings: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
         return AppSettings()
     }
 
     fun save(settings: AppSettings) {
-        val raw = json.encodeToString(settings)
+        val normalized = settings.copy(
+            messagesPerSync = settings.messagesPerSync.coerceIn(
+                WeChatMessageRepository.MIN_MESSAGES_PER_SYNC,
+                WeChatMessageRepository.MAX_MESSAGES_PER_SYNC
+            )
+        )
+        val raw = json.encodeToString(normalized)
         val sql = "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)"
         try {
             db.getConnection().use { conn ->
@@ -45,7 +59,7 @@ class SettingsStore(private val db: AppDatabase) {
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[SettingsStore] Failed to save settings: ${e.message}")
+            System.err.println("[SettingsStore] Failed to save settings: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
     }
 
@@ -58,7 +72,7 @@ class SettingsStore(private val db: AppDatabase) {
                 }
             }
         } catch (e: Exception) {
-            System.err.println("[SettingsStore] Failed to clear settings: ${e.message}")
+            System.err.println("[SettingsStore] Failed to clear settings: ${LlmJsonUtils.sanitizeLogMessage(e.message)}")
         }
     }
 

@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Psychology
@@ -67,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import com.wechatdigest.app.AppState
 import com.wechatdigest.core.db.WeChatDatabaseDriver
 import com.wechatdigest.core.detector.DiscoveredPath
+import com.wechatdigest.core.llm.EventExtractor
 import com.wechatdigest.core.llm.LlmProviderType
 import com.wechatdigest.core.llm.local.LocalModelMirror
 import com.wechatdigest.core.model.GroupChat
@@ -74,6 +76,7 @@ import com.wechatdigest.core.repository.WeChatContactRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 
 enum class WizardStep {
     WECHAT_PATH,
@@ -109,6 +112,8 @@ fun OnboardingWizardDialog(
     val detectedOllamaModels by appState.detectedOllamaModels.collectAsState()
     val isDetectingOllama by appState.isDetectingOllama.collectAsState()
     val ollamaStatusMessage by appState.ollamaStatusMessage.collectAsState()
+    val isTestingConnection by appState.isTestingLlmConnection.collectAsState()
+    val connectionStatusMessage by appState.llmConnectionStatusMessage.collectAsState()
     val downloadedLocalModelIds by appState.downloadedLocalModelIds.collectAsState()
     val importedLocalModels by appState.importedLocalModels.collectAsState()
     val localModelDownloadStates by appState.localModelDownloadStates.collectAsState()
@@ -124,8 +129,9 @@ fun OnboardingWizardDialog(
     var selectedRoomIds by remember { mutableStateOf(currentSettings.monitoredRoomIds) }
     var isLoadingRooms by remember { mutableStateOf(false) }
 
-    // Auto scan candidate paths on open
+    // Auto scan candidate paths & reset stale connection probe on open
     LaunchedEffect(Unit) {
+        appState.clearConnectionStatus()
         isScanningPaths = true
         val detected = withContext(Dispatchers.IO) {
             appState.autoDetectWeChatCandidates()
@@ -157,7 +163,7 @@ fun OnboardingWizardDialog(
             isLoadingRooms = true
             try {
                 val dir = com.wechatdigest.core.detector.WeChatPathDetector.resolveUserPath(selectedPath)
-                if (dir != null && dir.exists() && dir.isDirectory) {
+                if (dir != null && !java.nio.file.Files.isSymbolicLink(dir.toPath()) && dir.exists() && dir.isDirectory) {
                     val rooms = withContext(Dispatchers.IO) {
                         val defaultCacheDir = File(System.getProperty("user.home"), "Library/Application Support/WeChatDigest/decrypted")
                         val driver = WeChatDatabaseDriver(baseDir = dir, cacheDir = defaultCacheDir)
@@ -288,6 +294,17 @@ fun OnboardingWizardDialog(
                             modifier = Modifier.fillMaxWidth(),
                             label = { Text("WeChat Data Directory Path") },
                             placeholder = { Text("~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files") },
+                            trailingIcon = {
+                                IconButton(
+                                    onClick = {
+                                        DesktopPickers.openDirectoryPicker("Select WeChat Data Directory") { dir ->
+                                            selectedPath = dir.absolutePath
+                                        }
+                                    }
+                                ) {
+                                    Icon(Icons.Default.FolderOpen, contentDescription = "Browse WeChat directory")
+                                }
+                            },
                             singleLine = true
                         )
                     }
@@ -315,6 +332,7 @@ fun OnboardingWizardDialog(
                                     selected = builtInSelected,
                                     onClick = {
                                         providerType = LlmProviderType.BUILT_IN_LOCAL
+                                        appState.clearConnectionStatus()
                                         if (localModelId.isBlank()) {
                                             localModelId = downloadedLocalModelIds.firstOrNull()
                                                 ?: importedLocalModels.firstOrNull()?.id
@@ -336,6 +354,7 @@ fun OnboardingWizardDialog(
                                     selected = ollamaSelected,
                                     onClick = {
                                         providerType = LlmProviderType.OLLAMA
+                                        appState.clearConnectionStatus()
                                         if (endpointUrl == "https://api.openai.com/v1") {
                                             endpointUrl = "http://localhost:11434"
                                         }
@@ -363,6 +382,7 @@ fun OnboardingWizardDialog(
                                     selected = openAiSelected,
                                     onClick = {
                                         providerType = LlmProviderType.OPENAI_COMPATIBLE
+                                        appState.clearConnectionStatus()
                                         if (endpointUrl == "http://localhost:11434") {
                                             endpointUrl = "https://api.openai.com/v1"
                                         }
@@ -472,11 +492,22 @@ fun OnboardingWizardDialog(
                                     }
                                 }
 
+                                val insecureRemoteUrl = remember(endpointUrl, providerType) {
+                                    val trimmed = endpointUrl.trim().lowercase(Locale.ROOT)
+                                    trimmed.startsWith("http://") && !EventExtractor.isLocalEndpoint(trimmed)
+                                }
                                 OutlinedTextField(
                                     value = endpointUrl,
-                                    onValueChange = { endpointUrl = it },
+                                    onValueChange = {
+                                        endpointUrl = it
+                                        appState.clearConnectionStatus()
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     label = { Text("Endpoint Base URL") },
+                                    isError = insecureRemoteUrl,
+                                    supportingText = if (insecureRemoteUrl) {
+                                        { Text("Remote endpoints must use https:// to protect your API key and chat contents.") }
+                                    } else null,
                                     singleLine = true
                                 )
 
@@ -549,6 +580,22 @@ fun OnboardingWizardDialog(
                                     }
                                 }
                             }
+                            LlmConnectionTestRow(
+                                isTesting = isTestingConnection,
+                                statusMessage = connectionStatusMessage,
+                                onTestConnection = {
+                                    appState.testLlmConnection(
+                                        overrideConfig = currentSettings.llm.copy(
+                                            providerType = providerType,
+                                            endpointUrl = endpointUrl.trim(),
+                                            apiKey = apiKey.trim(),
+                                            modelName = modelName.trim(),
+                                            localModelId = localModelId.trim(),
+                                            localModelMirror = localModelMirror.name
+                                        )
+                                    )
+                                }
+                            )
                         }
                     }
 
@@ -581,7 +628,7 @@ fun OnboardingWizardDialog(
                                     .heightIn(max = 240.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                items(discoveredRooms) { room ->
+                                items(discoveredRooms, key = { it.roomId }) { room ->
                                     val isChecked = selectedRoomIds.contains(room.roomId)
                                     Row(
                                         modifier = Modifier

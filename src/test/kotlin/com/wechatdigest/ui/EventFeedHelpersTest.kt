@@ -194,4 +194,89 @@ class EventFeedHelpersTest {
         assertEquals(null, validateQuickEditIsoDate("2026-12-01 14:30:00"))
         assertTrue(validateQuickEditIsoDate("TBD") != null)
     }
+
+    @Test
+    fun `navigateEventSelection steps cleanly and clamps at list boundaries`() {
+        val ids = listOf("a", "b", "c")
+        assertEquals(null, navigateEventSelection(emptyList(), null, 1))
+        assertEquals("a", navigateEventSelection(ids, null, 1))
+        assertEquals("c", navigateEventSelection(ids, null, -1))
+        assertEquals("b", navigateEventSelection(ids, "a", 1))
+        assertEquals("c", navigateEventSelection(ids, "c", 1))
+        assertEquals("a", navigateEventSelection(ids, "a", -1))
+        assertEquals("b", navigateEventSelection(ids, "c", -1))
+    }
+
+    @Test
+    fun `resolveSyncStatusDisplay prioritizes local runtime and model startup progress`() {
+        assertEquals(
+            null,
+            resolveSyncStatusDisplay(
+                isSyncing = false,
+                syncStatusText = null,
+                isLocalProvider = false,
+                runtimeState = com.wechatdigest.core.llm.local.LocalRuntimeState.NotInstalled,
+                serverState = com.wechatdigest.core.llm.local.LocalServerState.Stopped
+            )
+        )
+        assertEquals(
+            "Downloading AI runtime (50%)...",
+            resolveSyncStatusDisplay(
+                isSyncing = true,
+                syncStatusText = "Starting sync...",
+                isLocalProvider = true,
+                runtimeState = com.wechatdigest.core.llm.local.LocalRuntimeState.Downloading(50L, 100L),
+                serverState = com.wechatdigest.core.llm.local.LocalServerState.Stopped
+            )
+        )
+        assertEquals(
+            "Starting local model (Qwen3 4B)...",
+            resolveSyncStatusDisplay(
+                isSyncing = false,
+                syncStatusText = null,
+                isLocalProvider = true,
+                runtimeState = com.wechatdigest.core.llm.local.LocalRuntimeState.Ready("b1", "/bin/llama"),
+                serverState = com.wechatdigest.core.llm.local.LocalServerState.Starting("qwen3-4b", "Qwen3 4B")
+            )
+        )
+        assertEquals(
+            "(1/2) Math Group: Analyzing...",
+            resolveSyncStatusDisplay(
+                isSyncing = true,
+                syncStatusText = "(1/2) Math Group: Analyzing...",
+                isLocalProvider = true,
+                runtimeState = com.wechatdigest.core.llm.local.LocalRuntimeState.Ready("b1", "/bin/llama"),
+                serverState = com.wechatdigest.core.llm.local.LocalServerState.Running("qwen3-4b", "Qwen3 4B", "http://127.0.0.1:8080")
+            )
+        )
+    }
+
+    @Test
+    fun `clampMessagesPerSync enforces 1 to 500 bounds`() {
+        assertEquals(1, clampMessagesPerSync(0))
+        assertEquals(1, clampMessagesPerSync(-25))
+        assertEquals(50, clampMessagesPerSync(50))
+        assertEquals(500, clampMessagesPerSync(500))
+        assertEquals(500, clampMessagesPerSync(9999))
+    }
+
+    @Test
+    fun `DesktopPickers isAcceptableSelection validates types, extensions, and rejects symlinks`() {
+        val dir = kotlin.io.path.createTempDirectory("picker_test").toFile()
+        try {
+            val subDir = java.io.File(dir, "realDir").apply { mkdirs() }
+            val jsonFile = java.io.File(dir, "all_keys.json").apply { writeText("{}") }
+            val txtFile = java.io.File(dir, "notes.txt").apply { writeText("hi") }
+            val symDir = java.io.File(dir, "linkDir")
+            java.nio.file.Files.createSymbolicLink(symDir.toPath(), subDir.toPath())
+
+            assertTrue(DesktopPickers.isAcceptableSelection(subDir, selectDirectory = true, allowedExtension = null))
+            assertFalse(DesktopPickers.isAcceptableSelection(jsonFile, selectDirectory = true, allowedExtension = null))
+            assertFalse(DesktopPickers.isAcceptableSelection(symDir, selectDirectory = true, allowedExtension = null))
+            assertTrue(DesktopPickers.isAcceptableSelection(jsonFile, selectDirectory = false, allowedExtension = ".json"))
+            assertFalse(DesktopPickers.isAcceptableSelection(txtFile, selectDirectory = false, allowedExtension = ".json"))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }
