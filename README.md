@@ -17,7 +17,7 @@ A native macOS Compose Multiplatform desktop application that turns noisy WeChat
 
 ## Installation (macOS)
 
-Download the latest **`WeChatDigest-1.1.0.dmg`** from the [GitHub Releases](../../releases) page, open the disk image, and drag **WeChatDigest.app** into your `/Applications` folder.
+Download the latest **`WeChatDigest-2.0.0.dmg`** from the [GitHub Releases](../../releases) page, open the disk image, and drag **WeChatDigest.app** into your `/Applications` folder.
 
 ## Building & Running from Source
 
@@ -35,7 +35,7 @@ Download the latest **`WeChatDigest-1.1.0.dmg`** from the [GitHub Releases](../.
 ```bash
 ./gradlew packageDmg
 ```
-The signed/packaged `.dmg` will be generated at `build/compose/binaries/main/dmg/WeChatDigest-1.1.0.dmg`.
+The signed/packaged `.dmg` will be generated at `build/compose/binaries/main/dmg/WeChatDigest-2.0.0.dmg`.
 
 ## Testing & AI Pipeline Evaluation Testbed
 

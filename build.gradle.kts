@@ -53,7 +53,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Dmg)
             packageName = "WeChatDigest"
-            packageVersion = "1.1.0"
+            packageVersion = "2.0.0"
             description = "Local AI-powered WeChat group announcement & event digest for macOS"
             includeAllModules = true
         }
