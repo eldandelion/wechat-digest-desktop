@@ -29,6 +29,42 @@ private func loadDownscaledCGImage(from url: URL, maxPixelSize: Int = 2048) -> C
     return CGImageSourceCreateImageAtIndex(source, 0, nil)
 }
 
+private func performVisionRequests(on cgImage: CGImage, cpuOnly: Bool) throws -> VisionOcrResult {
+    let textRequest = VNRecognizeTextRequest()
+    textRequest.recognitionLevel = .accurate
+    textRequest.recognitionLanguages = ["zh-Hans", "en-US"]
+    textRequest.usesLanguageCorrection = true
+    textRequest.usesCPUOnly = cpuOnly
+
+    let barcodeRequest = VNDetectBarcodesRequest()
+    barcodeRequest.symbologies = [.qr]
+    barcodeRequest.usesCPUOnly = cpuOnly
+
+    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    try handler.perform([textRequest, barcodeRequest])
+
+    let recognizedLines: [String] = (textRequest.results ?? []).compactMap { observation in
+        observation.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines)
+    }.filter { !$0.isEmpty }
+
+    var seenQr = Set<String>()
+    var qrPayloads: [String] = []
+    for observation in (barcodeRequest.results ?? []) {
+        guard let rawPayload = observation.payloadStringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawPayload.isEmpty else {
+            continue
+        }
+        if seenQr.insert(rawPayload).inserted {
+            qrPayloads.append(rawPayload)
+        }
+    }
+
+    return VisionOcrResult(
+        text: recognizedLines.joined(separator: "\n"),
+        qrPayloads: qrPayloads
+    )
+}
+
 private func recognizeImage(at path: String) throws -> VisionOcrResult {
     return try autoreleasepool {
         let url = URL(fileURLWithPath: path)
@@ -40,37 +76,12 @@ private func recognizeImage(at path: String) throws -> VisionOcrResult {
             throw NSError(domain: "VisionOcr", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unable to decode image"])
         }
 
-        let textRequest = VNRecognizeTextRequest()
-        textRequest.recognitionLevel = .accurate
-        textRequest.recognitionLanguages = ["zh-Hans", "en-US"]
-        textRequest.usesLanguageCorrection = true
-
-        let barcodeRequest = VNDetectBarcodesRequest()
-        barcodeRequest.symbologies = [.qr]
-
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        try handler.perform([textRequest, barcodeRequest])
-
-        let recognizedLines: [String] = (textRequest.results ?? []).compactMap { observation in
-            observation.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        }.filter { !$0.isEmpty }
-
-        var seenQr = Set<String>()
-        var qrPayloads: [String] = []
-        for observation in (barcodeRequest.results ?? []) {
-            guard let rawPayload = observation.payloadStringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !rawPayload.isEmpty else {
-                continue
-            }
-            if seenQr.insert(rawPayload).inserted {
-                qrPayloads.append(rawPayload)
-            }
+        do {
+            return try performVisionRequests(on: cgImage, cpuOnly: false)
+        } catch {
+            // Headless macOS VMs without Metal/ANE support may reject GPU execution; retry on CPU.
+            return try performVisionRequests(on: cgImage, cpuOnly: true)
         }
-
-        return VisionOcrResult(
-            text: recognizedLines.joined(separator: "\n"),
-            qrPayloads: qrPayloads
-        )
     }
 }
 
